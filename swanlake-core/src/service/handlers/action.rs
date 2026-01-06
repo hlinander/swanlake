@@ -1,13 +1,69 @@
-use arrow_array::{Array, RecordBatch, StringArray};
+use arrow_array::{Array, StringArray};
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::Action;
-use arrow_schema::{DataType, Field, Schema};
 use futures::stream;
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tonic::{Request, Response, Status};
 use tracing::info;
 
 use crate::service::SwanFlightSqlService;
+
+/// Airport extension's expected format for compressed content
+#[derive(Debug, Serialize, Deserialize)]
+struct AirportSerializedCompressedContent {
+    /// The uncompressed length of the data
+    length: u32,
+    /// The compressed data using ZStandard
+    data: Vec<u8>,
+}
+
+/// Airport extension's expected format for content with SHA256 hash
+#[derive(Debug, Serialize, Deserialize)]
+struct AirportSerializedContentsWithSHA256Hash {
+    /// The SHA256 of the serialized contents or external URL
+    sha256: String,
+    /// The external URL where contents should be obtained
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    /// The inline serialized contents
+    #[serde(skip_serializing_if = "Option::is_none")]
+    serialized: Option<String>,
+}
+
+/// Airport extension's expected format for a schema
+#[derive(Debug, Serialize, Deserialize)]
+struct AirportSerializedSchema {
+    /// The name of the schema
+    name: String,
+    /// The description of the schema
+    description: String,
+    /// Any tags to apply to the schema
+    tags: HashMap<String, String>,
+    /// The contents of the schema itself
+    contents: AirportSerializedContentsWithSHA256Hash,
+    /// Should this schema be considered the default schema
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_default: Option<bool>,
+}
+
+/// Airport extension's expected format for catalog version result
+#[derive(Debug, Serialize, Deserialize)]
+struct AirportGetCatalogVersionResult {
+    catalog_version: u64,
+    is_fixed: bool,
+}
+
+/// Airport extension's expected format for catalog root
+#[derive(Debug, Serialize, Deserialize)]
+struct AirportSerializedCatalogRoot {
+    /// The contents of the catalog itself
+    contents: AirportSerializedContentsWithSHA256Hash,
+    /// A list of schemas
+    schemas: Vec<AirportSerializedSchema>,
+    /// The version of the catalog returned
+    version_info: AirportGetCatalogVersionResult,
+}
 
 /// Handle the "list_schemas" custom action from DuckDB Airport extension
 pub(crate) async fn do_action_list_schemas(
@@ -22,12 +78,10 @@ pub(crate) async fn do_action_list_schemas(
     let sql = "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name";
 
     let session_clone = session.clone();
-    let query_result = tokio::task::spawn_blocking(move || {
-        session_clone.execute_query(sql)
-    })
-    .await
-    .map_err(SwanFlightSqlService::status_from_join)?
-    .map_err(SwanFlightSqlService::status_from_error)?;
+    let query_result = tokio::task::spawn_blocking(move || session_clone.execute_query(sql))
+        .await
+        .map_err(SwanFlightSqlService::status_from_join)?
+        .map_err(SwanFlightSqlService::status_from_error)?;
 
     // Convert the Arrow batches to a list of schema names
     let mut schema_names = Vec::new();
@@ -45,45 +99,74 @@ pub(crate) async fn do_action_list_schemas(
         }
     }
 
-    info!(count = schema_names.len(), "found schemas");
+    info!(count = schema_names.len(), schemas = ?schema_names, "found schemas");
 
-    // Build a response with schema names encoded as Arrow Flight Result messages
-    // Each schema name is returned as a separate Result message
-    let mut results: Vec<Result<arrow_flight::Result, Status>> = Vec::new();
+    // Build the Airport-compatible response
+    let schemas: Vec<AirportSerializedSchema> = schema_names
+        .into_iter()
+        .map(|name| {
+            let is_default = name == "main"; // DuckDB's default schema
+            AirportSerializedSchema {
+                name: name.clone(),
+                description: format!("Schema: {}", name),
+                tags: HashMap::new(),
+                contents: AirportSerializedContentsWithSHA256Hash {
+                    sha256: String::new(), // Empty for now
+                    url: None,
+                    serialized: Some(String::new()), // Empty serialized content
+                },
+                is_default: if is_default { Some(true) } else { None },
+            }
+        })
+        .collect();
 
-    for name in schema_names {
-        // Create a simple RecordBatch with the schema name
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "schema_name",
-            DataType::Utf8,
-            false,
-        )]));
+    let catalog_root = AirportSerializedCatalogRoot {
+        contents: AirportSerializedContentsWithSHA256Hash {
+            sha256: String::new(),
+            url: None,
+            serialized: Some(String::new()),
+        },
+        schemas,
+        version_info: AirportGetCatalogVersionResult {
+            catalog_version: 1,
+            is_fixed: false,
+        },
+    };
 
-        let schema_array = StringArray::from(vec![name.as_str()]);
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(schema_array)])
-            .map_err(|e| Status::internal(format!("Failed to create batch: {}", e)))?;
+    // Serialize to msgpack
+    let serialized = rmp_serde::to_vec(&catalog_root)
+        .map_err(|e| Status::internal(format!("Failed to msgpack encode catalog root: {}", e)))?;
 
-        // Serialize the batch as IPC
-        let mut writer = arrow_ipc::writer::StreamWriter::try_new(
-            Vec::new(),
-            batch.schema_ref(),
-        )
-        .map_err(|e| Status::internal(format!("Failed to create IPC writer: {}", e)))?;
+    info!(serialized_size = serialized.len(), "serialized catalog root");
 
-        writer
-            .write(&batch)
-            .map_err(|e| Status::internal(format!("Failed to write batch: {}", e)))?;
+    // Compress with zstd
+    let compressed = zstd::encode_all(serialized.as_slice(), 3)
+        .map_err(|e| Status::internal(format!("Failed to zstd compress: {}", e)))?;
 
-        writer
-            .finish()
-            .map_err(|e| Status::internal(format!("Failed to finish IPC stream: {}", e)))?;
+    info!(
+        compressed_size = compressed.len(),
+        uncompressed_size = serialized.len(),
+        "compressed catalog data"
+    );
 
-        let body = writer.into_inner()
-            .map_err(|e| Status::internal(format!("Failed to get IPC bytes: {}", e)))?;
+    // Wrap in compressed content structure
+    let compressed_content = AirportSerializedCompressedContent {
+        length: serialized.len() as u32,
+        data: compressed,
+    };
 
-        results.push(Ok(arrow_flight::Result { body: body.into() }));
-    }
+    // Serialize the wrapper to msgpack
+    let final_body = rmp_serde::to_vec(&compressed_content).map_err(|e| {
+        Status::internal(format!("Failed to msgpack encode compressed content: {}", e))
+    })?;
 
-    let output_stream = Box::pin(stream::iter(results));
+    info!(final_size = final_body.len(), "final encoded response size");
+
+    // Return as a single Result message
+    let result = arrow_flight::Result {
+        body: final_body.into(),
+    };
+
+    let output_stream = Box::pin(stream::iter(vec![Ok(result)]));
     Ok(Response::new(output_stream))
 }
