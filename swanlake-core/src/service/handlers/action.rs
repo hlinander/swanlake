@@ -10,13 +10,14 @@ use tracing::info;
 use crate::service::SwanFlightSqlService;
 
 /// Airport extension's expected format for compressed content
+/// Note: This uses tuple serialization (MSGPACK_DEFINE), not map (MSGPACK_DEFINE_MAP)
 #[derive(Debug, Serialize, Deserialize)]
-struct AirportSerializedCompressedContent {
+struct AirportSerializedCompressedContent(
     /// The uncompressed length of the data
-    length: u32,
+    u32,
     /// The compressed data using ZStandard
-    data: Vec<u8>,
-}
+    Vec<u8>,
+);
 
 /// Airport extension's expected format for content with SHA256 hash
 #[derive(Debug, Serialize, Deserialize)]
@@ -149,11 +150,11 @@ pub(crate) async fn do_action_list_schemas(
         "compressed catalog data"
     );
 
-    // Wrap in compressed content structure
-    let compressed_content = AirportSerializedCompressedContent {
-        length: serialized.len() as u32,
-        data: compressed,
-    };
+    // Wrap in compressed content structure (tuple format)
+    let compressed_content = AirportSerializedCompressedContent(
+        serialized.len() as u32,
+        compressed,
+    );
 
     // Serialize the wrapper to msgpack
     let final_body = rmp_serde::to_vec(&compressed_content).map_err(|e| {
