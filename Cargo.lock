@@ -3484,6 +3484,7 @@ dependencies = [
  "postgres-native-tls",
  "prost",
  "reqwest 0.12.24",
+ "rmp",
  "rmp-serde",
  "serde",
  "serde_bytes",

@@ -1,5 +1,6 @@
 use arrow_array::{Array, StringArray};
 use arrow_flight::flight_service_server::FlightService;
+use arrow_flight::sql::{ProstMessageExt, TicketStatementQuery};
 use arrow_flight::{Action, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket};
 use arrow_schema::{DataType, Field, Schema};
 use futures::stream;
@@ -12,6 +13,7 @@ use tonic::{Request, Response, Status};
 use tracing::info;
 
 use crate::service::SwanFlightSqlService;
+use super::ticket::{StatementTicketKind, TicketStatementPayload};
 
 /// Airport extension's expected format for compressed content
 /// Note: This uses tuple serialization (MSGPACK_DEFINE), not map (MSGPACK_DEFINE_MAP)
@@ -102,16 +104,29 @@ struct AirportSerializedFlightAppMetadata {
 fn serialize_schema_contents(
     flight_infos: Vec<FlightInfo>,
 ) -> Result<AirportSerializedContentsWithSHA256Hash, Status> {
-    // Serialize each FlightInfo to bytes and collect as byte arrays
-    // Even if empty, we serialize an empty array so Airport doesn't fall back to ListFlights
-    let serialized_infos: Vec<ByteBuf> = flight_infos
+    // Serialize each FlightInfo to bytes
+    // C++ uses std::vector<std::string> which in msgpack is an array of "str" type (not "bin")
+    // Even though FlightInfo is binary data, C++ std::string is used as binary container
+    // We need to use msgpack str format for compatibility
+    let serialized_infos: Vec<Vec<u8>> = flight_infos
         .into_iter()
-        .map(|info| ByteBuf::from(info.encode_to_vec()))
+        .map(|info| info.encode_to_vec())
         .collect();
 
-    // Serialize as msgpack array of byte strings
-    let msgpack_data = rmp_serde::to_vec(&serialized_infos)
-        .map_err(|e| Status::internal(format!("Failed to msgpack encode flight infos: {}", e)))?;
+    // Manually build msgpack array of str type (not bin type) using rmp directly
+    // This matches C++ msgpack's serialization of std::vector<std::string>
+    let mut msgpack_data = Vec::new();
+
+    // Write array header
+    rmp::encode::write_array_len(&mut msgpack_data, serialized_infos.len() as u32)
+        .map_err(|e| Status::internal(format!("Failed to write msgpack array len: {}", e)))?;
+
+    // Write each FlightInfo as a str (not bin) - C++ expects str format
+    for info_bytes in &serialized_infos {
+        rmp::encode::write_str_len(&mut msgpack_data, info_bytes.len() as u32)
+            .map_err(|e| Status::internal(format!("Failed to write msgpack str len: {}", e)))?;
+        msgpack_data.extend_from_slice(info_bytes);
+    }
 
     // Compress with zstd
     let compressed = zstd::encode_all(msgpack_data.as_slice(), 3)
@@ -155,10 +170,11 @@ fn build_table_flight_info(
     let arrow_schema = Schema::new(fields);
 
     // Build the app_metadata with table info
+    // The 'catalog' field must match the attached catalog name that the client uses
     let metadata = AirportSerializedFlightAppMetadata {
         r#type: "table".to_string(),
         schema: schema_name.to_string(),
-        catalog: catalog_name.to_string(),
+        catalog: catalog_name.to_string(), // Must match the attached catalog name
         name: table_name.to_string(),
         comment: None,
         input_schema: None,
@@ -171,20 +187,25 @@ fn build_table_flight_info(
         .map_err(|e| Status::internal(format!("Failed to serialize table metadata: {}", e)))?;
 
     // Create FlightDescriptor for this table
+    // Use schema.table path (without catalog prefix, since catalog is the attached server itself)
     let descriptor = FlightDescriptor::new_path(vec![
-        catalog_name.to_string(),
         schema_name.to_string(),
         table_name.to_string(),
     ]);
 
     // Create a ticket for fetching the table data
-    let ticket = Ticket::new(format!("{}.{}.{}", catalog_name, schema_name, table_name));
-    let endpoint = FlightEndpoint::new().with_ticket(ticket);
+    let ticket = Ticket::new(format!("{}.{}", schema_name, table_name));
+    // Add location - empty string means "same server"
+    let endpoint = FlightEndpoint::new()
+        .with_ticket(ticket)
+        .with_location("grpc://localhost:4214");
 
     let flight_info = FlightInfo::new()
         .with_descriptor(descriptor)
         .with_endpoint(endpoint)
         .with_app_metadata(app_metadata)
+        .with_total_records(-1) // Unknown
+        .with_total_bytes(-1) // Unknown
         .try_with_schema(&arrow_schema)
         .map_err(|e| Status::internal(format!("Failed to build FlightInfo: {}", e)))?;
 
@@ -275,10 +296,15 @@ pub(crate) async fn do_action_list_schemas(
         }
         rmp_serde::from_slice::<CatalogRequest>(&request.get_ref().body)
             .map(|r| r.catalog_name)
-            .unwrap_or_else(|_| "hello".to_string())
+            .unwrap_or_else(|e| {
+                info!("Failed to parse catalog request: {}, using default", e);
+                "hello".to_string()
+            })
     } else {
         "hello".to_string()
     };
+
+    info!(catalog_name = %catalog_name, "using catalog name for list_schemas");
 
     // Build schemas with their tables
     let mut schemas = Vec::new();
@@ -320,11 +346,18 @@ pub(crate) async fn do_action_list_schemas(
             }
         }
 
-        info!(schema = %schema_name, table_count = tables.len(), "found tables in schema");
+        info!(schema = %schema_name, table_count = tables.len(), tables = ?tables.keys().collect::<Vec<_>>(), "found tables in schema");
 
         // Build FlightInfo for each table
         let mut flight_infos = Vec::new();
         for (table_name, columns) in tables {
+            info!(
+                catalog = %catalog_name,
+                schema = %schema_name,
+                table = %table_name,
+                column_count = columns.len(),
+                "building FlightInfo for table"
+            );
             let flight_info =
                 build_table_flight_info(&catalog_name, &schema_name, &table_name, columns)?;
             flight_infos.push(flight_info);
@@ -338,7 +371,7 @@ pub(crate) async fn do_action_list_schemas(
             description: String::new(),
             tags: HashMap::new(),
             contents,
-            is_default: if is_default { Some(true) } else { None },
+            is_default: Some(is_default),
         });
     }
 
@@ -387,6 +420,176 @@ pub(crate) async fn do_action_list_schemas(
     // Return as a single Result message
     let result = arrow_flight::Result {
         body: final_body.into(),
+    };
+
+    let output_stream = Box::pin(stream::iter(vec![Ok(result)]));
+    Ok(Response::new(output_stream))
+}
+
+/// Airport's transaction identifier result
+#[derive(Debug, Serialize, Deserialize)]
+struct GetTransactionIdentifierResult {
+    identifier: Option<String>,
+}
+
+/// Airport's endpoint parameters
+#[derive(Debug, Deserialize, Default)]
+struct AirportEndpointParameters {
+    /// JSON filters for predicate pushdown
+    #[serde(default)]
+    json_filters: String,
+    /// Column IDs to project
+    #[serde(default)]
+    column_ids: Vec<i64>,
+    /// Table function parameters
+    #[serde(default)]
+    table_function_parameters: String,
+    /// Table function input schema
+    #[serde(default)]
+    table_function_input_schema: String,
+    /// Point-in-time unit
+    #[serde(default)]
+    at_unit: String,
+    /// Point-in-time value
+    #[serde(default)]
+    at_value: String,
+}
+
+/// Airport's endpoints request
+#[derive(Debug, Deserialize)]
+struct AirportGetFlightEndpointsRequest {
+    /// The flight descriptor (serialized)
+    #[serde(with = "serde_bytes")]
+    descriptor: Vec<u8>,
+    /// Endpoint parameters
+    #[serde(default)]
+    parameters: AirportEndpointParameters,
+}
+
+/// Handle the "create_transaction" custom action from DuckDB Airport extension
+pub(crate) async fn do_action_create_transaction(
+    service: &SwanFlightSqlService,
+    request: Request<Action>,
+) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
+    let session = service.prepare_request(&request).await?;
+
+    info!("handling create_transaction action");
+
+    // Start a transaction in the session
+    let session_clone = session.clone();
+    let transaction_id = tokio::task::spawn_blocking(move || session_clone.begin_transaction())
+        .await
+        .map_err(SwanFlightSqlService::status_from_join)?
+        .map_err(SwanFlightSqlService::status_from_error)?;
+
+    info!(transaction_id = %transaction_id, "transaction started for Airport");
+
+    // Return the transaction identifier
+    let result_struct = GetTransactionIdentifierResult {
+        identifier: Some(transaction_id.to_string()),
+    };
+
+    let result_body = rmp_serde::to_vec_named(&result_struct)
+        .map_err(|e| Status::internal(format!("Failed to serialize transaction result: {}", e)))?;
+
+    let result = arrow_flight::Result {
+        body: result_body.into(),
+    };
+
+    let output_stream = Box::pin(stream::iter(vec![Ok(result)]));
+    Ok(Response::new(output_stream))
+}
+
+/// Handle the "catalog_version" action from DuckDB Airport extension
+/// Returns the current catalog version for cache invalidation
+pub(crate) async fn do_action_catalog_version(
+    service: &SwanFlightSqlService,
+    request: Request<Action>,
+) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
+    let _session = service.prepare_request(&request).await?;
+
+    info!("handling catalog_version action");
+
+    // Return a fixed catalog version (could be made dynamic based on schema changes)
+    let result_struct = AirportGetCatalogVersionResult {
+        catalog_version: 1,
+        is_fixed: false,
+    };
+
+    let result_body = rmp_serde::to_vec_named(&result_struct)
+        .map_err(|e| Status::internal(format!("Failed to serialize catalog version: {}", e)))?;
+
+    let result = arrow_flight::Result {
+        body: result_body.into(),
+    };
+
+    let output_stream = Box::pin(stream::iter(vec![Ok(result)]));
+    Ok(Response::new(output_stream))
+}
+
+/// Handle the "endpoints" action from DuckDB Airport extension
+/// Returns FlightEndpoints for data retrieval
+pub(crate) async fn do_action_endpoints(
+    service: &SwanFlightSqlService,
+    request: Request<Action>,
+) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
+    let _session = service.prepare_request(&request).await?;
+
+    // Parse the request
+    let request_data: AirportGetFlightEndpointsRequest =
+        rmp_serde::from_slice(&request.get_ref().body)
+            .map_err(|e| Status::invalid_argument(format!("Failed to parse endpoints request: {}", e)))?;
+
+    // The descriptor is a serialized FlightDescriptor (protobuf)
+    let descriptor = FlightDescriptor::decode(request_data.descriptor.as_slice())
+        .map_err(|e| Status::invalid_argument(format!("Failed to decode flight descriptor: {}", e)))?;
+
+    info!(
+        descriptor = ?descriptor,
+        filters = %request_data.parameters.json_filters,
+        columns = ?request_data.parameters.column_ids,
+        "handling endpoints action"
+    );
+
+    // Build SQL query from the descriptor path (schema.table)
+    let table_path = descriptor.path.join(".");
+    let sql = format!("SELECT * FROM {}", table_path);
+
+    info!(sql = %sql, "creating ticket for Airport query");
+
+    // Create a ticket using SwanLake's internal format (wrapped in Flight SQL's TicketStatementQuery)
+    // This will be executed when Airport calls DoGet
+    let ticket_payload = TicketStatementPayload::new(StatementTicketKind::Ephemeral)
+        .with_fallback_sql(&sql)
+        .with_returns_rows(true);
+
+    let ticket_query = TicketStatementQuery {
+        statement_handle: ticket_payload.encode_to_vec().into(),
+    };
+
+    // Encode as Any-wrapped protobuf (required by Flight SQL)
+    let ticket = Ticket::new(ticket_query.as_any().encode_to_vec());
+
+    // Create a single endpoint pointing back to this server
+    // The client will call DoGet with this ticket
+    let endpoint = FlightEndpoint::new()
+        .with_ticket(ticket)
+        .with_location("grpc://localhost:4214");
+
+    // Serialize the endpoint
+    let endpoint_bytes = endpoint.encode_to_vec();
+
+    // Return as msgpack array of serialized endpoints (as strings, not bin)
+    // Using manual msgpack encoding to match C++ std::vector<std::string>
+    let mut result_body = Vec::new();
+    rmp::encode::write_array_len(&mut result_body, 1)
+        .map_err(|e| Status::internal(format!("Failed to write array len: {}", e)))?;
+    rmp::encode::write_str_len(&mut result_body, endpoint_bytes.len() as u32)
+        .map_err(|e| Status::internal(format!("Failed to write str len: {}", e)))?;
+    result_body.extend_from_slice(&endpoint_bytes);
+
+    let result = arrow_flight::Result {
+        body: result_body.into(),
     };
 
     let output_stream = Box::pin(stream::iter(vec![Ok(result)]));

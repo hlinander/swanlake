@@ -155,6 +155,9 @@ impl FlightSqlService for SwanFlightSqlService {
 
         match action_type.as_str() {
             "list_schemas" => action::do_action_list_schemas(self, request).await,
+            "create_transaction" => action::do_action_create_transaction(self, request).await,
+            "catalog_version" => action::do_action_catalog_version(self, request).await,
+            "endpoints" => action::do_action_endpoints(self, request).await,
             _ => Err(Status::invalid_argument(format!(
                 "do_action: The defined request is invalid: {:?}",
                 action_type
