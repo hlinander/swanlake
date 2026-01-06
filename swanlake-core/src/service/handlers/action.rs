@@ -33,9 +33,11 @@ struct AirportSerializedContentsWithSHA256Hash {
 }
 
 /// Airport extension's expected format for a schema
+/// Uses MSGPACK_DEFINE_MAP(schema, description, tags, contents) - note: "schema" not "name"
 #[derive(Debug, Serialize, Deserialize)]
 struct AirportSerializedSchema {
-    /// The name of the schema
+    /// The name of the schema (field is "schema" in msgpack, not "name")
+    #[serde(rename = "schema")]
     name: String,
     /// The description of the schema
     description: String,
@@ -43,27 +45,18 @@ struct AirportSerializedSchema {
     tags: HashMap<String, String>,
     /// The contents of the schema itself
     contents: AirportSerializedContentsWithSHA256Hash,
-    /// Should this schema be considered the default schema
-    #[serde(skip_serializing_if = "Option::is_none")]
-    is_default: Option<bool>,
-}
-
-/// Airport extension's expected format for catalog version result
-#[derive(Debug, Serialize, Deserialize)]
-struct AirportGetCatalogVersionResult {
-    catalog_version: u64,
-    is_fixed: bool,
+    // Note: is_default is NOT included in MSGPACK_DEFINE_MAP, so we don't serialize it
 }
 
 /// Airport extension's expected format for catalog root
+/// Uses MSGPACK_DEFINE_MAP(contents, schemas) - only these 2 fields
 #[derive(Debug, Serialize, Deserialize)]
 struct AirportSerializedCatalogRoot {
     /// The contents of the catalog itself
     contents: AirportSerializedContentsWithSHA256Hash,
     /// A list of schemas
     schemas: Vec<AirportSerializedSchema>,
-    /// The version of the catalog returned
-    version_info: AirportGetCatalogVersionResult,
+    // Note: version_info is NOT included in MSGPACK_DEFINE_MAP
 }
 
 /// Handle the "list_schemas" custom action from DuckDB Airport extension
@@ -106,7 +99,6 @@ pub(crate) async fn do_action_list_schemas(
     let schemas: Vec<AirportSerializedSchema> = schema_names
         .into_iter()
         .map(|name| {
-            let is_default = name == "main"; // DuckDB's default schema
             AirportSerializedSchema {
                 name: name.clone(),
                 description: format!("Schema: {}", name),
@@ -116,7 +108,6 @@ pub(crate) async fn do_action_list_schemas(
                     url: None,
                     serialized: Some(String::new()), // Empty serialized content
                 },
-                is_default: if is_default { Some(true) } else { None },
             }
         })
         .collect();
@@ -128,10 +119,6 @@ pub(crate) async fn do_action_list_schemas(
             serialized: Some(String::new()),
         },
         schemas,
-        version_info: AirportGetCatalogVersionResult {
-            catalog_version: 1,
-            is_fixed: false,
-        },
     };
 
     // Serialize to msgpack
