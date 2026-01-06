@@ -14,6 +14,7 @@ use tracing::instrument;
 
 use super::SwanFlightSqlService;
 
+mod action;
 mod prepared;
 mod sql_info;
 mod statement;
@@ -143,5 +144,21 @@ impl FlightSqlService for SwanFlightSqlService {
         request: Request<arrow_flight::Action>,
     ) -> Result<(), Status> {
         transaction::do_action_end_transaction(self, query, request).await
+    }
+
+    #[instrument(skip(self, request), fields(session_id, action_type = %request.get_ref().r#type))]
+    async fn do_action_fallback(
+        &self,
+        request: Request<arrow_flight::Action>,
+    ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        let action_type = &request.get_ref().r#type;
+
+        match action_type.as_str() {
+            "list_schemas" => action::do_action_list_schemas(self, request).await,
+            _ => Err(Status::invalid_argument(format!(
+                "do_action: The defined request is invalid: {:?}",
+                action_type
+            ))),
+        }
     }
 }
