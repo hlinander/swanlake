@@ -811,17 +811,29 @@ pub(crate) async fn do_action_endpoints(
         "handling endpoints action"
     );
 
-    // Build SQL query from the descriptor path (schema.table)
-    let table_path = descriptor.path.join(".");
-
-    // Parse filters for predicate pushdown
-    let where_clause = parse_filters_to_where_clause(&request_data.parameters.json_filters);
-
-    let sql = if let Some(ref conditions) = where_clause {
-        format!("SELECT * FROM {} WHERE {}", table_path, conditions)
+    // Build SQL query - either from cmd (for SQL passthrough) or from path (for table scans)
+    let sql = if !descriptor.cmd.is_empty() {
+        // CMD type descriptor - contains raw SQL (from airport_take_flight)
+        let raw_sql = std::str::from_utf8(&descriptor.cmd)
+            .map_err(|e| Status::invalid_argument(format!("Invalid UTF-8 in SQL: {e}")))?;
+        info!(sql = %raw_sql, "using raw SQL from descriptor cmd (SQL passthrough)");
+        raw_sql.to_string()
     } else {
-        format!("SELECT * FROM {}", table_path)
+        // PATH type descriptor - build SQL from path (for table scans)
+        let table_path = descriptor.path.join(".");
+
+        // Parse filters for predicate pushdown
+        let where_clause = parse_filters_to_where_clause(&request_data.parameters.json_filters);
+
+        if let Some(ref conditions) = where_clause {
+            format!("SELECT * FROM {} WHERE {}", table_path, conditions)
+        } else {
+            format!("SELECT * FROM {}", table_path)
+        }
     };
+
+    // Parse filters for predicate pushdown (for logging)
+    let where_clause = parse_filters_to_where_clause(&request_data.parameters.json_filters);
 
     info!(sql = %sql, predicate_pushdown = where_clause.is_some(), "creating ticket for Airport query");
 

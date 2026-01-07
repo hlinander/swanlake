@@ -18,7 +18,7 @@ mod action;
 mod prepared;
 mod sql_info;
 mod statement;
-mod ticket;
+pub(crate) mod ticket;
 mod transaction;
 
 #[tonic::async_trait]
