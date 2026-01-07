@@ -455,6 +455,266 @@ struct AirportEndpointParameters {
     at_value: String,
 }
 
+/// DuckDB filter JSON structure for predicate pushdown
+#[derive(Debug, Deserialize)]
+struct DuckDBFilters {
+    filters: Vec<DuckDBExpression>,
+    column_binding_names_by_index: Vec<String>,
+}
+
+/// DuckDB expression (all types supported by Airport)
+#[derive(Debug, Deserialize)]
+#[serde(tag = "expression_class")]
+enum DuckDBExpression {
+    #[serde(rename = "BOUND_COMPARISON")]
+    Comparison {
+        #[serde(rename = "type")]
+        comparison_type: String,
+        left: Box<DuckDBExpression>,
+        right: Box<DuckDBExpression>,
+    },
+    #[serde(rename = "BOUND_COLUMN_REF")]
+    ColumnRef {
+        alias: String,
+    },
+    #[serde(rename = "BOUND_CONSTANT")]
+    Constant {
+        value: DuckDBValue,
+    },
+    #[serde(rename = "BOUND_CONJUNCTION")]
+    Conjunction {
+        #[serde(rename = "type")]
+        conjunction_type: String,
+        children: Vec<DuckDBExpression>,
+    },
+    #[serde(rename = "BOUND_OPERATOR")]
+    Operator {
+        #[serde(rename = "type")]
+        operator_type: String,
+        children: Vec<DuckDBExpression>,
+    },
+    #[serde(rename = "BOUND_BETWEEN")]
+    Between {
+        input: Box<DuckDBExpression>,
+        lower: Box<DuckDBExpression>,
+        upper: Box<DuckDBExpression>,
+    },
+    #[serde(rename = "BOUND_FUNCTION")]
+    Function {
+        name: String,
+        children: Vec<DuckDBExpression>,
+    },
+    #[serde(rename = "BOUND_CAST")]
+    Cast {
+        child: Box<DuckDBExpression>,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+struct DuckDBValue {
+    #[serde(rename = "type")]
+    value_type: DuckDBType,
+    is_null: bool,
+    #[serde(default)]
+    value: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct DuckDBType {
+    id: String,
+}
+
+/// Convert a DuckDB expression to SQL
+fn expression_to_sql(expr: &DuckDBExpression) -> Option<String> {
+    match expr {
+        DuckDBExpression::Comparison { comparison_type, left, right } => {
+            let left_sql = expression_to_sql(left)?;
+            let right_sql = expression_to_sql(right)?;
+            let op = match comparison_type.as_str() {
+                "COMPARE_EQUAL" => "=",
+                "COMPARE_NOTEQUAL" => "!=",
+                "COMPARE_LESSTHAN" => "<",
+                "COMPARE_GREATERTHAN" => ">",
+                "COMPARE_LESSTHANOREQUALTO" => "<=",
+                "COMPARE_GREATERTHANOREQUALTO" => ">=",
+                _ => return None,
+            };
+            Some(format!("{} {} {}", left_sql, op, right_sql))
+        }
+        DuckDBExpression::ColumnRef { alias } => {
+            // Quote column name to handle special characters
+            Some(format!("\"{}\"", alias))
+        }
+        DuckDBExpression::Constant { value } => {
+            if value.is_null {
+                return Some("NULL".to_string());
+            }
+            match value.value_type.id.as_str() {
+                "INTEGER" | "BIGINT" | "SMALLINT" | "TINYINT" | "DOUBLE" | "FLOAT" => {
+                    Some(value.value.to_string())
+                }
+                "VARCHAR" | "TEXT" => {
+                    if let Some(s) = value.value.as_str() {
+                        // Escape single quotes
+                        Some(format!("'{}'", s.replace('\'', "''")))
+                    } else {
+                        Some(format!("'{}'", value.value))
+                    }
+                }
+                "BOOLEAN" => {
+                    Some(value.value.to_string().to_uppercase())
+                }
+                _ => Some(value.value.to_string()),
+            }
+        }
+        DuckDBExpression::Conjunction { conjunction_type, children } => {
+            let parts: Vec<String> = children.iter()
+                .filter_map(expression_to_sql)
+                .collect();
+            if parts.is_empty() {
+                return None;
+            }
+            let op = match conjunction_type.as_str() {
+                "CONJUNCTION_AND" => " AND ",
+                "CONJUNCTION_OR" => " OR ",
+                _ => return None,
+            };
+            Some(format!("({})", parts.join(op)))
+        }
+        DuckDBExpression::Operator { operator_type, children } => {
+            match operator_type.as_str() {
+                "OPERATOR_IS_NULL" => {
+                    let child = children.first()?;
+                    let child_sql = expression_to_sql(child)?;
+                    Some(format!("{} IS NULL", child_sql))
+                }
+                "OPERATOR_IS_NOT_NULL" => {
+                    let child = children.first()?;
+                    let child_sql = expression_to_sql(child)?;
+                    Some(format!("{} IS NOT NULL", child_sql))
+                }
+                "COMPARE_IN" => {
+                    if children.is_empty() {
+                        return None;
+                    }
+                    let column = expression_to_sql(children.first()?)?;
+                    let values: Vec<String> = children.iter()
+                        .skip(1)
+                        .filter_map(expression_to_sql)
+                        .collect();
+                    if values.is_empty() {
+                        return None;
+                    }
+                    Some(format!("{} IN ({})", column, values.join(", ")))
+                }
+                "COMPARE_NOT_IN" => {
+                    if children.is_empty() {
+                        return None;
+                    }
+                    let column = expression_to_sql(children.first()?)?;
+                    let values: Vec<String> = children.iter()
+                        .skip(1)
+                        .filter_map(expression_to_sql)
+                        .collect();
+                    if values.is_empty() {
+                        return None;
+                    }
+                    Some(format!("{} NOT IN ({})", column, values.join(", ")))
+                }
+                "OPERATOR_NOT" => {
+                    let child = children.first()?;
+                    let child_sql = expression_to_sql(child)?;
+                    Some(format!("NOT ({})", child_sql))
+                }
+                _ => {
+                    info!(operator = %operator_type, "unsupported operator type");
+                    None
+                }
+            }
+        }
+        DuckDBExpression::Between { input, lower, upper } => {
+            let input_sql = expression_to_sql(input)?;
+            let lower_sql = expression_to_sql(lower)?;
+            let upper_sql = expression_to_sql(upper)?;
+            Some(format!("{} BETWEEN {} AND {}", input_sql, lower_sql, upper_sql))
+        }
+        DuckDBExpression::Function { name, children } => {
+            // Handle common functions that can be pushed down
+            match name.to_lowercase().as_str() {
+                "~~" | "like" => {
+                    // LIKE operator: first child is column, second is pattern
+                    if children.len() < 2 {
+                        return None;
+                    }
+                    let column = expression_to_sql(&children[0])?;
+                    let pattern = expression_to_sql(&children[1])?;
+                    Some(format!("{} LIKE {}", column, pattern))
+                }
+                "!~~" | "not_like" => {
+                    if children.len() < 2 {
+                        return None;
+                    }
+                    let column = expression_to_sql(&children[0])?;
+                    let pattern = expression_to_sql(&children[1])?;
+                    Some(format!("{} NOT LIKE {}", column, pattern))
+                }
+                "~~~" | "ilike" => {
+                    if children.len() < 2 {
+                        return None;
+                    }
+                    let column = expression_to_sql(&children[0])?;
+                    let pattern = expression_to_sql(&children[1])?;
+                    Some(format!("{} ILIKE {}", column, pattern))
+                }
+                _ => {
+                    // For other functions, try to generate standard function call syntax
+                    let args: Vec<String> = children.iter()
+                        .filter_map(expression_to_sql)
+                        .collect();
+                    if args.is_empty() && !children.is_empty() {
+                        return None;
+                    }
+                    Some(format!("{}({})", name, args.join(", ")))
+                }
+            }
+        }
+        DuckDBExpression::Cast { child } => {
+            // For casts, just evaluate the child expression
+            // The type conversion will be handled by the database
+            expression_to_sql(child)
+        }
+        DuckDBExpression::Unknown => {
+            info!("encountered unknown expression type, skipping");
+            None
+        }
+    }
+}
+
+/// Parse filters JSON and convert to SQL WHERE clause
+fn parse_filters_to_where_clause(json_filters: &str) -> Option<String> {
+    if json_filters.is_empty() {
+        return None;
+    }
+
+    let filters: DuckDBFilters = serde_json::from_str(json_filters).ok()?;
+
+    if filters.filters.is_empty() {
+        return None;
+    }
+
+    let conditions: Vec<String> = filters.filters.iter()
+        .filter_map(expression_to_sql)
+        .collect();
+
+    if conditions.is_empty() {
+        return None;
+    }
+
+    Some(conditions.join(" AND "))
+}
+
 /// Airport's endpoints request
 #[derive(Debug, Deserialize)]
 struct AirportGetFlightEndpointsRequest {
@@ -553,9 +813,17 @@ pub(crate) async fn do_action_endpoints(
 
     // Build SQL query from the descriptor path (schema.table)
     let table_path = descriptor.path.join(".");
-    let sql = format!("SELECT * FROM {}", table_path);
 
-    info!(sql = %sql, "creating ticket for Airport query");
+    // Parse filters for predicate pushdown
+    let where_clause = parse_filters_to_where_clause(&request_data.parameters.json_filters);
+
+    let sql = if let Some(ref conditions) = where_clause {
+        format!("SELECT * FROM {} WHERE {}", table_path, conditions)
+    } else {
+        format!("SELECT * FROM {}", table_path)
+    };
+
+    info!(sql = %sql, predicate_pushdown = where_clause.is_some(), "creating ticket for Airport query");
 
     // Create a ticket using SwanLake's internal format (wrapped in Flight SQL's TicketStatementQuery)
     // This will be executed when Airport calls DoGet
