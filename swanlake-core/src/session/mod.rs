@@ -84,7 +84,8 @@ impl PreparedStatementState {
 /// A client session with dedicated connection and state
 pub struct Session {
     id: SessionId,
-    connection: DuckDbConnection,
+    /// The DuckDB connection for this session (pub(crate) for streaming access)
+    pub(crate) connection: DuckDbConnection,
     transactions: Mutex<HashSet<TransactionId>>,
     aborted_transactions: Mutex<HashSet<TransactionId>>,
     prepared_statements: Mutex<HashMap<StatementHandle, PreparedStatementState>>,

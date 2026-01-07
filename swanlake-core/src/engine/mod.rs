@@ -9,5 +9,5 @@ pub(crate) mod batch;
 pub mod connection;
 mod factory;
 
-pub use connection::{DuckDbConnection, QueryResult};
+pub use connection::{DuckDbConnection, QueryResult, StreamingBatch};
 pub use factory::EngineFactory;

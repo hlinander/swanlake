@@ -20,6 +20,7 @@ use crate::session::{registry::SessionRegistry, Session, SessionId};
 mod convert;
 mod execute;
 mod handlers;
+pub(crate) mod streaming;
 
 use handlers::ticket::{StatementTicketKind, TicketStatementPayload};
 

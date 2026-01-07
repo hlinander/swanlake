@@ -3,9 +3,8 @@ use std::sync::Arc;
 use arrow_flight::flight_service_server::FlightService;
 use duckdb::types::Value;
 use tonic::{metadata::MetadataValue, Response, Status};
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 
-use crate::engine::connection::QueryResult;
 use crate::session::id::StatementHandle;
 use crate::session::{PreparedStatementMeta, Session};
 
@@ -145,59 +144,17 @@ impl SwanFlightSqlService {
             handle = %handle,
             sql = %sql,
             param_count,
-            "executing prepared statement via handle"
+            streaming = true,
+            "executing prepared statement via handle (streaming)"
         );
 
-        let session_clone = session.clone();
-        let params_for_exec = parameters;
-        let sql_for_exec = sql;
+        // Use streaming execution for better latency and memory efficiency
+        let params = if parameters.is_empty() {
+            None
+        } else {
+            Some(parameters)
+        };
 
-        let QueryResult {
-            schema,
-            batches,
-            total_rows,
-            total_bytes,
-        } = tokio::task::spawn_blocking(move || {
-            if params_for_exec.is_empty() {
-                session_clone.execute_query(&sql_for_exec)
-            } else {
-                session_clone.execute_query_with_params(&sql_for_exec, &params_for_exec)
-            }
-        })
-        .await
-        .map_err(Self::status_from_join)?
-        .map_err(Self::status_from_error)?;
-
-        let flight_data =
-            arrow_flight::utils::batches_to_flight_data(&schema, batches).map_err(|err| {
-                error!(%err, "failed to convert record batches to flight data");
-                Status::internal(format!(
-                    "failed to convert record batches to flight data: {err}"
-                ))
-            })?;
-
-        debug!(
-            handle = %handle,
-            batch_count = flight_data.len(),
-            "converted batches to flight data"
-        );
-
-        let stream = Self::into_stream(flight_data);
-        let mut response = Response::new(stream);
-        if let Ok(value) = MetadataValue::try_from(total_rows.to_string()) {
-            response
-                .metadata_mut()
-                .insert("x-swanlake-total-rows", value);
-        }
-        if let Ok(value) = MetadataValue::try_from(total_bytes.to_string()) {
-            response
-                .metadata_mut()
-                .insert("x-swanlake-total-bytes", value);
-        }
-        info!(
-            handle = %handle,
-            total_rows, total_bytes, "prepared statement completed"
-        );
-        Ok(response)
+        Self::execute_query_streaming(session.clone(), sql, params).await
     }
 }

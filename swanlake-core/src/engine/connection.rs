@@ -10,11 +10,24 @@ use arrow_schema::{Field, Schema};
 use duckdb::types::Value;
 use duckdb::{params_from_iter, Connection};
 use duckdb::{Arrow, Statement};
+use tokio::sync::mpsc;
 use tracing::{debug, info, instrument};
 
 use crate::error::ServerError;
 
 use crate::types::duckdb_type_to_arrow;
+
+/// Message sent through the streaming channel
+pub enum StreamingBatch {
+    /// Schema message (sent first)
+    Schema(Schema),
+    /// A record batch
+    Batch(RecordBatch),
+    /// Query completed with totals
+    Done { total_rows: usize, total_bytes: usize },
+    /// Error occurred
+    Error(ServerError),
+}
 
 /// Result of a query execution
 pub struct QueryResult {
@@ -76,6 +89,89 @@ impl DuckDbConnection {
                 "executed query"
             );
             Ok(result)
+        })
+    }
+
+    /// Execute a SELECT query and stream results through a channel.
+    ///
+    /// This method sends batches as they're produced by DuckDB, enabling
+    /// progressive streaming to clients without collecting all results first.
+    ///
+    /// The channel receives:
+    /// 1. `Schema` - The result schema (first message)
+    /// 2. `Batch` - Zero or more record batches
+    /// 3. `Done` - Final message with totals, OR `Error` if something failed
+    #[instrument(skip(self, tx), fields(sql = %sql))]
+    pub fn execute_query_streaming(
+        &self,
+        sql: &str,
+        tx: mpsc::Sender<StreamingBatch>,
+    ) -> Result<(), ServerError> {
+        self.with_prepared(sql, |stmt| {
+            let arrow = Self::query_arrow(stmt, None)?;
+
+            // Send schema first
+            let schema = arrow.get_schema();
+            if tx.blocking_send(StreamingBatch::Schema(schema.as_ref().clone())).is_err() {
+                debug!("streaming receiver dropped, stopping query");
+                return Ok(());
+            }
+
+            // Stream batches
+            let mut total_rows = 0usize;
+            let mut total_bytes = 0usize;
+            for batch in arrow {
+                total_rows += batch.num_rows();
+                total_bytes += batch.get_array_memory_size();
+
+                if tx.blocking_send(StreamingBatch::Batch(batch)).is_err() {
+                    debug!("streaming receiver dropped, stopping query");
+                    return Ok(());
+                }
+            }
+
+            // Send completion message
+            let _ = tx.blocking_send(StreamingBatch::Done { total_rows, total_bytes });
+            debug!(total_rows, total_bytes, "streaming query completed");
+            Ok(())
+        })
+    }
+
+    /// Execute a query with parameters and stream results through a channel.
+    #[instrument(skip(self, tx, params), fields(sql = %sql, param_count = params.len()))]
+    pub fn execute_query_with_params_streaming(
+        &self,
+        sql: &str,
+        params: &[Value],
+        tx: mpsc::Sender<StreamingBatch>,
+    ) -> Result<(), ServerError> {
+        self.with_prepared(sql, |stmt| {
+            let arrow = Self::query_arrow(stmt, Some(params))?;
+
+            // Send schema first
+            let schema = arrow.get_schema();
+            if tx.blocking_send(StreamingBatch::Schema(schema.as_ref().clone())).is_err() {
+                debug!("streaming receiver dropped, stopping query");
+                return Ok(());
+            }
+
+            // Stream batches
+            let mut total_rows = 0usize;
+            let mut total_bytes = 0usize;
+            for batch in arrow {
+                total_rows += batch.num_rows();
+                total_bytes += batch.get_array_memory_size();
+
+                if tx.blocking_send(StreamingBatch::Batch(batch)).is_err() {
+                    debug!("streaming receiver dropped, stopping query");
+                    return Ok(());
+                }
+            }
+
+            // Send completion message
+            let _ = tx.blocking_send(StreamingBatch::Done { total_rows, total_bytes });
+            debug!(total_rows, total_bytes, "streaming query with params completed");
+            Ok(())
         })
     }
 
