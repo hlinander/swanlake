@@ -289,19 +289,36 @@ pub(crate) async fn do_action_list_schemas(
     info!(count = schema_names.len(), schemas = ?schema_names, "found schemas");
 
     // Get the catalog name from the request body (msgpack encoded)
-    let catalog_name = if !request.get_ref().body.is_empty() {
-        #[derive(Deserialize)]
+    let body = &request.get_ref().body;
+    info!(body_len = body.len(), body_hex = %hex::encode(&body[..body.len().min(100)]), "list_schemas request body");
+
+    let catalog_name = if !body.is_empty() {
+        // Try parsing as map with catalog_name field
+        #[derive(Deserialize, Debug)]
         struct CatalogRequest {
-            catalog_name: String,
+            catalog_name: Option<String>,
         }
-        rmp_serde::from_slice::<CatalogRequest>(&request.get_ref().body)
-            .map(|r| r.catalog_name)
-            .unwrap_or_else(|e| {
-                info!("Failed to parse catalog request: {}, using default", e);
-                "hello".to_string()
-            })
+        match rmp_serde::from_slice::<CatalogRequest>(body) {
+            Ok(r) => {
+                info!(parsed = ?r, "parsed catalog request");
+                r.catalog_name.unwrap_or_default()
+            }
+            Err(e) => {
+                // Try parsing as raw string
+                match rmp_serde::from_slice::<String>(body) {
+                    Ok(s) => {
+                        info!(raw_string = %s, "parsed as raw string");
+                        s
+                    }
+                    Err(_) => {
+                        info!("Failed to parse catalog request: {}, using default", e);
+                        String::new()
+                    }
+                }
+            }
+        }
     } else {
-        "hello".to_string()
+        String::new()
     };
 
     info!(catalog_name = %catalog_name, "using catalog name for list_schemas");
@@ -867,6 +884,264 @@ pub(crate) async fn do_action_endpoints(
     rmp::encode::write_str_len(&mut result_body, endpoint_bytes.len() as u32)
         .map_err(|e| Status::internal(format!("Failed to write str len: {}", e)))?;
     result_body.extend_from_slice(&endpoint_bytes);
+
+    let result = arrow_flight::Result {
+        body: result_body.into(),
+    };
+
+    let output_stream = Box::pin(stream::iter(vec![Ok(result)]));
+    Ok(Response::new(output_stream))
+}
+
+/// Airport's create_table request parameters
+/// Uses MSGPACK_DEFINE_MAP with all constraint fields
+#[derive(Debug, Deserialize)]
+struct AirportCreateTableParameters {
+    catalog_name: String,
+    schema_name: String,
+    table_name: String,
+    /// IPC-serialized Arrow schema
+    #[serde(with = "serde_bytes")]
+    arrow_schema: Vec<u8>,
+    /// Conflict resolution: "error", "ignore", "replace"
+    #[serde(default)]
+    on_conflict: String,
+    #[serde(default)]
+    not_null_constraints: Vec<u64>,
+    #[serde(default)]
+    unique_constraints: Vec<u64>,
+    #[serde(default)]
+    check_constraints: Vec<String>,
+    #[serde(default)]
+    primary_key_columns: Vec<String>,
+    #[serde(default)]
+    unique_columns: Vec<String>,
+    #[serde(default)]
+    multi_key_primary_keys: Vec<String>,
+    #[serde(default)]
+    extra_constraints: Vec<String>,
+}
+
+/// Convert Arrow DataType to DuckDB SQL type
+fn arrow_type_to_duckdb_sql(dtype: &DataType) -> String {
+    match dtype {
+        DataType::Boolean => "BOOLEAN".to_string(),
+        DataType::Int8 => "TINYINT".to_string(),
+        DataType::Int16 => "SMALLINT".to_string(),
+        DataType::Int32 => "INTEGER".to_string(),
+        DataType::Int64 => "BIGINT".to_string(),
+        DataType::UInt8 => "UTINYINT".to_string(),
+        DataType::UInt16 => "USMALLINT".to_string(),
+        DataType::UInt32 => "UINTEGER".to_string(),
+        DataType::UInt64 => "UBIGINT".to_string(),
+        DataType::Float32 => "FLOAT".to_string(),
+        DataType::Float64 => "DOUBLE".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR".to_string(),
+        DataType::Binary | DataType::LargeBinary => "BLOB".to_string(),
+        DataType::Date32 | DataType::Date64 => "DATE".to_string(),
+        DataType::Time32(_) | DataType::Time64(_) => "TIME".to_string(),
+        DataType::Timestamp(_, None) => "TIMESTAMP".to_string(),
+        DataType::Timestamp(_, Some(_)) => "TIMESTAMPTZ".to_string(),
+        DataType::Interval(_) => "INTERVAL".to_string(),
+        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => format!("DECIMAL({}, {})", p, s),
+        DataType::List(field) | DataType::LargeList(field) => {
+            format!("{}[]", arrow_type_to_duckdb_sql(field.data_type()))
+        }
+        DataType::Struct(fields) => {
+            let field_defs: Vec<String> = fields
+                .iter()
+                .map(|f| format!("{} {}", f.name(), arrow_type_to_duckdb_sql(f.data_type())))
+                .collect();
+            format!("STRUCT({})", field_defs.join(", "))
+        }
+        DataType::Map(field, _) => {
+            if let DataType::Struct(fields) = field.data_type() {
+                if fields.len() == 2 {
+                    let key_type = arrow_type_to_duckdb_sql(fields[0].data_type());
+                    let value_type = arrow_type_to_duckdb_sql(fields[1].data_type());
+                    return format!("MAP({}, {})", key_type, value_type);
+                }
+            }
+            "JSON".to_string()
+        }
+        _ => "VARCHAR".to_string(), // Fallback for unknown types
+    }
+}
+
+/// Handle the "create_table" action from DuckDB Airport extension
+pub(crate) async fn do_action_create_table(
+    service: &SwanFlightSqlService,
+    request: Request<Action>,
+) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
+    let session = service.prepare_request(&request).await?;
+
+    // Parse the request parameters
+    let params: AirportCreateTableParameters =
+        rmp_serde::from_slice(&request.get_ref().body)
+            .map_err(|e| Status::invalid_argument(format!("Failed to parse create_table request: {}", e)))?;
+
+    info!(
+        catalog = %params.catalog_name,
+        schema = %params.schema_name,
+        table = %params.table_name,
+        on_conflict = %params.on_conflict,
+        arrow_schema_len = params.arrow_schema.len(),
+        arrow_schema_hex = %hex::encode(&params.arrow_schema[..params.arrow_schema.len().min(100)]),
+        "handling create_table action"
+    );
+
+    // Deserialize Arrow schema from IPC stream format
+    // Use StreamReader which handles the IPC framing (continuation markers, size prefixes)
+    let cursor = std::io::Cursor::new(&params.arrow_schema);
+    let reader = arrow_ipc::reader::StreamReader::try_new(cursor, None)
+        .map_err(|e| Status::invalid_argument(format!("Failed to parse Arrow schema: {}", e)))?;
+    let schema = reader.schema();
+
+    info!(fields = ?schema.fields().iter().map(|f: &arrow_schema::FieldRef| f.name().as_str()).collect::<Vec<_>>(), "parsed Arrow schema");
+
+    // Build column definitions
+    let column_defs: Vec<String> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field): (usize, &arrow_schema::FieldRef)| {
+            let mut col_def = format!(
+                "\"{}\" {}",
+                field.name(),
+                arrow_type_to_duckdb_sql(field.data_type())
+            );
+            // Add NOT NULL constraint if specified
+            if params.not_null_constraints.contains(&(idx as u64)) || !field.is_nullable() {
+                col_def.push_str(" NOT NULL");
+            }
+            col_def
+        })
+        .collect();
+
+    // Build constraints
+    let mut constraints = Vec::new();
+    if !params.primary_key_columns.is_empty() {
+        constraints.push(format!(
+            "PRIMARY KEY ({})",
+            params.primary_key_columns.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !params.unique_columns.is_empty() {
+        constraints.push(format!(
+            "UNIQUE ({})",
+            params.unique_columns.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    // Build CREATE TABLE statement
+    let qualified_name = if params.schema_name.is_empty() {
+        format!("\"{}\"", params.table_name)
+    } else {
+        format!("\"{}\".\"{}\"", params.schema_name, params.table_name)
+    };
+
+    let if_not_exists = if params.on_conflict == "ignore" { "IF NOT EXISTS " } else { "" };
+
+    let mut sql = format!(
+        "CREATE TABLE {}{} ({}",
+        if_not_exists,
+        qualified_name,
+        column_defs.join(", ")
+    );
+    if !constraints.is_empty() {
+        sql.push_str(", ");
+        sql.push_str(&constraints.join(", "));
+    }
+    sql.push(')');
+
+    info!(sql = %sql, "executing CREATE TABLE");
+
+    // Execute CREATE TABLE
+    let session_clone = session.clone();
+    tokio::task::spawn_blocking(move || session_clone.execute_statement(&sql))
+        .await
+        .map_err(SwanFlightSqlService::status_from_join)?
+        .map_err(SwanFlightSqlService::status_from_error)?;
+
+    info!(table = %params.table_name, "table created successfully");
+
+    // Build FlightInfo response for the new table
+    let columns: Vec<(String, DataType)> = schema
+        .fields()
+        .iter()
+        .map(|f: &arrow_schema::FieldRef| (f.name().clone(), f.data_type().clone()))
+        .collect();
+    let flight_info = build_table_flight_info(
+        &params.catalog_name,
+        &params.schema_name,
+        &params.table_name,
+        columns,
+    )?;
+
+    // Serialize FlightInfo as the response
+    let flight_info_bytes = flight_info.encode_to_vec();
+
+    let result = arrow_flight::Result {
+        body: flight_info_bytes.into(),
+    };
+
+    let output_stream = Box::pin(stream::iter(vec![Ok(result)]));
+    Ok(Response::new(output_stream))
+}
+
+/// Airport's create_schema request parameters
+/// Uses MSGPACK_DEFINE_MAP(catalog_name, schema, comment, tags)
+#[derive(Debug, Deserialize)]
+struct AirportCreateSchemaParameters {
+    catalog_name: String,
+    schema: String,
+    comment: Option<String>,
+    #[serde(default)]
+    tags: HashMap<String, String>,
+}
+
+/// Handle the "create_schema" action from DuckDB Airport extension
+/// Creates a schema in the database if it doesn't exist
+pub(crate) async fn do_action_create_schema(
+    service: &SwanFlightSqlService,
+    request: Request<Action>,
+) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
+    let session = service.prepare_request(&request).await?;
+
+    // Parse the request parameters
+    let params: AirportCreateSchemaParameters =
+        rmp_serde::from_slice(&request.get_ref().body)
+            .map_err(|e| Status::invalid_argument(format!("Failed to parse create_schema request: {}", e)))?;
+
+    info!(
+        catalog = %params.catalog_name,
+        schema = %params.schema,
+        comment = ?params.comment,
+        "handling create_schema action"
+    );
+
+    // Execute CREATE SCHEMA IF NOT EXISTS
+    let schema_name = params.schema.clone();
+    let session_clone = session.clone();
+    tokio::task::spawn_blocking(move || {
+        let sql = format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema_name);
+        session_clone.execute_statement(&sql)
+    })
+    .await
+    .map_err(SwanFlightSqlService::status_from_join)?
+    .map_err(SwanFlightSqlService::status_from_error)?;
+
+    info!(schema = %params.schema, "schema created successfully");
+
+    // Return empty contents with SHA256 hash (schema has no tables initially)
+    let contents = AirportSerializedContentsWithSHA256Hash {
+        sha256: String::new(),
+        url: None,
+        serialized: None,
+    };
+
+    let result_body = rmp_serde::to_vec_named(&contents)
+        .map_err(|e| Status::internal(format!("Failed to serialize create_schema response: {}", e)))?;
 
     let result = arrow_flight::Result {
         body: result_body.into(),

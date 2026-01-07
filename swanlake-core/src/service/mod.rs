@@ -179,6 +179,14 @@ impl SwanFlightService {
         }
     }
 
+    /// Check if SQL is a DDL statement (doesn't return rows)
+    fn is_ddl_statement(sql: &str) -> bool {
+        let trimmed = sql.trim().to_uppercase();
+        trimmed.starts_with("CREATE")
+            || trimmed.starts_with("DROP")
+            || trimmed.starts_with("ALTER")
+    }
+
     /// Handle raw Flight SQL passthrough (for airport_take_flight).
     async fn handle_raw_sql_flight_info(
         &self,
@@ -193,7 +201,27 @@ impl SwanFlightService {
 
         let session = self.inner.prepare_request(&request).await?;
 
-        // Get schema for the query
+        // Check if this is a DDL statement - execute directly without expecting results
+        if Self::is_ddl_statement(&sql) {
+            info!(sql = %sql, "executing DDL statement via passthrough");
+
+            let sql_clone = sql.clone();
+            let session_clone = Arc::clone(&session);
+            tokio::task::spawn_blocking(move || session_clone.execute_statement(&sql_clone))
+                .await
+                .map_err(SwanFlightSqlService::status_from_join)?
+                .map_err(SwanFlightSqlService::status_from_error)?;
+
+            // Return empty FlightInfo for DDL (no result rows)
+            let info = FlightInfo::new()
+                .try_with_schema(&arrow_schema::Schema::empty())
+                .map_err(|e| Status::internal(format!("Failed to encode schema: {e}")))?
+                .with_descriptor(request.into_inner());
+
+            return Ok(Response::new(info));
+        }
+
+        // For queries, get schema and create ticket for DoGet
         let sql_clone = sql.clone();
         let session_clone = Arc::clone(&session);
         let schema = tokio::task::spawn_blocking(move || session_clone.schema_for_query(&sql_clone))
