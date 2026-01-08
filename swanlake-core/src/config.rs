@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Path to DuckDB database file. Use ":memory:" for in-memory (default).
+    pub database_path: Option<String>,
     /// Optional SQL statement executed during startup for ducklake integration.
     pub ducklake_init_sql: Option<String>,
     /// Optional comma-separated list of DuckLake databases to checkpoint periodically.
@@ -26,6 +28,7 @@ impl Default for ServerConfig {
         Self {
             host: "0.0.0.0".to_string(),
             port: 4214,
+            database_path: None, // None means in-memory
             ducklake_init_sql: None,
             checkpoint_databases: None,
             checkpoint_interval_hours: Some(24),

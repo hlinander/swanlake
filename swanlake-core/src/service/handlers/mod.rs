@@ -15,6 +15,7 @@ use tracing::instrument;
 use super::SwanFlightSqlService;
 
 mod action;
+pub(crate) mod exchange;
 mod prepared;
 mod sql_info;
 mod statement;
@@ -160,10 +161,35 @@ impl FlightSqlService for SwanFlightSqlService {
             "create_transaction" => action::do_action_create_transaction(self, request).await,
             "catalog_version" => action::do_action_catalog_version(self, request).await,
             "endpoints" => action::do_action_endpoints(self, request).await,
-            _ => Err(Status::invalid_argument(format!(
-                "do_action: The defined request is invalid: {:?}",
-                action_type
-            ))),
+            "execute" => action::do_action_execute(self, request).await,
+            _ => {
+                // Check if the action type itself is SQL (Airport uses this pattern for DDL)
+                let trimmed = action_type.trim().to_uppercase();
+                if trimmed.starts_with("CREATE")
+                    || trimmed.starts_with("DROP")
+                    || trimmed.starts_with("ALTER")
+                    || trimmed.starts_with("INSERT")
+                    || trimmed.starts_with("UPDATE")
+                    || trimmed.starts_with("DELETE")
+                    || trimmed.starts_with("TRUNCATE")
+                {
+                    // Action type is SQL - execute it directly
+                    let sql = action_type.clone();
+                    action::do_action_execute_sql(self, &sql, request).await
+                } else {
+                    let body = &request.get_ref().body;
+                    tracing::warn!(
+                        action_type = %action_type,
+                        body_len = body.len(),
+                        body_hex = %hex::encode(&body[..body.len().min(200)]),
+                        "unknown action type"
+                    );
+                    Err(Status::invalid_argument(format!(
+                        "do_action: The defined request is invalid: {:?}",
+                        action_type
+                    )))
+                }
+            }
         }
     }
 }

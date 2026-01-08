@@ -1150,3 +1150,121 @@ pub(crate) async fn do_action_create_schema(
     let output_stream = Box::pin(stream::iter(vec![Ok(result)]));
     Ok(Response::new(output_stream))
 }
+
+/// Airport's execute action request - for arbitrary SQL that doesn't return rows
+/// The body can be either raw SQL string or msgpack-encoded SQL
+#[derive(Debug, Deserialize)]
+struct AirportExecuteParameters {
+    sql: String,
+}
+
+/// Handle the "execute" action from DuckDB Airport extension
+/// Executes arbitrary SQL (DDL/DML) that doesn't return rows
+pub(crate) async fn do_action_execute(
+    service: &SwanFlightSqlService,
+    request: Request<Action>,
+) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
+    let session = service.prepare_request(&request).await?;
+    let body = &request.get_ref().body;
+
+    info!(
+        body_len = body.len(),
+        body_hex = %hex::encode(&body[..body.len().min(100)]),
+        "handling execute action"
+    );
+
+    // Try to parse the SQL from the body
+    // Airport sends the body as msgpack - try different formats
+    let sql = if body.is_empty() {
+        return Err(Status::invalid_argument("execute action requires SQL in body"));
+    } else {
+        // First try: parse as msgpack map with "sql" field
+        if let Ok(params) = rmp_serde::from_slice::<AirportExecuteParameters>(body) {
+            info!(sql = %params.sql, "parsed SQL from msgpack map");
+            params.sql
+        }
+        // Second try: parse as raw msgpack string
+        else if let Ok(sql_str) = rmp_serde::from_slice::<String>(body) {
+            info!(sql = %sql_str, "parsed SQL from msgpack string");
+            sql_str
+        }
+        // Third try: treat as raw UTF-8 string
+        else if let Ok(sql_str) = std::str::from_utf8(body) {
+            info!(sql = %sql_str, "parsed SQL from raw UTF-8");
+            sql_str.to_string()
+        } else {
+            return Err(Status::invalid_argument("execute action body must be SQL string"));
+        }
+    };
+
+    info!(sql = %sql, "executing action SQL");
+
+    // Execute the SQL statement
+    let sql_clone = sql.clone();
+    let session_clone = session.clone();
+    let affected_rows = tokio::task::spawn_blocking(move || {
+        session_clone.execute_statement(&sql_clone)
+    })
+    .await
+    .map_err(SwanFlightSqlService::status_from_join)?
+    .map_err(SwanFlightSqlService::status_from_error)?;
+
+    info!(sql = %sql, affected_rows, "execute action completed");
+
+    // Return affected rows as msgpack
+    // Airport expects a result that can be converted to a table
+    #[derive(Serialize)]
+    struct ExecuteResult {
+        affected_rows: i64,
+    }
+
+    let result_body = rmp_serde::to_vec_named(&ExecuteResult { affected_rows })
+        .map_err(|e| Status::internal(format!("Failed to serialize execute result: {}", e)))?;
+
+    let result = arrow_flight::Result {
+        body: result_body.into(),
+    };
+
+    let output_stream = Box::pin(stream::iter(vec![Ok(result)]));
+    Ok(Response::new(output_stream))
+}
+
+/// Handle SQL passed directly as the action type (Airport pattern for DDL)
+/// The action type itself contains the SQL to execute
+pub(crate) async fn do_action_execute_sql(
+    service: &SwanFlightSqlService,
+    sql: &str,
+    request: Request<Action>,
+) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
+    let session = service.prepare_request(&request).await?;
+
+    info!(sql = %sql, "executing SQL from action type");
+
+    // Execute the SQL statement
+    let sql_owned = sql.to_string();
+    let session_clone = session.clone();
+    let affected_rows = tokio::task::spawn_blocking(move || {
+        session_clone.execute_statement(&sql_owned)
+    })
+    .await
+    .map_err(SwanFlightSqlService::status_from_join)?
+    .map_err(SwanFlightSqlService::status_from_error)?;
+
+    info!(sql = %sql, affected_rows, "SQL action completed");
+
+    // Return affected rows as msgpack
+    #[derive(Serialize)]
+    struct ExecuteResult {
+        affected_rows: i64,
+    }
+
+    let result_body = rmp_serde::to_vec_named(&ExecuteResult { affected_rows })
+        .map_err(|e| Status::internal(format!("Failed to serialize execute result: {}", e)))?;
+
+    let result = arrow_flight::Result {
+        body: result_body.into(),
+    };
+
+    let output_stream = Box::pin(stream::iter(vec![Ok(result)]));
+    Ok(Response::new(output_stream))
+}

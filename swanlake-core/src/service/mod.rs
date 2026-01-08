@@ -325,7 +325,8 @@ impl FlightService for SwanFlightService {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        self.inner.do_exchange(request).await
+        // Handle Airport's DoExchange for insert/update/delete operations
+        handlers::exchange::do_exchange(&self.inner, request).await
     }
 
     async fn poll_flight_info(

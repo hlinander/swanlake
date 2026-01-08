@@ -14,6 +14,7 @@ use crate::error::ServerError;
 #[derive(Clone)]
 pub struct EngineFactory {
     init_sql: String,
+    database_path: Option<String>,
 }
 
 impl EngineFactory {
@@ -37,19 +38,32 @@ impl EngineFactory {
         let init_sql = init_statements.join("\n");
         info!("base init sql {}", init_sql);
 
-        Ok(Self { init_sql })
+        let database_path = config.database_path.clone();
+        if let Some(ref path) = database_path {
+            info!("using file-based database: {}", path);
+        } else {
+            info!("using in-memory database");
+        }
+
+        Ok(Self { init_sql, database_path })
     }
 
     /// Create a new initialized DuckDB connection
     ///
-    /// Each connection is created fresh with its own in-memory database.
-    /// This ensures complete isolation between sessions.
+    /// If database_path is set, opens a file-based database (shared across sessions).
+    /// Otherwise, creates an in-memory database (isolated per session).
     #[instrument(skip(self))]
     pub fn create_connection(&self) -> Result<DuckDbConnection, ServerError> {
         let config = Config::default()
             .enable_autoload_extension(true)?
             .allow_unsigned_extensions()?;
-        let conn = Connection::open_in_memory_with_flags(config)?;
+
+        let conn = if let Some(ref path) = self.database_path {
+            Connection::open_with_flags(path, config)?
+        } else {
+            Connection::open_in_memory_with_flags(config)?
+        };
+
         conn.execute_batch(&self.init_sql)?;
         info!("created new DuckDB connection");
         Ok(DuckDbConnection::new(conn))
