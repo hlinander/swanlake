@@ -12,7 +12,6 @@ use futures::{stream, Stream};
 use prost::Message;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info, Span};
-use uuid::Uuid;
 
 use crate::error::ServerError;
 use crate::session::{registry::SessionRegistry, Session, SessionId};
@@ -40,26 +39,41 @@ impl SwanFlightSqlService {
         Self { registry }
     }
 
-    /// Extract session ID from tonic Request for session tracking (Phase 2)
+    /// Extract session ID from tonic Request metadata
     ///
-    /// This uses the remote peer address as the session ID.
-    /// Sessions persist across requests from the same gRPC connection.
-    pub(crate) fn extract_session_id<T>(request: &Request<T>) -> SessionId {
-        if let Some(addr) = request.remote_addr() {
-            SessionId::from_string(addr.to_string())
-        } else {
-            SessionId::from_string(Uuid::new_v4().to_string())
+    /// Checks for session ID in order:
+    /// 1. `airport-client-session-id` (Airport extension's header)
+    /// 2. `x-session-id` (custom header)
+    pub(crate) fn extract_session_id<T>(request: &Request<T>) -> Result<SessionId, Status> {
+        let metadata = request.metadata();
+
+        // Airport extension sends this header
+        if let Some(session_id) = metadata.get("airport-client-session-id") {
+            if let Ok(id_str) = session_id.to_str() {
+                if !id_str.is_empty() {
+                    return Ok(SessionId::from_string(id_str.to_string()));
+                }
+            }
         }
+
+        // Fallback to x-session-id
+        if let Some(session_id) = metadata.get("x-session-id") {
+            if let Ok(id_str) = session_id.to_str() {
+                if !id_str.is_empty() {
+                    return Ok(SessionId::from_string(id_str.to_string()));
+                }
+            }
+        }
+
+        Err(Status::invalid_argument("session ID header is required (airport-client-session-id or x-session-id)"))
     }
 
-    /// Get or create a session based on connection (Phase 2: connection-based persistence)
-    /// Prepare request: extract session_id, record to tracing span, and get/create session.
-    /// Extracts session ID from the gRPC connection and reuses sessions across requests.
+    /// Prepare request: extract session_id from header, record to tracing span, and get/create session.
     pub(crate) async fn prepare_request<T>(
         &self,
         request: &Request<T>,
     ) -> Result<Arc<Session>, Status> {
-        let session_id = Self::extract_session_id(request);
+        let session_id = Self::extract_session_id(request)?;
         Span::current().record("session_id", session_id.as_ref());
         self.registry
             .get_or_create_by_id(&session_id)

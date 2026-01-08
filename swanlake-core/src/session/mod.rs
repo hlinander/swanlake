@@ -81,11 +81,11 @@ impl PreparedStatementState {
     }
 }
 
-/// A client session with dedicated connection and state
+/// A client session with shared connection and per-session state
 pub struct Session {
     id: SessionId,
-    /// The DuckDB connection for this session (pub(crate) for streaming access)
-    pub(crate) connection: DuckDbConnection,
+    /// The shared DuckDB connection (pub(crate) for streaming access)
+    pub(crate) connection: std::sync::Arc<DuckDbConnection>,
     transactions: Mutex<HashSet<TransactionId>>,
     aborted_transactions: Mutex<HashSet<TransactionId>>,
     prepared_statements: Mutex<HashMap<StatementHandle, PreparedStatementState>>,
@@ -95,10 +95,10 @@ pub struct Session {
 }
 
 impl Session {
-    /// Create a new session with a specific ID (for connection-based persistence)
+    /// Create a new session with a specific ID and shared connection
     #[instrument(skip(connection))]
-    pub fn new_with_id(id: SessionId, connection: DuckDbConnection) -> Self {
-        debug!(session_id = %id, "created new session with specific ID");
+    pub fn new_with_id(id: SessionId, connection: std::sync::Arc<DuckDbConnection>) -> Self {
+        debug!(session_id = %id, "created new session with shared connection");
 
         Self {
             id,

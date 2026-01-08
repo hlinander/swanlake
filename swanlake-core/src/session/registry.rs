@@ -6,6 +6,9 @@
 //! - Provides session lookup
 //! - Cleans up idle sessions
 //! - Enforces max session limit
+//!
+//! When a new session ID is encountered, the connection is reset by creating
+//! a fresh DuckDB connection. This ensures each client gets a clean state.
 
 use std::collections::HashMap;
 
@@ -15,7 +18,7 @@ use std::time::Duration;
 use tracing::{debug, info, instrument, warn};
 
 use crate::config::ServerConfig;
-use crate::engine::EngineFactory;
+use crate::engine::{DuckDbConnection, EngineFactory};
 use crate::error::ServerError;
 use crate::session::id::SessionId;
 use crate::session::Session;
@@ -31,6 +34,10 @@ pub struct SessionRegistry {
 
 struct RegistryInner {
     sessions: HashMap<SessionId, Arc<Session>>,
+    /// Current session ID - when this changes, we create a fresh connection
+    current_session_id: Option<SessionId>,
+    /// Shared connection for all sessions with the current session ID
+    shared_connection: Arc<DuckDbConnection>,
 }
 
 impl SessionRegistry {
@@ -43,6 +50,10 @@ impl SessionRegistry {
         let max_sessions = config.max_sessions.unwrap_or(100);
         let session_timeout = Duration::from_secs(config.session_timeout_seconds.unwrap_or(1800)); // 30min default
 
+        // Create the initial shared connection
+        let shared_connection = Arc::new(factory.lock().unwrap().create_connection()?);
+        info!("created initial DuckDB connection");
+
         info!(
             max_sessions,
             session_timeout_seconds = session_timeout.as_secs(),
@@ -52,6 +63,8 @@ impl SessionRegistry {
         Ok(Self {
             inner: Arc::new(RwLock::new(RegistryInner {
                 sessions: HashMap::new(),
+                current_session_id: None,
+                shared_connection,
             })),
             factory,
             max_sessions,
@@ -93,12 +106,11 @@ impl SessionRegistry {
         removed
     }
 
-    /// Get or create session by session ID (Phase 2)
+    /// Get or create session by session ID
     ///
-    /// This enables session persistence across requests from the same gRPC connection.
-    /// The session_id is derived from the connection info (e.g., remote address).
-    /// If a session already exists with this ID, it is reused.
-    /// Otherwise, a new session is created with the given ID.
+    /// When a new session ID is encountered (different from current), the connection
+    /// is reset by creating a fresh DuckDB connection. This ensures each client
+    /// gets a clean state without inherited ATTACHes or other state.
     pub async fn get_or_create_by_id(
         &self,
         session_id: &SessionId,
@@ -115,37 +127,71 @@ impl SessionRegistry {
             }
         }
 
-        // No existing session, create new one with specific ID (write lock)
-        // Check session limit
-        {
-            let inner = self.inner.read().expect("registry lock poisoned");
-            if inner.sessions.len() >= self.max_sessions {
-                warn!(
-                    current = inner.sessions.len(),
-                    max = self.max_sessions,
-                    "max sessions limit reached"
-                );
-                return Err(ServerError::MaxSessionsReached);
-            }
+        // New session ID - need write lock to potentially reset connection
+        let mut inner = self.inner.write().expect("registry lock poisoned");
+
+        // Double-check after acquiring write lock
+        if let Some(session) = inner.sessions.get(session_id) {
+            return Ok(session.clone());
         }
 
-        // Create new connection
-        let connection = self.factory.lock().unwrap().create_connection()?;
+        // Check if this is a different session ID than current
+        let need_new_connection = match &inner.current_session_id {
+            Some(current) => current != session_id,
+            None => false, // First session, use existing connection
+        };
 
-        // Create session with the specified ID
-        let session = Arc::new(Session::new_with_id(session_id.clone(), connection));
-
-        // Register session
-        {
-            let mut inner = self.inner.write().expect("registry lock poisoned");
-            inner.sessions.insert(session_id.clone(), session.clone());
+        if need_new_connection {
             info!(
-                session_id = %session_id,
-                total_sessions = inner.sessions.len(),
-                "session created with specific ID"
+                old_session_id = %inner.current_session_id.as_ref().unwrap(),
+                new_session_id = %session_id,
+                "new session ID detected, creating fresh DuckDB connection"
             );
+
+            // Clear old sessions - they're for a different client
+            inner.sessions.clear();
+
+            // Create fresh connection
+            let new_connection = Arc::new(
+                self.factory
+                    .lock()
+                    .unwrap()
+                    .create_connection()?,
+            );
+            inner.shared_connection = new_connection;
         }
+
+        // Check session limit
+        if inner.sessions.len() >= self.max_sessions {
+            warn!(
+                current = inner.sessions.len(),
+                max = self.max_sessions,
+                "max sessions limit reached"
+            );
+            return Err(ServerError::MaxSessionsReached);
+        }
+
+        // Create session with the current shared connection
+        let session = Arc::new(Session::new_with_id(
+            session_id.clone(),
+            inner.shared_connection.clone(),
+        ));
+
+        // Register session and update current session ID
+        inner.current_session_id = Some(session_id.clone());
+        inner.sessions.insert(session_id.clone(), session.clone());
+        info!(
+            session_id = %session_id,
+            total_sessions = inner.sessions.len(),
+            "session created"
+        );
 
         Ok(session)
+    }
+
+    /// Get the shared connection directly (for operations that need it)
+    pub fn shared_connection(&self) -> Arc<DuckDbConnection> {
+        let inner = self.inner.read().expect("registry lock poisoned");
+        inner.shared_connection.clone()
     }
 }

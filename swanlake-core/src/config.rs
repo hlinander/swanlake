@@ -28,7 +28,7 @@ impl Default for ServerConfig {
         Self {
             host: "0.0.0.0".to_string(),
             port: 4214,
-            database_path: None, // None means in-memory
+            database_path: None,
             ducklake_init_sql: None,
             checkpoint_databases: None,
             checkpoint_interval_hours: Some(24),

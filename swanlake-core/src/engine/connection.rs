@@ -54,6 +54,15 @@ impl DuckDbConnection {
         }
     }
 
+    /// Get an interrupt handle for cancelling long-running queries.
+    ///
+    /// The returned handle can be used from another thread to interrupt
+    /// queries running on this connection.
+    pub fn interrupt_handle(&self) -> std::sync::Arc<duckdb::InterruptHandle> {
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        conn.interrupt_handle()
+    }
+
     /// Get the schema for a query without executing the full query.
     ///
     /// **Implementation Note:**
