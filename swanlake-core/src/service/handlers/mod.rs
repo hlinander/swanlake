@@ -172,6 +172,8 @@ impl FlightSqlService for SwanFlightSqlService {
                     || trimmed.starts_with("UPDATE")
                     || trimmed.starts_with("DELETE")
                     || trimmed.starts_with("TRUNCATE")
+                    || trimmed.starts_with("ATTACH")
+                    || trimmed.starts_with("DETACH")
                 {
                     // Action type is SQL - execute it directly
                     let sql = action_type.clone();

@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let flight_service = SwanFlightService::new(registry);
+    let flight_service = SwanFlightService::new(registry.clone());
 
     // Set up gRPC health service
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
@@ -59,6 +59,9 @@ async fn main() -> Result<()> {
 
     // Set up graceful shutdown
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Clone registry for use in shutdown handler
+    let registry_for_shutdown = registry.clone();
 
     tokio::spawn(async move {
         let ctrl_c = async {
@@ -86,6 +89,9 @@ async fn main() -> Result<()> {
                 info!("received SIGTERM, initiating graceful shutdown");
             }
         }
+
+        // Interrupt all running queries so they stop promptly
+        registry_for_shutdown.interrupt_all();
 
         // Set health status to NOT_SERVING before shutdown
         health_reporter.set_not_serving::<arrow_flight::flight_service_server::FlightServiceServer<SwanFlightService>>().await;

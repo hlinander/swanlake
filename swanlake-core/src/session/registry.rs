@@ -194,4 +194,14 @@ impl SessionRegistry {
         let inner = self.inner.read().expect("registry lock poisoned");
         inner.shared_connection.clone()
     }
+
+    /// Interrupt all running queries.
+    ///
+    /// This is called during server shutdown to stop any long-running queries
+    /// so the server can exit promptly.
+    pub fn interrupt_all(&self) {
+        let inner = self.inner.read().expect("registry lock poisoned");
+        info!("interrupting all running queries");
+        inner.shared_connection.interrupt_handle().interrupt();
+    }
 }

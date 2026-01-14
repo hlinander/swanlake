@@ -150,6 +150,56 @@ impl SwanFlightSqlService {
     }
 }
 
+/// Run a blocking operation with interrupt support.
+///
+/// Exported for use by handlers.
+///
+/// This spawns a monitor task that watches for the parent async task being dropped
+/// (e.g., client disconnect) and immediately interrupts the DuckDB query.
+///
+/// Unlike a simple InterruptOnDrop guard, this uses a channel-based approach that
+/// works correctly with spawn_blocking: the monitor task calls interrupt() as soon
+/// as the cancellation signal is dropped, regardless of whether spawn_blocking
+/// has finished.
+pub(crate) async fn run_interruptible<T, F>(
+    interrupt_handle: Arc<duckdb::InterruptHandle>,
+    f: F,
+) -> Result<T, Status>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ServerError> + Send + 'static,
+{
+    // Create a oneshot channel for signaling completion
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Spawn monitor task that will interrupt DuckDB if we're cancelled
+    let interrupt_handle_monitor = interrupt_handle.clone();
+    let monitor = tokio::spawn(async move {
+        // Wait for either:
+        // 1. done_tx is dropped (blocking task finished or parent cancelled)
+        // 2. The channel receives a value (normal completion)
+        if done_rx.await.is_err() {
+            // Sender was dropped without sending - this means cancellation
+            info!("request cancelled, interrupting DuckDB query via monitor");
+            interrupt_handle_monitor.interrupt();
+        }
+    });
+
+    // Run the blocking operation
+    let result = tokio::task::spawn_blocking(f)
+        .await
+        .map_err(SwanFlightSqlService::status_from_join)?
+        .map_err(SwanFlightSqlService::status_from_error);
+
+    // Signal completion to the monitor (so it doesn't interrupt)
+    let _ = done_tx.send(());
+
+    // Clean up the monitor task
+    let _ = monitor.await;
+
+    result
+}
+
 /// Wrapper service that handles both raw Flight and Flight SQL requests.
 ///
 /// This enables `airport_take_flight` SQL passthrough by intercepting raw Flight
@@ -221,10 +271,13 @@ impl SwanFlightService {
 
             let sql_clone = sql.clone();
             let session_clone = Arc::clone(&session);
-            tokio::task::spawn_blocking(move || session_clone.execute_statement(&sql_clone))
-                .await
-                .map_err(SwanFlightSqlService::status_from_join)?
-                .map_err(SwanFlightSqlService::status_from_error)?;
+
+            // Use interruptible execution so client cancellation (Ctrl+C) stops the query
+            let interrupt_handle = session.connection.interrupt_handle();
+            run_interruptible(interrupt_handle, move || {
+                session_clone.execute_statement(&sql_clone)
+            })
+            .await?;
 
             // Return empty FlightInfo for DDL (no result rows)
             let info = FlightInfo::new()
@@ -235,13 +288,16 @@ impl SwanFlightService {
             return Ok(Response::new(info));
         }
 
-        // For queries, get schema and create ticket for DoGet
-        let sql_clone = sql.clone();
+        // For queries, get schema using LIMIT 0 to avoid materializing data
+        let schema_sql = format!("SELECT * FROM ({}) LIMIT 0", sql.trim_end_matches(';').trim());
         let session_clone = Arc::clone(&session);
-        let schema = tokio::task::spawn_blocking(move || session_clone.schema_for_query(&sql_clone))
-            .await
-            .map_err(SwanFlightSqlService::status_from_join)?
-            .map_err(SwanFlightSqlService::status_from_error)?;
+
+        // Use interruptible execution so client cancellation (Ctrl+C) stops the query
+        let interrupt_handle = session.connection.interrupt_handle();
+        let schema = run_interruptible(interrupt_handle, move || {
+            session_clone.schema_for_query(&schema_sql)
+        })
+        .await?;
 
         // Create a ticket with the SQL
         let ticket_payload = TicketStatementPayload::new(StatementTicketKind::Ephemeral)

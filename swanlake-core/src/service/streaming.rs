@@ -76,8 +76,10 @@ impl SwanFlightSqlService {
     /// - Time to first byte (client sees data sooner)
     /// - Peak memory usage (no need to buffer all results)
     ///
-    /// When the stream is dropped (client cancels), the DuckDB query is
-    /// interrupted via the interrupt handle.
+    /// Cancellation support:
+    /// - A monitor task watches for receiver closure (client disconnect)
+    /// - When detected, it immediately interrupts DuckDB
+    /// - The stream's Drop impl also calls interrupt as a fallback
     pub(crate) async fn execute_query_streaming(
         session: Arc<Session>,
         sql: String,
@@ -89,16 +91,38 @@ impl SwanFlightSqlService {
         // Get interrupt handle for cancellation support
         let interrupt_handle = session.connection.interrupt_handle();
 
+        // Spawn a cancellation monitor task that proactively interrupts DuckDB
+        // as soon as the receiver is closed (client disconnects).
+        // This is more responsive than waiting for the next batch iteration.
+        let tx_monitor = tx.clone();
+        let interrupt_handle_monitor = interrupt_handle.clone();
+        let sql_for_monitor = sql.clone();
+        tokio::spawn(async move {
+            // Wait for the receiver to close (client disconnect or stream drop)
+            tx_monitor.closed().await;
+            // Interrupt DuckDB immediately - don't wait for next batch iteration
+            info!(sql = %sql_for_monitor, "client disconnected, interrupting DuckDB query");
+            interrupt_handle_monitor.interrupt();
+        });
+
         // Spawn blocking task to execute query and stream batches
+        // Clone interrupt handle so the blocking task can interrupt on cancellation
+        let interrupt_handle_clone = interrupt_handle.clone();
         let sql_clone = sql.clone();
+
         tokio::task::spawn_blocking(move || {
             let result = match params {
-                Some(ref p) => session
-                    .connection
-                    .execute_query_with_params_streaming(&sql_clone, p, tx.clone()),
-                None => session
-                    .connection
-                    .execute_query_streaming(&sql_clone, tx.clone()),
+                Some(ref p) => session.connection.execute_query_with_params_streaming(
+                    &sql_clone,
+                    p,
+                    tx.clone(),
+                    Some(interrupt_handle_clone.clone()),
+                ),
+                None => session.connection.execute_query_streaming(
+                    &sql_clone,
+                    tx.clone(),
+                    Some(interrupt_handle_clone.clone()),
+                ),
             };
 
             if let Err(e) = result {
@@ -113,7 +137,7 @@ impl SwanFlightSqlService {
         let rx_stream = ReceiverStream::new(rx);
 
         // State for tracking schema (needed for batch encoding context)
-        // Pass interrupt handle for cancellation on drop
+        // Pass interrupt handle for cancellation on drop (fallback mechanism)
         let stream = StreamingBatchToFlightData::new(rx_stream, interrupt_handle);
 
         Ok(Response::new(Box::pin(stream)))

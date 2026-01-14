@@ -5,11 +5,13 @@
 
 use std::sync::Mutex;
 
+use std::sync::Arc;
+
 use arrow_array::RecordBatch;
-use arrow_schema::{Field, Schema};
+use arrow_schema::{Field, Schema, SchemaRef};
 use duckdb::types::Value;
 use duckdb::{params_from_iter, Connection};
-use duckdb::{Arrow, Statement};
+use duckdb::{Arrow, ArrowStream, Statement};
 use tokio::sync::mpsc;
 use tracing::{debug, info, instrument};
 
@@ -103,83 +105,154 @@ impl DuckDbConnection {
 
     /// Execute a SELECT query and stream results through a channel.
     ///
-    /// This method sends batches as they're produced by DuckDB, enabling
-    /// progressive streaming to clients without collecting all results first.
+    /// This method uses DuckDB's true streaming execution with backpressure.
+    /// Unlike the old implementation, DuckDB will pause execution when the
+    /// consumer is not pulling batches, preventing memory blowup.
     ///
     /// The channel receives:
     /// 1. `Schema` - The result schema (first message)
     /// 2. `Batch` - Zero or more record batches
     /// 3. `Done` - Final message with totals, OR `Error` if something failed
-    #[instrument(skip(self, tx), fields(sql = %sql))]
+    ///
+    /// Pass an optional interrupt handle to enable cancellation when the
+    /// receiver is closed.
+    #[instrument(skip(self, tx, interrupt_handle), fields(sql = %sql))]
     pub fn execute_query_streaming(
         &self,
         sql: &str,
         tx: mpsc::Sender<StreamingBatch>,
+        interrupt_handle: Option<std::sync::Arc<duckdb::InterruptHandle>>,
     ) -> Result<(), ServerError> {
+        // Get schema using LIMIT 0 to avoid materializing data
+        let schema_sql = format!("SELECT * FROM ({}) LIMIT 0", sql.trim_end_matches(';').trim());
+        let schema = self.schema_for_query(&schema_sql)?;
+        let schema_ref: SchemaRef = Arc::new(schema.clone());
+
+        // Send schema first
+        if tx.blocking_send(StreamingBatch::Schema(schema)).is_err() {
+            debug!("streaming receiver dropped before schema sent");
+            return Ok(());
+        }
+
+        // Now execute the full query in true streaming mode
         self.with_prepared(sql, |stmt| {
-            let arrow = Self::query_arrow(stmt, None)?;
+            let arrow = Self::stream_arrow_with_schema(stmt, None, schema_ref)?;
 
-            // Send schema first
-            let schema = arrow.get_schema();
-            if tx.blocking_send(StreamingBatch::Schema(schema.as_ref().clone())).is_err() {
-                debug!("streaming receiver dropped, stopping query");
-                return Ok(());
-            }
-
-            // Stream batches
+            // Stream batches with backpressure
             let mut total_rows = 0usize;
             let mut total_bytes = 0usize;
+            let mut batch_count = 0usize;
             for batch in arrow {
-                total_rows += batch.num_rows();
-                total_bytes += batch.get_array_memory_size();
+                // Check if client cancelled before processing batch
+                if tx.is_closed() {
+                    info!(batch_count, total_rows, "streaming receiver closed, interrupting query");
+                    if let Some(ref handle) = interrupt_handle {
+                        handle.interrupt();
+                    }
+                    return Ok(());
+                }
+
+                batch_count += 1;
+                let batch_rows = batch.num_rows();
+                let batch_bytes = batch.get_array_memory_size();
+                total_rows += batch_rows;
+                total_bytes += batch_bytes;
+
+                debug!(
+                    batch_count,
+                    batch_rows,
+                    batch_bytes,
+                    total_rows,
+                    total_bytes,
+                    "streaming batch"
+                );
 
                 if tx.blocking_send(StreamingBatch::Batch(batch)).is_err() {
-                    debug!("streaming receiver dropped, stopping query");
+                    info!(batch_count, total_rows, "streaming receiver dropped, interrupting query");
+                    if let Some(ref handle) = interrupt_handle {
+                        handle.interrupt();
+                    }
                     return Ok(());
                 }
             }
 
             // Send completion message
             let _ = tx.blocking_send(StreamingBatch::Done { total_rows, total_bytes });
-            debug!(total_rows, total_bytes, "streaming query completed");
+            info!(batch_count, total_rows, total_bytes, "streaming query completed");
             Ok(())
         })
     }
 
     /// Execute a query with parameters and stream results through a channel.
-    #[instrument(skip(self, tx, params), fields(sql = %sql, param_count = params.len()))]
+    ///
+    /// This method uses DuckDB's true streaming execution with backpressure.
+    ///
+    /// Pass an optional interrupt handle to enable cancellation when the
+    /// receiver is closed.
+    #[instrument(skip(self, tx, params, interrupt_handle), fields(sql = %sql, param_count = params.len()))]
     pub fn execute_query_with_params_streaming(
         &self,
         sql: &str,
         params: &[Value],
         tx: mpsc::Sender<StreamingBatch>,
+        interrupt_handle: Option<std::sync::Arc<duckdb::InterruptHandle>>,
     ) -> Result<(), ServerError> {
+        // Get schema using LIMIT 0 to avoid materializing data
+        let schema_sql = format!("SELECT * FROM ({}) LIMIT 0", sql.trim_end_matches(';').trim());
+        let schema = self.schema_for_query(&schema_sql)?;
+        let schema_ref: SchemaRef = Arc::new(schema.clone());
+
+        // Send schema first
+        if tx.blocking_send(StreamingBatch::Schema(schema)).is_err() {
+            debug!("streaming receiver dropped before schema sent");
+            return Ok(());
+        }
+
+        // Now execute the full query in true streaming mode
         self.with_prepared(sql, |stmt| {
-            let arrow = Self::query_arrow(stmt, Some(params))?;
+            let arrow = Self::stream_arrow_with_schema(stmt, Some(params), schema_ref)?;
 
-            // Send schema first
-            let schema = arrow.get_schema();
-            if tx.blocking_send(StreamingBatch::Schema(schema.as_ref().clone())).is_err() {
-                debug!("streaming receiver dropped, stopping query");
-                return Ok(());
-            }
-
-            // Stream batches
+            // Stream batches with backpressure
             let mut total_rows = 0usize;
             let mut total_bytes = 0usize;
+            let mut batch_count = 0usize;
             for batch in arrow {
-                total_rows += batch.num_rows();
-                total_bytes += batch.get_array_memory_size();
+                // Check if client cancelled before processing batch
+                if tx.is_closed() {
+                    info!(batch_count, total_rows, "streaming receiver closed, interrupting query");
+                    if let Some(ref handle) = interrupt_handle {
+                        handle.interrupt();
+                    }
+                    return Ok(());
+                }
+
+                batch_count += 1;
+                let batch_rows = batch.num_rows();
+                let batch_bytes = batch.get_array_memory_size();
+                total_rows += batch_rows;
+                total_bytes += batch_bytes;
+
+                debug!(
+                    batch_count,
+                    batch_rows,
+                    batch_bytes,
+                    total_rows,
+                    total_bytes,
+                    "streaming batch (with params)"
+                );
 
                 if tx.blocking_send(StreamingBatch::Batch(batch)).is_err() {
-                    debug!("streaming receiver dropped, stopping query");
+                    info!(batch_count, total_rows, "streaming receiver dropped, interrupting query");
+                    if let Some(ref handle) = interrupt_handle {
+                        handle.interrupt();
+                    }
                     return Ok(());
                 }
             }
 
             // Send completion message
             let _ = tx.blocking_send(StreamingBatch::Done { total_rows, total_bytes });
-            debug!(total_rows, total_bytes, "streaming query with params completed");
+            info!(batch_count, total_rows, total_bytes, "streaming query with params completed");
             Ok(())
         })
     }
@@ -366,6 +439,9 @@ impl DuckDbConnection {
     }
 
     /// Run a query, binding parameters if provided, or filling with NULLs otherwise.
+    ///
+    /// **Warning:** This uses `query_arrow` which materializes all results upfront.
+    /// For large result sets, use `stream_arrow_with_schema` instead.
     fn query_arrow<'a>(
         stmt: &'a mut Statement,
         params: Option<&[Value]>,
@@ -379,6 +455,30 @@ impl DuckDbConnection {
                 } else {
                     let nulls: Vec<Value> = (0..param_count).map(|_| Value::Null).collect();
                     Ok(stmt.query_arrow(params_from_iter(nulls))?)
+                }
+            }
+        }
+    }
+
+    /// Run a query in true streaming mode with backpressure support.
+    ///
+    /// Unlike `query_arrow`, this uses `execute_streaming` internally which
+    /// does NOT materialize all results upfront. DuckDB will pause execution
+    /// when the consumer is not pulling batches.
+    fn stream_arrow_with_schema<'a>(
+        stmt: &'a mut Statement,
+        params: Option<&[Value]>,
+        schema: SchemaRef,
+    ) -> Result<ArrowStream<'a>, ServerError> {
+        match params {
+            Some(values) => Ok(stmt.stream_arrow(params_from_iter(values.iter()), schema)?),
+            None => {
+                let param_count = stmt.parameter_count();
+                if param_count == 0 {
+                    Ok(stmt.stream_arrow([], schema)?)
+                } else {
+                    let nulls: Vec<Value> = (0..param_count).map(|_| Value::Null).collect();
+                    Ok(stmt.stream_arrow(params_from_iter(nulls), schema)?)
                 }
             }
         }

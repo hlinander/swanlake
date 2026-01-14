@@ -44,3 +44,7 @@ zip = "6"
 
 [dev-dependencies]
 tempfile = "3"
+
+[[example]]
+name = "streaming_test"
+path = "examples/streaming_test.rs"

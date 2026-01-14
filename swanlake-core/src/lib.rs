@@ -8,6 +8,7 @@
 // use tracing::info;
 // use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
+pub mod cgroup;
 pub mod config;
 pub mod engine;
 pub mod error;
