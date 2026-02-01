@@ -3481,6 +3481,7 @@ dependencies = [
  "duckdb",
  "futures",
  "hex",
+ "libduckdb-sys",
  "native-tls",
  "postgres-native-tls",
  "prost",

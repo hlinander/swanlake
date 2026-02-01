@@ -4,6 +4,9 @@
 //! each RecordBatch to FlightData as it becomes available rather than
 //! collecting all results first.
 //!
+//! Progress reporting: Each batch includes app_metadata with msgpack-encoded
+//! progress (0.0 to 1.0) compatible with the Airport extension.
+//!
 //! Cancellation support: When the client cancels the request (e.g., Ctrl+C),
 //! the stream is dropped, which triggers DuckDB query interruption via the
 //! interrupt handle.
@@ -18,15 +21,35 @@ use arrow_ipc::writer::{IpcDataGenerator, IpcWriteOptions};
 use arrow_schema::Schema;
 use duckdb::InterruptHandle;
 use futures::Stream;
+use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
-use crate::engine::StreamingBatch;
+use crate::engine::{query_progress, StreamingBatch};
 use crate::session::Session;
 
 use super::SwanFlightSqlService;
+
+/// Progress information encoded in FlightData app_metadata.
+/// Compatible with Airport extension's AirportScannerProgress struct.
+#[derive(Serialize)]
+struct ScannerProgress {
+    /// Progress from 0.0 to 1.0
+    progress: f64,
+}
+
+/// Encode progress as msgpack for app_metadata.
+fn encode_progress(progress: f64) -> bytes::Bytes {
+    let scanner_progress = ScannerProgress {
+        progress: progress.clamp(0.0, 1.0),
+    };
+    match rmp_serde::to_vec_named(&scanner_progress) {
+        Ok(bytes) => bytes.into(),
+        Err(_) => bytes::Bytes::new(),
+    }
+}
 
 /// Encode a schema to FlightData (schema message only).
 fn encode_schema(schema: &Schema) -> Result<FlightData, Status> {
@@ -48,9 +71,9 @@ fn encode_schema(schema: &Schema) -> Result<FlightData, Status> {
     })
 }
 
-/// Encode a RecordBatch to FlightData.
+/// Encode a RecordBatch to FlightData with optional progress in app_metadata.
 #[allow(deprecated)]
-fn encode_batch(batch: &RecordBatch) -> Result<FlightData, Status> {
+fn encode_batch(batch: &RecordBatch, progress: Option<f64>) -> Result<FlightData, Status> {
     let options = IpcWriteOptions::default();
     let data_gen = IpcDataGenerator::default();
 
@@ -60,11 +83,16 @@ fn encode_batch(batch: &RecordBatch) -> Result<FlightData, Status> {
         .encoded_batch(batch, &mut dict_tracker, &options)
         .map_err(|e| Status::internal(format!("failed to encode batch: {e}")))?;
 
+    let app_metadata = match progress {
+        Some(p) => encode_progress(p),
+        None => bytes::Bytes::new(),
+    };
+
     Ok(FlightData {
         flight_descriptor: None,
         data_header: encoded.ipc_message.into(),
         data_body: encoded.arrow_data.into(),
-        app_metadata: bytes::Bytes::new(),
+        app_metadata,
     })
 }
 
@@ -147,13 +175,15 @@ impl SwanFlightSqlService {
 /// Stream adapter that converts StreamingBatch messages to FlightData.
 ///
 /// When dropped (e.g., client cancels), it interrupts the running DuckDB query.
+/// Includes progress information in app_metadata for each batch.
 struct StreamingBatchToFlightData<S> {
     inner: S,
     schema: Option<Arc<Schema>>,
     done: bool,
-    /// Interrupt handle for cancellation - when this stream is dropped,
-    /// we call interrupt() to stop any running query.
+    /// Interrupt handle for cancellation and progress polling.
     interrupt_handle: Arc<InterruptHandle>,
+    /// Rows sent so far (for fallback progress calculation)
+    rows_sent: u64,
 }
 
 impl<S> StreamingBatchToFlightData<S> {
@@ -163,7 +193,16 @@ impl<S> StreamingBatchToFlightData<S> {
             schema: None,
             done: false,
             interrupt_handle,
+            rows_sent: 0,
         }
+    }
+
+    /// Get current progress (0.0 to 1.0) from DuckDB's query progress API.
+    fn get_progress(&self) -> Option<f64> {
+        query_progress(&self.interrupt_handle).map(|p| {
+            // Convert percentage (0-100) to fraction (0-1)
+            (p.percentage / 100.0).clamp(0.0, 1.0)
+        })
     }
 }
 
@@ -207,8 +246,19 @@ where
                     }
                 }
                 StreamingBatch::Batch(batch) => {
-                    debug!(rows = batch.num_rows(), "streaming: encoding batch");
-                    match encode_batch(&batch) {
+                    let batch_rows = batch.num_rows() as u64;
+                    self.rows_sent += batch_rows;
+
+                    // Get progress from DuckDB's query progress API
+                    let progress = self.get_progress();
+                    info!(
+                        rows = batch_rows,
+                        total_rows_sent = self.rows_sent,
+                        progress = ?progress,
+                        "streaming: encoding batch with progress"
+                    );
+
+                    match encode_batch(&batch, progress) {
                         Ok(fd) => Poll::Ready(Some(Ok(fd))),
                         Err(e) => {
                             self.done = true;

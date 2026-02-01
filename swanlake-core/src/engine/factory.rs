@@ -37,6 +37,12 @@ impl EngineFactory {
             init_statements.push(format!("SET memory_limit = '{}';", memory_limit));
         }
 
+        // Enable progress bar API (required for query_progress to work)
+        // Disable printing to avoid polluting logs
+        init_statements.push(
+            "PRAGMA enable_progress_bar=true; PRAGMA enable_progress_bar_print=false;".to_string(),
+        );
+
         init_statements.push(
             "INSTALL ducklake; INSTALL httpfs; INSTALL aws; INSTALL postgres; \
             LOAD ducklake; LOAD httpfs; LOAD aws; LOAD postgres;"
