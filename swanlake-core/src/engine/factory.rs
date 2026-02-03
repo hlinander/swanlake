@@ -48,6 +48,18 @@ impl EngineFactory {
             LOAD ducklake; LOAD httpfs; LOAD aws; LOAD postgres;"
                 .to_string(),
         );
+
+        // Enable disk caching for S3/HTTP if cache directory is configured
+        if let Some(ref cache_dir) = config.cache_directory {
+            info!("enabling cache_httpfs with directory: {}", cache_dir);
+            init_statements.push(format!(
+                "INSTALL cache_httpfs FROM community; LOAD cache_httpfs; \
+                SET cache_httpfs_type = 'on_disk'; \
+                SET cache_httpfs_cache_directory = '{}';",
+                cache_dir
+            ));
+        }
+
         if let Some(sql) = config.ducklake_init_sql.as_ref() {
             let trimmed = sql.trim();
             if !trimmed.is_empty() {
