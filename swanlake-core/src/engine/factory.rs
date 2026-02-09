@@ -81,6 +81,15 @@ impl EngineFactory {
         Ok(Self { init_sql, database_path })
     }
 
+    /// Create a minimal factory for unit tests (no extensions, in-memory only).
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        Self {
+            init_sql: String::new(),
+            database_path: None,
+        }
+    }
+
     /// Create a new initialized DuckDB connection
     ///
     /// If database_path is set, opens a file-based database (shared across sessions).
