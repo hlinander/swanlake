@@ -504,3 +504,22 @@ impl DuckDbConnection {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_connection() -> DuckDbConnection {
+        let conn = Connection::open_in_memory().expect("failed to open in-memory db");
+        DuckDbConnection::new(conn)
+    }
+
+    #[test]
+    fn basic_statement_and_query() {
+        let conn = test_connection();
+        conn.execute_statement("CREATE TABLE t (id INTEGER)").unwrap();
+        conn.execute_statement("INSERT INTO t VALUES (1)").unwrap();
+        let result = conn.execute_query("SELECT * FROM t").unwrap();
+        assert_eq!(result.total_rows, 1);
+    }
+}

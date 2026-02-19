@@ -170,18 +170,25 @@ impl CheckpointService {
         let db = db_name.to_string();
         let factory = self.factory.clone();
         tokio::task::spawn_blocking(move || {
+            let t0 = std::time::Instant::now();
+            tracing::debug!("checkpoint: acquiring factory lock for {}", db);
             let conn = {
                 let guard = factory
                     .lock()
                     .map_err(|_| anyhow!("EngineFactory lock poisoned"))?;
-                guard
+                let conn = guard
                     .create_connection()
-                    .map_err(|e| anyhow!(e.to_string()))?
+                    .map_err(|e| anyhow!(e.to_string()))?;
+                // guard dropped here — factory lock released before checkpoint runs
+                conn
             };
+            tracing::debug!("checkpoint: factory lock released after {}ms, running CHECKPOINT {}",
+                t0.elapsed().as_millis(), db);
             let sql = format!("USE {}; CHECKPOINT;", db);
             conn.execute_batch(&sql)
                 .map_err(|e| anyhow!(e.to_string()))
                 .context("running checkpoint")?;
+            tracing::info!("checkpoint: {} completed in {}ms", db, t0.elapsed().as_millis());
             Ok(())
         })
         .await

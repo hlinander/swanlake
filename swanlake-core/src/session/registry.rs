@@ -114,31 +114,51 @@ impl SessionRegistry {
             }
         }
 
-        // Slow path: need write lock to create new session
+        // Check session limit under read lock first
+        {
+            let inner = self.inner.read().expect("registry lock poisoned");
+            if inner.sessions.len() >= self.max_sessions {
+                warn!(
+                    current = inner.sessions.len(),
+                    max = self.max_sessions,
+                    "max sessions limit reached"
+                );
+                return Err(ServerError::MaxSessionsReached);
+            }
+        }
+
+        // Create connection in a blocking task to avoid blocking the tokio runtime.
+        // The factory mutex (std::sync::Mutex) and create_connection() (extension loading)
+        // can both block for significant time.
+        let factory = self.factory.clone();
+        let sid = session_id.clone();
+        let connection = tokio::task::spawn_blocking(move || {
+            let t0 = std::time::Instant::now();
+            debug!(session_id = %sid, "acquiring factory lock for new connection");
+            let guard = factory.lock().unwrap();
+            let lock_elapsed = t0.elapsed();
+            let conn = guard.create_connection()?;
+            let total_elapsed = t0.elapsed();
+            info!(
+                session_id = %sid,
+                lock_ms = lock_elapsed.as_millis() as u64,
+                total_ms = total_elapsed.as_millis() as u64,
+                "connection created (factory lock released)"
+            );
+            Ok::<_, ServerError>(conn)
+        })
+        .await
+        .map_err(|e| ServerError::Internal(format!("spawn_blocking failed: {}", e)))??;
+        let connection = Arc::new(connection);
+
+        // Now acquire write lock only for insertion
         let mut inner = self.inner.write().expect("registry lock poisoned");
 
-        // Double-check after acquiring write lock
+        // Double-check after acquiring write lock (another thread may have created it)
         if let Some(session) = inner.sessions.get(session_id) {
+            // Connection we just created will be dropped — that's fine
             return Ok(session.clone());
         }
-
-        // Check session limit
-        if inner.sessions.len() >= self.max_sessions {
-            warn!(
-                current = inner.sessions.len(),
-                max = self.max_sessions,
-                "max sessions limit reached"
-            );
-            return Err(ServerError::MaxSessionsReached);
-        }
-
-        // Create a dedicated connection for this session
-        let connection = Arc::new(
-            self.factory
-                .lock()
-                .unwrap()
-                .create_connection()?,
-        );
 
         let session = Arc::new(Session::new_with_id(
             session_id.clone(),
@@ -303,5 +323,78 @@ mod tests {
 
         // Should not panic — interrupts all three connections
         registry.interrupt_all();
+    }
+
+    /// Regression test: factory.lock() + create_connection() used to run
+    /// directly in the async context, blocking the tokio worker thread.
+    /// Now it runs inside spawn_blocking.
+    ///
+    /// Uses current_thread runtime so the test is deterministic: with only
+    /// one worker thread, a blocking factory.lock() in async context would
+    /// deadlock the runtime — no other async task could make progress.
+    /// With spawn_blocking the lock moves to a separate thread pool,
+    /// keeping the runtime responsive.
+    #[tokio::test(flavor = "current_thread")]
+    async fn factory_lock_does_not_block_async_runtime() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let factory = Arc::new(Mutex::new(EngineFactory::new_for_test()));
+        let registry = SessionRegistry {
+            inner: Arc::new(RwLock::new(RegistryInner {
+                sessions: HashMap::new(),
+            })),
+            factory: factory.clone(),
+            max_sessions: 10,
+            session_timeout: Duration::from_secs(60),
+        };
+
+        // Hold the factory lock from another OS thread for 300ms,
+        // simulating contention (checkpoint or another session being created).
+        let factory_hold = factory.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = factory_hold.lock().unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+
+        // Give the holder thread time to acquire the lock
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Spawn session creation — get_or_create_by_id will block on the
+        // factory lock, but inside spawn_blocking so the runtime stays free.
+        let registry_clone = registry.clone();
+        let create_task = tokio::spawn(async move {
+            registry_clone
+                .get_or_create_by_id(&session_id("new-client"))
+                .await
+                .unwrap()
+        });
+
+        // This flag proves the runtime can still run async tasks while
+        // factory lock contention is ongoing. Without spawn_blocking on a
+        // current_thread runtime, this task would never execute because the
+        // sole worker thread would be stuck at factory.lock().
+        let progress = Arc::new(AtomicBool::new(false));
+        let progress_flag = progress.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            progress_flag.store(true, Ordering::SeqCst);
+        });
+
+        // Yield to let spawned tasks run
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            progress.load(Ordering::SeqCst),
+            "async runtime was blocked — factory.lock() is not in spawn_blocking"
+        );
+
+        // Wait for session creation to complete after holder releases lock
+        let session = create_task.await.unwrap();
+        holder.join().unwrap();
+
+        assert_eq!(registry.session_count(), 1);
+        session
+            .execute_statement("CREATE TABLE test_tbl (x INTEGER)")
+            .unwrap();
     }
 }

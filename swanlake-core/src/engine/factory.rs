@@ -96,6 +96,7 @@ impl EngineFactory {
     /// Otherwise, creates an in-memory database (isolated per session).
     #[instrument(skip(self))]
     pub fn create_connection(&self) -> Result<DuckDbConnection, ServerError> {
+        let t0 = std::time::Instant::now();
         let config = Config::default()
             .enable_autoload_extension(true)?
             .allow_unsigned_extensions()?;
@@ -105,9 +106,14 @@ impl EngineFactory {
         } else {
             Connection::open_in_memory_with_flags(config)?
         };
+        let open_elapsed = t0.elapsed();
 
         conn.execute_batch(&self.init_sql)?;
-        info!("created new DuckDB connection");
+        info!(
+            open_ms = open_elapsed.as_millis() as u64,
+            total_ms = t0.elapsed().as_millis() as u64,
+            "created new DuckDB connection"
+        );
         Ok(DuckDbConnection::new(conn))
     }
 }
