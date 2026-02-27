@@ -195,10 +195,9 @@ fn build_table_flight_info(
 
     // Create a ticket for fetching the table data
     let ticket = Ticket::new(format!("{}.{}", schema_name, table_name));
-    // Add location - empty string means "same server"
+    // No location means "use the same server the client is already connected to"
     let endpoint = FlightEndpoint::new()
-        .with_ticket(ticket)
-        .with_location("grpc://localhost:4214");
+        .with_ticket(ticket);
 
     let flight_info = FlightInfo::new()
         .with_descriptor(descriptor)
@@ -868,10 +867,9 @@ pub(crate) async fn do_action_endpoints(
     let ticket = Ticket::new(ticket_query.as_any().encode_to_vec());
 
     // Create a single endpoint pointing back to this server
-    // The client will call DoGet with this ticket
+    // The client will call DoGet with this ticket (no location = same server)
     let endpoint = FlightEndpoint::new()
-        .with_ticket(ticket)
-        .with_location("grpc://localhost:4214");
+        .with_ticket(ticket);
 
     // Serialize the endpoint
     let endpoint_bytes = endpoint.encode_to_vec();
