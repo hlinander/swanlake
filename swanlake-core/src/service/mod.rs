@@ -36,6 +36,8 @@ pub struct SwanFlightSqlService {
     registry: Arc<SessionRegistry>,
     metrics: Arc<Metrics>,
     session_id_mode: SessionIdMode,
+    /// gRPC location URL for this server, used in FlightEndpoint locations.
+    flight_location: String,
 }
 
 impl SwanFlightSqlService {
@@ -43,12 +45,19 @@ impl SwanFlightSqlService {
         registry: Arc<SessionRegistry>,
         metrics: Arc<Metrics>,
         session_id_mode: SessionIdMode,
+        flight_location: String,
     ) -> Self {
         Self {
             registry,
             metrics,
             session_id_mode,
+            flight_location,
         }
+    }
+
+    /// Returns the gRPC location URL for FlightEndpoint construction.
+    pub(crate) fn flight_location(&self) -> &str {
+        &self.flight_location
     }
 
     /// Extract session ID from tonic Request metadata.
@@ -234,9 +243,10 @@ impl SwanFlightService {
         registry: Arc<SessionRegistry>,
         metrics: Arc<Metrics>,
         session_id_mode: SessionIdMode,
+        flight_location: String,
     ) -> Self {
         Self {
-            inner: SwanFlightSqlService::new(registry, metrics, session_id_mode),
+            inner: SwanFlightSqlService::new(registry, metrics, session_id_mode, flight_location),
         }
     }
 
@@ -445,7 +455,7 @@ mod tests {
         let registry =
             Arc::new(SessionRegistry::new(&config, factory).map_err(|e| anyhow!(e.to_string()))?);
         let metrics = Arc::new(Metrics::new(1_000, 64));
-        Ok(SwanFlightSqlService::new(registry, metrics, mode))
+        Ok(SwanFlightSqlService::new(registry, metrics, mode, "grpc://localhost:4214".to_string()))
     }
 
     #[test]

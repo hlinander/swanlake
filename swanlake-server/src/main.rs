@@ -56,10 +56,12 @@ async fn main() -> Result<()> {
         config.metrics_history_size.unwrap_or(200),
     ));
 
+    let flight_location = format!("grpc://localhost:{}", config.port);
     let flight_service = SwanFlightService::new(
         registry.clone(),
         metrics.clone(),
         config.session_id_mode.clone(),
+        flight_location,
     );
 
     status::spawn_status_server(&config, metrics, registry.clone())?;

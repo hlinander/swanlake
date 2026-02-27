@@ -161,6 +161,7 @@ fn build_table_flight_info(
     schema_name: &str,
     table_name: &str,
     columns: Vec<(String, DataType)>,
+    flight_location: &str,
 ) -> Result<FlightInfo, Status> {
     // Build Arrow schema for the table
     let fields: Vec<Field> = columns
@@ -195,9 +196,9 @@ fn build_table_flight_info(
 
     // Create a ticket for fetching the table data
     let ticket = Ticket::new(format!("{}.{}", schema_name, table_name));
-    // No location means "use the same server the client is already connected to"
     let endpoint = FlightEndpoint::new()
-        .with_ticket(ticket);
+        .with_ticket(ticket)
+        .with_location(flight_location);
 
     let flight_info = FlightInfo::new()
         .with_descriptor(descriptor)
@@ -375,7 +376,7 @@ pub(crate) async fn do_action_list_schemas(
                 "building FlightInfo for table"
             );
             let flight_info =
-                build_table_flight_info(&catalog_name, &schema_name, &table_name, columns)?;
+                build_table_flight_info(&catalog_name, &schema_name, &table_name, columns, service.flight_location())?;
             flight_infos.push(flight_info);
         }
 
@@ -867,9 +868,9 @@ pub(crate) async fn do_action_endpoints(
     let ticket = Ticket::new(ticket_query.as_any().encode_to_vec());
 
     // Create a single endpoint pointing back to this server
-    // The client will call DoGet with this ticket (no location = same server)
     let endpoint = FlightEndpoint::new()
-        .with_ticket(ticket);
+        .with_ticket(ticket)
+        .with_location(service.flight_location());
 
     // Serialize the endpoint
     let endpoint_bytes = endpoint.encode_to_vec();
@@ -1074,6 +1075,7 @@ pub(crate) async fn do_action_create_table(
         &params.schema_name,
         &params.table_name,
         columns,
+        service.flight_location(),
     )?;
 
     // Serialize FlightInfo as the response
