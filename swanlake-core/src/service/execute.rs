@@ -4,9 +4,8 @@ use std::time::Instant;
 use arrow_flight::flight_service_server::FlightService;
 use duckdb::types::Value;
 use tonic::{metadata::MetadataValue, Response, Status};
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 
-use crate::engine::connection::QueryResult;
 use crate::session::id::StatementHandle;
 use crate::session::{PreparedStatementMeta, Session};
 
@@ -165,76 +164,17 @@ impl SwanFlightSqlService {
             handle = %handle,
             sql = %sql,
             param_count,
-            "executing prepared statement via handle"
+            streaming = true,
+            "executing prepared statement via handle (streaming)"
         );
 
-        let session_clone = session.clone();
-        let params_for_exec = parameters;
-        let sql_for_exec = sql.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            if params_for_exec.is_empty() {
-                session_clone.execute_query(&sql_for_exec)
-            } else {
-                session_clone.execute_query_with_params(&sql_for_exec, &params_for_exec)
-            }
-        })
-        .await;
-
-        let QueryResult {
-            schema,
-            batches,
-            total_rows,
-            total_bytes,
-        } = match result {
-            Ok(Ok(query_result)) => query_result,
-            Ok(Err(err)) => {
-                self.metrics
-                    .record_query_error(&sql, start.elapsed(), err.to_string());
-                return Err(Self::status_from_error(err));
-            }
-            Err(err) => {
-                self.metrics
-                    .record_query_error(&sql, start.elapsed(), err.to_string());
-                return Err(Self::status_from_join(err));
-            }
+        // Use streaming execution for better latency and memory efficiency
+        let params = if parameters.is_empty() {
+            None
+        } else {
+            Some(parameters)
         };
 
-        let flight_data =
-            arrow_flight::utils::batches_to_flight_data(&schema, batches).map_err(|err| {
-                error!(%err, "failed to convert record batches to flight data");
-                self.metrics
-                    .record_query_error(&sql, start.elapsed(), err.to_string());
-                Status::internal(format!(
-                    "failed to convert record batches to flight data: {err}"
-                ))
-            })?;
-
-        self.metrics
-            .record_query_success(&sql, start.elapsed(), total_rows, total_bytes);
-
-        debug!(
-            handle = %handle,
-            batch_count = flight_data.len(),
-            "converted batches to flight data"
-        );
-
-        let stream = Self::into_stream(flight_data);
-        let mut response = Response::new(stream);
-        if let Ok(value) = MetadataValue::try_from(total_rows.to_string()) {
-            response
-                .metadata_mut()
-                .insert("x-swanlake-total-rows", value);
-        }
-        if let Ok(value) = MetadataValue::try_from(total_bytes.to_string()) {
-            response
-                .metadata_mut()
-                .insert("x-swanlake-total-bytes", value);
-        }
-        info!(
-            handle = %handle,
-            total_rows, total_bytes, "prepared statement completed"
-        );
-        Ok(response)
+        Self::execute_query_streaming(session.clone(), sql, params).await
     }
 }

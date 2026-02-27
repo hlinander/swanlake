@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use duckdb::{Config, Connection};
 use tracing::{info, instrument};
 
+use crate::cgroup::{format_bytes_for_duckdb, get_cgroup_memory_limit};
 use crate::config::ServerConfig;
 use crate::engine::connection::DuckDbConnection;
 use crate::error::ServerError;
@@ -17,6 +18,7 @@ use crate::error::ServerError;
 pub struct EngineFactory {
     init_sql: String,
     init_lock: Arc<Mutex<()>>,
+    database_path: Option<String>,
 }
 
 impl EngineFactory {
@@ -33,12 +35,43 @@ impl EngineFactory {
 
     fn new_with_extension_bootstrap(config: &ServerConfig, bootstrap_extensions: bool) -> Self {
         let mut init_statements = Vec::new();
+
+        // Set memory limit from cgroup if available (for systemd-run resource limits)
+        // Use 70% of the cgroup limit to leave headroom for other allocations
+        if let Some(memory_bytes) = get_cgroup_memory_limit() {
+            let duckdb_memory = (memory_bytes as f64 * 0.70) as u64;
+            let memory_limit = format_bytes_for_duckdb(duckdb_memory);
+            info!(
+                "setting DuckDB memory_limit to {} (70% of {} cgroup limit)",
+                memory_limit,
+                format_bytes_for_duckdb(memory_bytes)
+            );
+            init_statements.push(format!("SET memory_limit = '{}';", memory_limit));
+        }
+
+        // Enable progress bar API (required for query_progress to work)
+        // Disable printing to avoid polluting logs
+        init_statements.push(
+            "PRAGMA enable_progress_bar=true; PRAGMA enable_progress_bar_print=false;".to_string(),
+        );
+
         if bootstrap_extensions {
             init_statements.push(
                 "INSTALL ducklake; INSTALL httpfs; INSTALL aws; INSTALL postgres; \
                 LOAD ducklake; LOAD httpfs; LOAD aws; LOAD postgres;"
                     .to_string(),
             );
+        }
+
+        // Enable disk caching for S3/HTTP if cache directory is configured
+        if let Some(ref cache_dir) = config.cache_directory {
+            info!("enabling cache_httpfs with directory: {}", cache_dir);
+            init_statements.push(format!(
+                "INSTALL cache_httpfs FROM community; LOAD cache_httpfs; \
+                SET cache_httpfs_type = 'on_disk'; \
+                SET cache_httpfs_cache_directory = '{}';",
+                cache_dir
+            ));
         }
 
         if let Some(threads) = config.duckdb_threads {
@@ -62,16 +95,24 @@ impl EngineFactory {
             info!("base init sql {}", init_sql);
         }
 
+        let database_path = config.database_path.clone();
+        if let Some(ref path) = database_path {
+            info!("using file-based database: {}", path);
+        } else {
+            info!("using in-memory database");
+        }
+
         Self {
             init_sql,
             init_lock: Arc::new(Mutex::new(())),
+            database_path,
         }
     }
 
     /// Create a new initialized DuckDB connection
     ///
-    /// Each connection is created fresh with its own in-memory database.
-    /// This ensures complete isolation between sessions.
+    /// If database_path is set, opens a file-based database (shared across sessions).
+    /// Otherwise, creates an in-memory database (isolated per session).
     #[instrument(skip(self))]
     pub fn create_connection(&self) -> Result<DuckDbConnection, ServerError> {
         // Serialize connection bootstrap so DuckLake metadata initialization does not race
@@ -81,14 +122,26 @@ impl EngineFactory {
             .lock()
             .map_err(|_| ServerError::Internal("engine init lock poisoned".to_string()))?;
 
+        let t0 = std::time::Instant::now();
         let config = Config::default()
             .enable_autoload_extension(true)?
             .allow_unsigned_extensions()?;
-        let conn = Connection::open_in_memory_with_flags(config)?;
+
+        let conn = if let Some(ref path) = self.database_path {
+            Connection::open_with_flags(path, config)?
+        } else {
+            Connection::open_in_memory_with_flags(config)?
+        };
+        let open_elapsed = t0.elapsed();
+
         if !self.init_sql.is_empty() {
             conn.execute_batch(&self.init_sql)?;
         }
-        info!("created new DuckDB connection");
+        info!(
+            open_ms = open_elapsed.as_millis() as u64,
+            total_ms = t0.elapsed().as_millis() as u64,
+            "created new DuckDB connection"
+        );
         Ok(DuckDbConnection::new(conn))
     }
 }

@@ -14,6 +14,10 @@ pub enum SessionIdMode {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Path to DuckDB database file. Use ":memory:" for in-memory (default).
+    pub database_path: Option<String>,
+    /// Directory for cache_httpfs disk cache. Enables S3/HTTP caching when set.
+    pub cache_directory: Option<String>,
     /// Optional SQL statement executed during startup for ducklake integration.
     pub ducklake_init_sql: Option<String>,
     /// Optional override for DuckDB worker thread count.
@@ -51,6 +55,8 @@ impl Default for ServerConfig {
         Self {
             host: "0.0.0.0".to_string(),
             port: 4214,
+            database_path: None,
+            cache_directory: None,
             ducklake_init_sql: None,
             duckdb_threads: None,
             checkpoint_databases: None,

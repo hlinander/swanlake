@@ -6,6 +6,9 @@
 //! - Provides session lookup
 //! - Cleans up idle sessions
 //! - Enforces max session limit
+//!
+//! Each session ID gets its own dedicated DuckDB connection, providing full
+//! isolation between clients (separate catalogs, transactions, temp tables, etc.).
 
 use std::collections::HashMap;
 
@@ -144,17 +147,16 @@ impl SessionRegistry {
         removed
     }
 
-    /// Get or create session by session ID (Phase 2)
+    /// Get or create session by session ID.
     ///
-    /// This enables session persistence across requests from the same gRPC connection.
-    /// The session_id is derived from the connection info (e.g., remote address).
-    /// If a session already exists with this ID, it is reused.
-    /// Otherwise, a new session is created with the given ID.
+    /// Each session ID gets its own dedicated DuckDB connection, providing
+    /// full isolation between clients (separate catalogs, transactions,
+    /// temp tables, etc.).
     pub async fn get_or_create_by_id(
         &self,
         session_id: &SessionId,
     ) -> Result<Arc<Session>, ServerError> {
-        // First, try to get existing session (read lock)
+        // Fast path: try to get existing session (read lock)
         {
             let inner = self
                 .inner
@@ -192,11 +194,23 @@ impl SessionRegistry {
         // Create new connection in spawn_blocking to avoid blocking async runtime
         // (DuckDB connection creation involves I/O: loading extensions, init SQL, etc.)
         let factory = self.factory.clone();
-        let connection = tokio::task::spawn_blocking(move || factory.create_connection())
-            .await
-            .map_err(|e| ServerError::Internal(format!("connection task failed: {e}")))??;
+        let sid = session_id.clone();
+        let connection = tokio::task::spawn_blocking(move || {
+            let t0 = std::time::Instant::now();
+            debug!(session_id = %sid, "creating new connection");
+            let conn = factory.create_connection()?;
+            info!(
+                session_id = %sid,
+                total_ms = t0.elapsed().as_millis() as u64,
+                "connection created"
+            );
+            Ok::<_, ServerError>(conn)
+        })
+        .await
+        .map_err(|e| ServerError::Internal(format!("connection task failed: {e}")))??;
 
-        // Create session with the specified ID
+        // Create session with the specified ID and a shared Arc connection
+        let connection = Arc::new(connection);
         let session = Arc::new(Session::new_with_id(session_id.clone(), connection));
 
         // Register session
@@ -215,14 +229,33 @@ impl SessionRegistry {
                     _permit: permit,
                 },
             );
-            info!(
-                session_id = %session_id,
-                total_sessions = inner.sessions.len(),
-                "session created with specific ID"
-            );
         }
+        info!(
+            session_id = %session_id,
+            total_sessions = self.inner.read().unwrap_or_else(|p| p.into_inner()).sessions.len(),
+            "session created with dedicated connection"
+        );
 
         Ok(session)
+    }
+
+    /// Interrupt all running queries.
+    ///
+    /// This is called during server shutdown to stop any long-running queries
+    /// so the server can exit promptly.
+    pub fn interrupt_all(&self) {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        info!(
+            sessions = inner.sessions.len(),
+            "interrupting all running queries"
+        );
+        for (id, entry) in &inner.sessions {
+            debug!(session_id = %id, "interrupting session");
+            entry.session.connection.interrupt_handle().interrupt();
+        }
     }
 }
 

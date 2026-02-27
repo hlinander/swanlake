@@ -5,7 +5,7 @@ use swanlake_core::config::ServerConfig;
 use swanlake_core::engine::EngineFactory;
 use swanlake_core::maintenance::CheckpointService;
 use swanlake_core::metrics::Metrics;
-use swanlake_core::service::SwanFlightSqlService;
+use swanlake_core::service::SwanFlightService;
 use tonic::transport::Server;
 
 use tracing::info;
@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
         config.metrics_history_size.unwrap_or(200),
     ));
 
-    let flight_service = SwanFlightSqlService::new(
+    let flight_service = SwanFlightService::new(
         registry.clone(),
         metrics.clone(),
         config.session_id_mode.clone(),
@@ -66,12 +66,15 @@ async fn main() -> Result<()> {
 
     // Set up gRPC health service
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
-    health_reporter.set_serving::<arrow_flight::flight_service_server::FlightServiceServer<SwanFlightSqlService>>().await;
+    health_reporter.set_serving::<arrow_flight::flight_service_server::FlightServiceServer<SwanFlightService>>().await;
 
     info!(%addr, "starting SwanLake Flight SQL server");
 
     // Set up graceful shutdown
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Clone registry for use in shutdown handler
+    let registry_for_shutdown = registry.clone();
 
     tokio::spawn(async move {
         let ctrl_c = async {
@@ -106,8 +109,11 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Interrupt all running queries so they stop promptly
+        registry_for_shutdown.interrupt_all();
+
         // Set health status to NOT_SERVING before shutdown
-        health_reporter.set_not_serving::<arrow_flight::flight_service_server::FlightServiceServer<SwanFlightSqlService>>().await;
+        health_reporter.set_not_serving::<arrow_flight::flight_service_server::FlightServiceServer<SwanFlightService>>().await;
 
         let _ = shutdown_tx.send(());
     });
