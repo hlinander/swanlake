@@ -597,7 +597,7 @@ mod tests {
         let conn = Connection::open_in_memory().context("failed to open in-memory duckdb")?;
         let session = Session::new_with_id(
             SessionId::from_string("metadata-test-session".to_string()),
-            DuckDbConnection::new(conn),
+            Arc::new(DuckDbConnection::new(conn)),
         );
         Ok(Arc::new(session))
     }
