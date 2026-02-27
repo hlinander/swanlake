@@ -12,8 +12,8 @@ arrow-ipc = { version = "57" }
 arrow-schema = { workspace = true }
 arrow-cast = "57"
 arrow-select = "57"
-duckdb = { git = "https://github.com/swanlake-io/duckdb-rs", rev = "017cf3c", default-features = false, features = ["appender-arrow"] }
-libduckdb-sys = { git = "https://github.com/swanlake-io/duckdb-rs", rev = "017cf3c", default-features = false }
+duckdb = { git = "https://github.com/duckdb/duckdb-rs", tag = "v1.4.4", default-features = false, features = ["appender-arrow"] }
+libduckdb-sys = { git = "https://github.com/duckdb/duckdb-rs", tag = "v1.4.4", default-features = false }
 sqlparser = { version = "0.59.0", features = ["visitor"] }
 futures = "0.3.31"
 bytes = "1"

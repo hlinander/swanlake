@@ -7,7 +7,7 @@ use std::time::Duration;
 use zip::ZipArchive;
 
 fn main() {
-    let version = env::var("DUCKDB_VERSION").unwrap_or_else(|_| "1.4.1".to_string());
+    let version = env::var("DUCKDB_VERSION").unwrap_or_else(|_| "1.4.4".to_string());
     let root_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let cache_dir = Path::new(&root_dir).join(".duckdb");
     let install_dir = cache_dir.join(&version);
