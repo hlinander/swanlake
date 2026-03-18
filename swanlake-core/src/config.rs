@@ -14,6 +14,9 @@ pub enum SessionIdMode {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Host advertised in FlightEndpoint locations. Defaults to "localhost".
+    /// Set to the externally reachable hostname or IP for remote clients.
+    pub advertise_host: String,
     /// Path to DuckDB database file. Use ":memory:" for in-memory (default).
     pub database_path: Option<String>,
     /// Directory for cache_httpfs disk cache. Enables S3/HTTP caching when set.
@@ -55,6 +58,7 @@ impl Default for ServerConfig {
         Self {
             host: "0.0.0.0".to_string(),
             port: 4214,
+            advertise_host: "localhost".to_string(),
             database_path: None,
             cache_directory: None,
             ducklake_init_sql: None,

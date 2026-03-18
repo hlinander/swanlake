@@ -16,6 +16,7 @@ and boolean flags accept `true/false` (case-insensitive).
 | --- | --- | --- |
 | `SWANLAKE_HOST` | gRPC bind address | `0.0.0.0` |
 | `SWANLAKE_PORT` | gRPC listening port | `4214` |
+| `SWANLAKE_ADVERTISE_HOST` | Host advertised in FlightEndpoint locations (the address clients use to connect back) | `localhost` |
 | `SWANLAKE_MAX_SESSIONS` | Maximum concurrent sessions | `100` |
 | `SWANLAKE_SESSION_TIMEOUT_SECONDS` | Idle timeout before cleanup | `900` (15 min) |
 | `SWANLAKE_SESSION_ID_MODE` | Session identifier source: `peer_addr` (IP:port) or `peer_ip` (IP only) | `peer_addr` |
