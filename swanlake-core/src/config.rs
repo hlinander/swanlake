@@ -23,6 +23,9 @@ pub struct ServerConfig {
     pub session_timeout_seconds: Option<u64>,
     /// Log format: "compact" or "json".
     pub log_format: String,
+    /// Override DuckDB memory_limit (e.g. "16GB", "4096MB").
+    /// When set, bypasses cgroup and meminfo auto-detection.
+    pub memory_limit: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -38,6 +41,7 @@ impl Default for ServerConfig {
             max_sessions: Some(100),
             session_timeout_seconds: Some(900),
             log_format: "compact".to_string(),
+            memory_limit: None,
         }
     }
 }

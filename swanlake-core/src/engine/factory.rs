@@ -6,7 +6,7 @@
 use duckdb::{Config, Connection};
 use tracing::{info, instrument};
 
-use crate::cgroup::{format_bytes_for_duckdb, get_cgroup_memory_limit};
+use crate::cgroup::{compute_memory_limit_from_meminfo, format_bytes_for_duckdb, get_cgroup_memory_limit};
 use crate::config::ServerConfig;
 use crate::engine::connection::DuckDbConnection;
 use crate::error::ServerError;
@@ -24,15 +24,24 @@ impl EngineFactory {
     pub fn new(config: &ServerConfig) -> Result<Self, ServerError> {
         let mut init_statements = Vec::new();
 
-        // Set memory limit from cgroup if available (for systemd-run resource limits)
-        // Use 70% of the cgroup limit to leave headroom for other allocations
-        if let Some(memory_bytes) = get_cgroup_memory_limit() {
+        // Memory limit priority: config override > cgroup > meminfo > DuckDB default
+        if let Some(ref limit) = config.memory_limit {
+            info!("setting DuckDB memory_limit to {} (config override)", limit);
+            init_statements.push(format!("SET memory_limit = '{}';", limit));
+        } else if let Some(memory_bytes) = get_cgroup_memory_limit() {
             let duckdb_memory = (memory_bytes as f64 * 0.70) as u64;
             let memory_limit = format_bytes_for_duckdb(duckdb_memory);
             info!(
                 "setting DuckDB memory_limit to {} (70% of {} cgroup limit)",
                 memory_limit,
                 format_bytes_for_duckdb(memory_bytes)
+            );
+            init_statements.push(format!("SET memory_limit = '{}';", memory_limit));
+        } else if let Some(memory_bytes) = compute_memory_limit_from_meminfo() {
+            let memory_limit = format_bytes_for_duckdb(memory_bytes);
+            info!(
+                "setting DuckDB memory_limit to {} (from /proc/meminfo: RAM - 10GB + swap)",
+                memory_limit
             );
             init_statements.push(format!("SET memory_limit = '{}';", memory_limit));
         }

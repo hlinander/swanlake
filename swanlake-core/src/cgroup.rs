@@ -87,9 +87,94 @@ pub fn format_bytes_for_duckdb(bytes: u64) -> String {
     }
 }
 
+/// Parse `/proc/meminfo` content and compute a memory limit as
+/// `(MemTotal - 10 GB) + SwapTotal`. Returns `None` when either field is
+/// missing or the result would be non-positive.
+fn compute_memory_limit_from_meminfo_content(content: &str) -> Option<u64> {
+    const KB: u64 = 1024;
+    const TEN_GB: u64 = 10 * 1024 * 1024 * 1024;
+
+    let mut mem_total: Option<u64> = None;
+    let mut swap_total: Option<u64> = None;
+
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            mem_total = parse_meminfo_kb(rest);
+        } else if let Some(rest) = line.strip_prefix("SwapTotal:") {
+            swap_total = parse_meminfo_kb(rest);
+        }
+        if mem_total.is_some() && swap_total.is_some() {
+            break;
+        }
+    }
+
+    let mem_bytes = mem_total? * KB;
+    let swap_bytes = swap_total? * KB;
+
+    if mem_bytes <= TEN_GB {
+        debug!("meminfo: MemTotal ({} bytes) <= 10 GB, skipping", mem_bytes);
+        return None;
+    }
+
+    let limit = (mem_bytes - TEN_GB) + swap_bytes;
+    Some(limit)
+}
+
+/// Parse a value like `" 16384000 kB"` → `Some(16384000)`.
+fn parse_meminfo_kb(value: &str) -> Option<u64> {
+    value.split_whitespace().next()?.parse::<u64>().ok()
+}
+
+/// Read `/proc/meminfo` and compute a DuckDB memory limit from system RAM and
+/// swap using the formula `(MemTotal - 10 GB) + SwapTotal`.
+///
+/// Returns `None` on non-Linux, parse failure, or when MemTotal ≤ 10 GB.
+pub fn compute_memory_limit_from_meminfo() -> Option<u64> {
+    let content = match fs::read_to_string("/proc/meminfo") {
+        Ok(c) => c,
+        Err(e) => {
+            debug!("failed to read /proc/meminfo: {}", e);
+            return None;
+        }
+    };
+    let limit = compute_memory_limit_from_meminfo_content(&content)?;
+    debug!("meminfo memory limit: {} bytes", limit);
+    Some(limit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_compute_memory_limit_from_meminfo_content() {
+        // 64 GB RAM, 32 GB swap → (64 - 10) + 32 = 86 GB
+        let content = "\
+MemTotal:       67108864 kB
+MemFree:        10000000 kB
+SwapTotal:      33554432 kB
+SwapFree:       33554432 kB
+";
+        let limit = compute_memory_limit_from_meminfo_content(content).unwrap();
+        let expected = (64 - 10 + 32) * 1024 * 1024 * 1024_u64;
+        assert_eq!(limit, expected);
+    }
+
+    #[test]
+    fn test_meminfo_too_little_ram() {
+        // 8 GB RAM (≤ 10 GB) → None
+        let content = "\
+MemTotal:        8388608 kB
+SwapTotal:       4194304 kB
+";
+        assert!(compute_memory_limit_from_meminfo_content(content).is_none());
+    }
+
+    #[test]
+    fn test_meminfo_missing_fields() {
+        let content = "MemTotal:       67108864 kB\n";
+        assert!(compute_memory_limit_from_meminfo_content(content).is_none());
+    }
 
     #[test]
     fn test_format_bytes_for_duckdb() {

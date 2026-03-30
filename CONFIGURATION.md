@@ -26,6 +26,18 @@ and boolean flags accept `true/false` (case-insensitive).
 | `SWANLAKE_LOG_FORMAT` | `compact` or `json` | `compact` |
 | `NO_COLOR` | Disable log color if set to `true` | _(unset)_ |
 
+## Memory
+
+| Env Var | Description | Default |
+| --- | --- | --- |
+| `SWANLAKE_MEMORY_LIMIT` | Override DuckDB `memory_limit` (e.g. `16GB`, `4096MB`). Bypasses auto-detection. | _(unset)_ |
+
+When `SWANLAKE_MEMORY_LIMIT` is not set, the server auto-detects the limit using this priority:
+
+1. **cgroup** — 70% of the cgroup memory limit (e.g. when running under `systemd-run`)
+2. **`/proc/meminfo`** — `(MemTotal − 10 GB) + SwapTotal`
+3. **DuckDB default** — if none of the above are available
+
 ## DuckLake / DuckDB Initialization
 
 | Env Var | Description | Default |
