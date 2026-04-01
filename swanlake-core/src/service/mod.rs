@@ -32,11 +32,34 @@ use handlers::ticket::{StatementTicketKind, TicketStatementPayload};
 #[derive(Clone)]
 pub struct SwanFlightSqlService {
     registry: Arc<SessionRegistry>,
+    instance_id: Arc<str>,
 }
 
 impl SwanFlightSqlService {
     pub fn new(registry: Arc<SessionRegistry>) -> Self {
-        Self { registry }
+        let instance_id: Arc<str> = uuid::Uuid::new_v4().to_string().into();
+        info!(%instance_id, "server instance initialized");
+        Self { registry, instance_id }
+    }
+
+    pub(crate) fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// Validate that the client's expected instance ID matches this server's.
+    /// If no header is sent, allow the request (backwards compatible).
+    fn validate_instance_id<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        if let Some(expected) = request.metadata().get("x-expected-instance-id") {
+            if let Ok(expected_str) = expected.to_str() {
+                if expected_str != self.instance_id.as_ref() {
+                    return Err(Status::failed_precondition(format!(
+                        "server instance changed: expected {}, got {}",
+                        expected_str, self.instance_id
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Extract session ID from tonic Request metadata
@@ -73,6 +96,7 @@ impl SwanFlightSqlService {
         &self,
         request: &Request<T>,
     ) -> Result<Arc<Session>, Status> {
+        self.validate_instance_id(request)?;
         let session_id = Self::extract_session_id(request)?;
         Span::current().record("session_id", session_id.as_ref());
         self.registry

@@ -162,6 +162,7 @@ impl FlightSqlService for SwanFlightSqlService {
             "catalog_version" => action::do_action_catalog_version(self, request).await,
             "endpoints" => action::do_action_endpoints(self, request).await,
             "execute" => action::do_action_execute(self, request).await,
+            "server_identity" => action::do_action_server_identity(self, request).await,
             _ => {
                 // Check if the action type itself is SQL (Airport uses this pattern for DDL)
                 let trimmed = action_type.trim().to_uppercase();

@@ -1229,6 +1229,28 @@ pub(crate) async fn do_action_execute(
     Ok(Response::new(output_stream))
 }
 
+/// Handle the "server_identity" action — returns this server's instance UUID.
+/// Does NOT call prepare_request (no session needed, no instance validation).
+pub(crate) async fn do_action_server_identity(
+    service: &SwanFlightSqlService,
+    _request: Request<Action>,
+) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
+    info!("handling server_identity action");
+
+    #[derive(Serialize)]
+    struct IdentityResult {
+        instance_id: String,
+    }
+
+    let body = rmp_serde::to_vec_named(&IdentityResult {
+        instance_id: service.instance_id().to_string(),
+    })
+    .map_err(|e| Status::internal(format!("serialize error: {e}")))?;
+
+    let result = arrow_flight::Result { body: body.into() };
+    Ok(Response::new(Box::pin(stream::iter(vec![Ok(result)]))))
+}
+
 /// Handle SQL passed directly as the action type (Airport pattern for DDL)
 /// The action type itself contains the SQL to execute
 pub(crate) async fn do_action_execute_sql(
