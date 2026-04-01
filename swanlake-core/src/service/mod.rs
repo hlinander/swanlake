@@ -107,16 +107,29 @@ impl SwanFlightSqlService {
     }
 
     /// Prepare request: extract session_id from header, record to tracing span, and get/create session.
+    /// If `x-expected-session-nonce` is present, validate it against the session's nonce
+    /// to detect sessions that were silently recreated (server restart, idle eviction).
     pub(crate) async fn prepare_request<T>(
         &self,
         request: &Request<T>,
     ) -> Result<Arc<Session>, Status> {
         let session_id = self.extract_session_id(request);
         Span::current().record("session_id", session_id.as_ref());
-        self.registry
+        let session = self.registry
             .get_or_create_by_id(&session_id)
             .await
-            .map_err(Self::status_from_error)
+            .map_err(Self::status_from_error)?;
+        if let Some(expected) = request.metadata().get("x-expected-session-nonce") {
+            if let Ok(expected_str) = expected.to_str() {
+                if expected_str != session.nonce() {
+                    return Err(Status::failed_precondition(format!(
+                        "session was recreated: expected nonce {}, got {}",
+                        expected_str, session.nonce()
+                    )));
+                }
+            }
+        }
+        Ok(session)
     }
 
     pub(crate) fn status_from_error(err: ServerError) -> Status {

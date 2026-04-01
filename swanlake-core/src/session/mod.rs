@@ -133,6 +133,10 @@ impl SchemaCache {
 /// A client session with dedicated connection and state
 pub struct Session {
     id: SessionId,
+    /// Opaque token assigned at creation. Clients cache this and send it back
+    /// via `x-expected-session-nonce` so the server can detect that a session
+    /// was silently recreated (after restart or idle eviction).
+    nonce: String,
     /// The shared DuckDB connection (pub(crate) for streaming access)
     pub(crate) connection: std::sync::Arc<DuckDbConnection>,
     transactions: Mutex<HashSet<TransactionId>>,
@@ -153,6 +157,7 @@ impl Session {
 
         Self {
             id,
+            nonce: uuid::Uuid::new_v4().to_string(),
             connection,
             transactions: Mutex::new(HashSet::new()),
             aborted_transactions: Mutex::new(HashSet::new()),
@@ -163,6 +168,11 @@ impl Session {
             last_activity: Mutex::new(Instant::now()),
             schema_cache: Mutex::new(SchemaCache::new()),
         }
+    }
+
+    /// Opaque nonce assigned at session creation.
+    pub fn nonce(&self) -> &str {
+        &self.nonce
     }
 
     /// Get time since last activity

@@ -1229,6 +1229,30 @@ pub(crate) async fn do_action_execute(
     Ok(Response::new(output_stream))
 }
 
+/// Handle the "session_info" action — returns the current session's nonce.
+/// Clients cache the nonce and send it back via `x-expected-session-nonce`
+/// to detect sessions that were silently recreated.
+pub(crate) async fn do_action_session_info(
+    service: &SwanFlightSqlService,
+    request: Request<Action>,
+) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
+    let session = service.prepare_request(&request).await?;
+    info!("handling session_info action");
+
+    #[derive(Serialize)]
+    struct SessionInfoResult {
+        nonce: String,
+    }
+
+    let body = rmp_serde::to_vec_named(&SessionInfoResult {
+        nonce: session.nonce().to_string(),
+    })
+    .map_err(|e| Status::internal(format!("serialize error: {e}")))?;
+
+    let result = arrow_flight::Result { body: body.into() };
+    Ok(Response::new(Box::pin(stream::iter(vec![Ok(result)]))))
+}
+
 /// Handle SQL passed directly as the action type (Airport pattern for DDL)
 /// The action type itself contains the SQL to execute
 pub(crate) async fn do_action_execute_sql(
