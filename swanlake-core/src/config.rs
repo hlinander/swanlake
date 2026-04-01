@@ -51,6 +51,9 @@ pub struct ServerConfig {
     pub metrics_slow_query_threshold_ms: Option<u64>,
     /// Max number of latency/error/slow-query entries to retain.
     pub metrics_history_size: Option<usize>,
+    /// Override DuckDB memory_limit (e.g. "16GB", "4096MB").
+    /// When set, bypasses cgroup and meminfo auto-detection.
+    pub memory_limit: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -76,6 +79,7 @@ impl Default for ServerConfig {
             status_path_prefix: String::new(),
             metrics_slow_query_threshold_ms: Some(5000),
             metrics_history_size: Some(200),
+            memory_limit: None,
         }
     }
 }

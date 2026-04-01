@@ -39,6 +39,18 @@ and boolean flags accept `true/false` (case-insensitive).
 | `SWANLAKE_METRICS_SLOW_QUERY_THRESHOLD_MS` | Slow query threshold (ms) used for tagging slow queries | `5000` |
 | `SWANLAKE_METRICS_HISTORY_SIZE` | Number of latency/error/slow-query entries retained | `200` |
 
+## Memory
+
+| Env Var | Description | Default |
+| --- | --- | --- |
+| `SWANLAKE_MEMORY_LIMIT` | Override DuckDB `memory_limit` (e.g. `16GB`, `4096MB`). Bypasses auto-detection. | _(unset)_ |
+
+When `SWANLAKE_MEMORY_LIMIT` is not set, the server auto-detects the limit using this priority:
+
+1. **cgroup** — 70% of the cgroup memory limit (e.g. when running under `systemd-run`)
+2. **`/proc/meminfo`** — `(MemTotal - 10 GB) + SwapTotal`
+3. **DuckDB default** — if none of the above are available
+
 ## DuckLake / DuckDB Initialization
 
 | Env Var | Description | Default |
