@@ -87,6 +87,19 @@ impl DuckDbConnection {
         })
     }
 
+    /// Schema planning for streaming: wraps in `SELECT * FROM () LIMIT 0` to
+    /// avoid materializing data, except for statements like EXPLAIN that can't
+    /// be used as subqueries.
+    fn schema_for_streaming(&self, sql: &str) -> Result<Schema, ServerError> {
+        let trimmed = sql.trim_start();
+        if trimmed.starts_with("EXPLAIN") || trimmed.starts_with("explain") {
+            self.schema_for_query(sql)
+        } else {
+            let schema_sql = format!("SELECT * FROM ({}) LIMIT 0", sql.trim_end_matches(';').trim());
+            self.schema_for_query(&schema_sql)
+        }
+    }
+
     /// Execute a SELECT query and return results
     #[instrument(skip(self), fields(sql = %sql))]
     pub fn execute_query(&self, sql: &str) -> Result<QueryResult, ServerError> {
@@ -123,9 +136,7 @@ impl DuckDbConnection {
         tx: mpsc::Sender<StreamingBatch>,
         interrupt_handle: Option<std::sync::Arc<duckdb::InterruptHandle>>,
     ) -> Result<(), ServerError> {
-        // Get schema using LIMIT 0 to avoid materializing data
-        let schema_sql = format!("SELECT * FROM ({}) LIMIT 0", sql.trim_end_matches(';').trim());
-        let schema = self.schema_for_query(&schema_sql)?;
+        let schema = self.schema_for_streaming(sql)?;
         let schema_ref: SchemaRef = Arc::new(schema.clone());
 
         // Send schema first
@@ -197,9 +208,7 @@ impl DuckDbConnection {
         tx: mpsc::Sender<StreamingBatch>,
         interrupt_handle: Option<std::sync::Arc<duckdb::InterruptHandle>>,
     ) -> Result<(), ServerError> {
-        // Get schema using LIMIT 0 to avoid materializing data
-        let schema_sql = format!("SELECT * FROM ({}) LIMIT 0", sql.trim_end_matches(';').trim());
-        let schema = self.schema_for_query(&schema_sql)?;
+        let schema = self.schema_for_streaming(sql)?;
         let schema_ref: SchemaRef = Arc::new(schema.clone());
 
         // Send schema first
