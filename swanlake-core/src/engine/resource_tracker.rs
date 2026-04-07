@@ -55,7 +55,7 @@ impl ResourceTracker {
 
                 while !stop_flag.load(Ordering::Relaxed) {
                     match monitoring_conn.query_row(
-                        "SELECT duckdb_memory()",
+                        "SELECT sum(memory_usage_bytes) FROM duckdb_memory()",
                         [],
                         |row| row.get::<_, i64>(0),
                     ) {
