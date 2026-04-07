@@ -13,6 +13,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use arrow_flight::flight_service_server::FlightService;
@@ -215,6 +216,10 @@ impl SwanFlightSqlService {
 ///
 /// When dropped (e.g., client cancels), it interrupts the running DuckDB query.
 /// Includes progress information in app_metadata for each batch.
+///
+/// Sends periodic heartbeat messages (0-row batches with app_metadata) so that
+/// resource stats (memory, CPU) reach the client even when no data batches are
+/// being produced.
 struct StreamingBatchToFlightData<S> {
     inner: S,
     schema: Option<Arc<Schema>>,
@@ -225,6 +230,8 @@ struct StreamingBatchToFlightData<S> {
     resource_tracker: Arc<ResourceTracker>,
     /// Rows sent so far (for fallback progress calculation)
     rows_sent: u64,
+    /// Periodic timer for sending progress heartbeats between data batches.
+    heartbeat: tokio::time::Interval,
 }
 
 impl<S> StreamingBatchToFlightData<S> {
@@ -233,6 +240,12 @@ impl<S> StreamingBatchToFlightData<S> {
         interrupt_handle: Arc<InterruptHandle>,
         resource_tracker: Arc<ResourceTracker>,
     ) -> Self {
+        // First tick after 250ms (not immediately), then every 250ms.
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_millis(250),
+            Duration::from_millis(250),
+        );
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         Self {
             inner,
             schema: None,
@@ -240,6 +253,7 @@ impl<S> StreamingBatchToFlightData<S> {
             interrupt_handle,
             resource_tracker,
             rows_sent: 0,
+            heartbeat,
         }
     }
 
@@ -294,6 +308,8 @@ where
                 StreamingBatch::Batch(batch) => {
                     let batch_rows = batch.num_rows() as u64;
                     self.rows_sent += batch_rows;
+                    // Reset heartbeat so we don't send one right after real data.
+                    self.heartbeat.reset();
 
                     // Get progress and resource stats
                     let progress = self.get_progress();
@@ -331,7 +347,36 @@ where
                 self.done = true;
                 Poll::Ready(None)
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                // No data batch available — send a heartbeat with resource stats
+                // if the timer has fired. Uses a 0-row RecordBatch so the airport
+                // extension sees a valid (but empty) batch and processes app_metadata.
+                if let Some(schema) = self.schema.clone() {
+                    if self.heartbeat.poll_tick(cx).is_ready() {
+                        let progress = self.get_progress();
+                        let snapshot = self.resource_tracker.snapshot();
+                        let has_data = progress.is_some()
+                            || snapshot.peak_memory_bytes > 0
+                            || snapshot.cpu_time_us > 0;
+                        if has_data {
+                            let empty_batch = RecordBatch::new_empty(schema);
+                            match encode_batch(&empty_batch, progress, Some(snapshot)) {
+                                Ok(fd) => {
+                                    trace!(
+                                        progress = ?progress,
+                                        peak_memory_bytes = snapshot.peak_memory_bytes,
+                                        cpu_time_us = snapshot.cpu_time_us,
+                                        "heartbeat: sending progress update"
+                                    );
+                                    return Poll::Ready(Some(Ok(fd)));
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                }
+                Poll::Pending
+            }
         }
     }
 }
