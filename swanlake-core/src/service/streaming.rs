@@ -99,9 +99,12 @@ fn encode_batch(
         .encoded_batch(batch, &mut dict_tracker, &options)
         .map_err(|e| Status::internal(format!("failed to encode batch: {e}")))?;
 
-    let app_metadata = match progress {
-        Some(p) => encode_progress(p, snapshot),
-        None => bytes::Bytes::new(),
+    let has_resource_data = snapshot
+        .map_or(false, |s| s.peak_memory_bytes > 0 || s.cpu_time_us > 0);
+    let app_metadata = if progress.is_some() || has_resource_data {
+        encode_progress(progress.unwrap_or(0.0), snapshot)
+    } else {
+        bytes::Bytes::new()
     };
 
     Ok(FlightData {
