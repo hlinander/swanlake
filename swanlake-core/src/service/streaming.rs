@@ -149,8 +149,27 @@ impl SwanFlightSqlService {
             interrupt_handle_monitor.interrupt();
         });
 
+        // Create monitoring connection BEFORE spawning the blocking task,
+        // while the session's connection mutex is still available.
+        // try_clone() creates a sibling connection to the same database via duckdb_connect().
+        // duckdb_memory() is database-wide, so any connection to the same DB works.
+        let resource_tracker = {
+            let conn_guard = session.connection.conn.lock()
+                .map_err(|_| Status::internal("connection mutex poisoned"))?;
+            match conn_guard.try_clone() {
+                Ok(mon_conn) => {
+                    drop(conn_guard);
+                    Arc::new(ResourceTracker::start(mon_conn))
+                }
+                Err(e) => {
+                    drop(conn_guard);
+                    warn!(%e, "failed to clone monitoring connection, resource tracking disabled");
+                    Arc::new(ResourceTracker::disabled())
+                }
+            }
+        };
+
         // Spawn blocking task to execute query and stream batches
-        // Clone interrupt handle so the blocking task can interrupt on cancellation
         let interrupt_handle_clone = interrupt_handle.clone();
         let sql_clone = sql.clone();
 
@@ -176,9 +195,6 @@ impl SwanFlightSqlService {
         });
 
         info!(sql = %sql, "started streaming query execution");
-
-        // Start resource tracker to sample DuckDB memory usage
-        let resource_tracker = Arc::new(ResourceTracker::start(&interrupt_handle));
 
         // Convert channel to stream, mapping StreamingBatch to FlightData
         let rx_stream = ReceiverStream::new(rx);
