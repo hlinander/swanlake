@@ -159,7 +159,7 @@ impl SwanFlightSqlService {
             match conn_guard.try_clone() {
                 Ok(mon_conn) => {
                     drop(conn_guard);
-                    Arc::new(ResourceTracker::start(mon_conn))
+                    Arc::new(ResourceTracker::start(mon_conn, interrupt_handle.clone()))
                 }
                 Err(e) => {
                     drop(conn_guard);
