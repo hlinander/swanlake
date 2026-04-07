@@ -77,6 +77,9 @@ impl ResourceTracker {
         let sampler_handle = thread::Builder::new()
             .name("resource-sampler".into())
             .spawn(move || {
+                // Force capture of entire SendConn (not just conn.0) so the
+                // unsafe Send impl applies under Rust 2021 disjoint capture.
+                let conn = conn;
                 let query =
                     CString::new("SELECT duckdb_memory()").expect("CString::new failed");
                 let mut warned = false;
