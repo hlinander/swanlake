@@ -27,7 +27,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 use tracing::{debug, error, info, trace, warn};
 
-use crate::engine::{query_progress, StreamingBatch};
+use crate::engine::{query_progress, ResourceSnapshot, ResourceTracker, StreamingBatch};
 use crate::session::Session;
 
 use super::SwanFlightSqlService;
@@ -38,12 +38,24 @@ use super::SwanFlightSqlService;
 struct ScannerProgress {
     /// Progress from 0.0 to 1.0
     progress: f64,
+    /// Peak memory usage in bytes since query start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peak_memory_bytes: Option<u64>,
+    /// Current memory usage in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_memory_bytes: Option<u64>,
+    /// Accumulated CPU time in microseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_time_us: Option<u64>,
 }
 
-/// Encode progress as msgpack for app_metadata.
-fn encode_progress(progress: f64) -> bytes::Bytes {
+/// Encode progress and optional resource stats as msgpack for app_metadata.
+fn encode_progress(progress: f64, snapshot: Option<ResourceSnapshot>) -> bytes::Bytes {
     let scanner_progress = ScannerProgress {
         progress: progress.clamp(0.0, 1.0),
+        peak_memory_bytes: snapshot.map(|s| s.peak_memory_bytes),
+        current_memory_bytes: snapshot.map(|s| s.current_memory_bytes),
+        cpu_time_us: snapshot.and_then(|s| if s.cpu_time_us > 0 { Some(s.cpu_time_us) } else { None }),
     };
     match rmp_serde::to_vec_named(&scanner_progress) {
         Ok(bytes) => bytes.into(),
@@ -73,7 +85,11 @@ fn encode_schema(schema: &Schema) -> Result<FlightData, Status> {
 
 /// Encode a RecordBatch to FlightData with optional progress in app_metadata.
 #[allow(deprecated)]
-fn encode_batch(batch: &RecordBatch, progress: Option<f64>) -> Result<FlightData, Status> {
+fn encode_batch(
+    batch: &RecordBatch,
+    progress: Option<f64>,
+    snapshot: Option<ResourceSnapshot>,
+) -> Result<FlightData, Status> {
     let options = IpcWriteOptions::default();
     let data_gen = IpcDataGenerator::default();
 
@@ -84,7 +100,7 @@ fn encode_batch(batch: &RecordBatch, progress: Option<f64>) -> Result<FlightData
         .map_err(|e| Status::internal(format!("failed to encode batch: {e}")))?;
 
     let app_metadata = match progress {
-        Some(p) => encode_progress(p),
+        Some(p) => encode_progress(p, snapshot),
         None => bytes::Bytes::new(),
     };
 
@@ -161,12 +177,16 @@ impl SwanFlightSqlService {
 
         info!(sql = %sql, "started streaming query execution");
 
+        // Start resource tracker to sample DuckDB memory usage
+        let resource_tracker = Arc::new(ResourceTracker::start(&interrupt_handle));
+
         // Convert channel to stream, mapping StreamingBatch to FlightData
         let rx_stream = ReceiverStream::new(rx);
 
         // State for tracking schema (needed for batch encoding context)
         // Pass interrupt handle for cancellation on drop (fallback mechanism)
-        let stream = StreamingBatchToFlightData::new(rx_stream, interrupt_handle);
+        let stream =
+            StreamingBatchToFlightData::new(rx_stream, interrupt_handle, resource_tracker);
 
         Ok(Response::new(Box::pin(stream)))
     }
@@ -182,17 +202,24 @@ struct StreamingBatchToFlightData<S> {
     done: bool,
     /// Interrupt handle for cancellation and progress polling.
     interrupt_handle: Arc<InterruptHandle>,
+    /// Resource tracker for memory usage sampling.
+    resource_tracker: Arc<ResourceTracker>,
     /// Rows sent so far (for fallback progress calculation)
     rows_sent: u64,
 }
 
 impl<S> StreamingBatchToFlightData<S> {
-    fn new(inner: S, interrupt_handle: Arc<InterruptHandle>) -> Self {
+    fn new(
+        inner: S,
+        interrupt_handle: Arc<InterruptHandle>,
+        resource_tracker: Arc<ResourceTracker>,
+    ) -> Self {
         Self {
             inner,
             schema: None,
             done: false,
             interrupt_handle,
+            resource_tracker,
             rows_sent: 0,
         }
     }
@@ -249,16 +276,20 @@ where
                     let batch_rows = batch.num_rows() as u64;
                     self.rows_sent += batch_rows;
 
-                    // Get progress from DuckDB's query progress API
+                    // Get progress and resource stats
                     let progress = self.get_progress();
+                    let snapshot = self.resource_tracker.snapshot();
                     info!(
                         rows = batch_rows,
                         total_rows_sent = self.rows_sent,
                         progress = ?progress,
+                        peak_memory_bytes = snapshot.peak_memory_bytes,
+                        current_memory_bytes = snapshot.current_memory_bytes,
+                        cpu_time_us = snapshot.cpu_time_us,
                         "streaming: encoding batch with progress"
                     );
 
-                    match encode_batch(&batch, progress) {
+                    match encode_batch(&batch, progress, Some(snapshot)) {
                         Ok(fd) => Poll::Ready(Some(Ok(fd))),
                         Err(e) => {
                             self.done = true;

@@ -10,7 +10,9 @@ pub(crate) mod batch;
 pub mod connection;
 mod factory;
 pub mod progress;
+pub mod resource_tracker;
 
 pub use connection::{DuckDbConnection, QueryResult, StreamingBatch};
 pub use factory::EngineFactory;
 pub use progress::{query_progress, QueryProgress};
+pub use resource_tracker::{ResourceSnapshot, ResourceTracker};

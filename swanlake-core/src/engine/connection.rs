@@ -145,6 +145,15 @@ impl DuckDbConnection {
             return Ok(());
         }
 
+        // Enable CPU time profiling for resource tracking
+        {
+            let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = conn.execute_batch(
+                "SET enable_profiling = 'json'; \
+                 SET custom_profiling_settings = '{\"OPERATOR_CPU_TIME\": \"true\", \"CPU_TIME_ACTUAL\": \"true\"}';"
+            );
+        }
+
         // Now execute the full query in true streaming mode
         self.with_prepared(sql, |stmt| {
             let arrow = Self::stream_arrow_with_schema(stmt, None, schema_ref)?;
@@ -215,6 +224,15 @@ impl DuckDbConnection {
         if tx.blocking_send(StreamingBatch::Schema(schema)).is_err() {
             debug!("streaming receiver dropped before schema sent");
             return Ok(());
+        }
+
+        // Enable CPU time profiling for resource tracking
+        {
+            let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = conn.execute_batch(
+                "SET enable_profiling = 'json'; \
+                 SET custom_profiling_settings = '{\"OPERATOR_CPU_TIME\": \"true\", \"CPU_TIME_ACTUAL\": \"true\"}';"
+            );
         }
 
         // Now execute the full query in true streaming mode
