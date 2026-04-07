@@ -329,13 +329,15 @@ impl SwanFlightService {
             return Ok(Response::new(info));
         }
 
-        // For queries, get schema using LIMIT 0 to avoid materializing data
-        let schema_sql = format!("SELECT * FROM ({}) LIMIT 0", sql.trim_end_matches(';').trim());
+        // For queries, get schema without materializing data.
+        // EXPLAIN can't be wrapped in a subquery, so use schema_for_streaming
+        // which handles that case.
+        let sql_for_schema = sql.clone();
         let session_clone = Arc::clone(&session);
 
         let interrupt_handle = session.connection.interrupt_handle();
         let schema = run_interruptible(interrupt_handle, move || {
-            session_clone.schema_for_query(&schema_sql)
+            session_clone.connection.schema_for_streaming(&sql_for_schema)
         })
         .await?;
 

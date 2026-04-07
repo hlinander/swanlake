@@ -90,7 +90,7 @@ impl DuckDbConnection {
     /// Schema planning for streaming: wraps in `SELECT * FROM () LIMIT 0` to
     /// avoid materializing data, except for statements like EXPLAIN that can't
     /// be used as subqueries.
-    fn schema_for_streaming(&self, sql: &str) -> Result<Schema, ServerError> {
+    pub fn schema_for_streaming(&self, sql: &str) -> Result<Schema, ServerError> {
         let trimmed = sql.trim_start();
         if trimmed.starts_with("EXPLAIN") || trimmed.starts_with("explain") {
             self.schema_for_query(sql)
