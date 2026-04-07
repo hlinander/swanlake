@@ -96,12 +96,6 @@ jobs:
       - name: Start services
         run: docker compose up -d
 
-      - name: Cache DuckDB
-        uses: actions/cache@v5
-        with:
-          path: .duckdb
-          key: perf-duckdb-${{ runner.os }}
-
       - name: Cache BenchBase artifacts
         uses: actions/cache@v5
         with:

@@ -18,8 +18,7 @@ RUN --mount=type=cache,id=cargo_registry,target=/usr/local/cargo/registry \
     cargo build --release --bin swanlake && \
     mkdir -p /release && \
     cp /swanlake/target/release/swanlake /release/ && \
-    cp /swanlake/scripts/docker-entrypoint.sh /release/docker-entrypoint.sh && \
-    cp -r /swanlake/swanlake-core/.duckdb /release/.duckdb
+    cp /swanlake/scripts/docker-entrypoint.sh /release/docker-entrypoint.sh
 
 # ========== base ==========
 
@@ -41,7 +40,6 @@ USER swanlake
 WORKDIR /app
 
 COPY --from=ghcr.io/grpc-ecosystem/grpc-health-probe:v0.4.41 /ko-app/grpc-health-probe /usr/local/bin/grpc-health-probe
-COPY --from=builder /release/.duckdb .duckdb
 COPY --from=builder /release/swanlake /usr/local/bin/swanlake
 
 EXPOSE 4214

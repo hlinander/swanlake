@@ -24,8 +24,8 @@ arrow-flight = { version = "57", features = ["flight-sql"] }
 arrow-ipc = "57"
 arrow-cast = "57"
 arrow-select = "57"
-duckdb = { git = "https://github.com/kabergstrom/duckdb-rs", rev = "de24d0d9636e7a962fe866d8f9bca94dea3c6d1b", default-features = false, features = ["appender-arrow"] }
-libduckdb-sys = { git = "https://github.com/kabergstrom/duckdb-rs", rev = "de24d0d9636e7a962fe866d8f9bca94dea3c6d1b", default-features = false }
+duckdb = { git = "https://github.com/kabergstrom/duckdb-rs", rev = "de24d0d9636e7a962fe866d8f9bca94dea3c6d1b", default-features = false, features = ["bundled", "appender-arrow"] }
+libduckdb-sys = { git = "https://github.com/kabergstrom/duckdb-rs", rev = "de24d0d9636e7a962fe866d8f9bca94dea3c6d1b", default-features = false, features = ["bundled"] }
 tonic = { version = "0.14.4", features = ["transport"] }
 thiserror = "2.0.18"
 
