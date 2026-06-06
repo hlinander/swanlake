@@ -1104,7 +1104,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 [[package]]
 name = "duckdb"
 version = "1.10502.0"
-source = "git+https://github.com/duckdb/duckdb-rs?tag=v1.10502.0#8aa176add468ce2f7ada2d9bfd46f4c13509f198"
+source = "git+https://github.com/hlinander/duckdb-rs?rev=993e6d92cd64fe4581bc43ee2b528056aaba632b#993e6d92cd64fe4581bc43ee2b528056aaba632b"
 dependencies = [
  "arrow",
  "cast",
@@ -1759,7 +1759,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2057,7 +2057,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "libduckdb-sys"
 version = "1.10502.0"
-source = "git+https://github.com/duckdb/duckdb-rs?tag=v1.10502.0#8aa176add468ce2f7ada2d9bfd46f4c13509f198"
+source = "git+https://github.com/hlinander/duckdb-rs?rev=993e6d92cd64fe4581bc43ee2b528056aaba632b#993e6d92cd64fe4581bc43ee2b528056aaba632b"
 dependencies = [
  "cc",
  "flate2",
@@ -2750,7 +2750,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "thiserror",
  "tokio",
  "tracing",
@@ -2787,7 +2787,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
