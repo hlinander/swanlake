@@ -1104,7 +1104,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 [[package]]
 name = "duckdb"
 version = "1.10502.0"
-source = "git+https://github.com/hlinander/duckdb-rs?rev=eaa9c3e0fd9d1d2c344fbbc4e6c17765e863d1c1#eaa9c3e0fd9d1d2c344fbbc4e6c17765e863d1c1"
+source = "git+https://github.com/hlinander/duckdb-rs?rev=b76a4416fc249c885d9ca161de382b1d83869afe#b76a4416fc249c885d9ca161de382b1d83869afe"
 dependencies = [
  "arrow",
  "cast",
@@ -2057,7 +2057,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "libduckdb-sys"
 version = "1.10502.0"
-source = "git+https://github.com/hlinander/duckdb-rs?rev=eaa9c3e0fd9d1d2c344fbbc4e6c17765e863d1c1#eaa9c3e0fd9d1d2c344fbbc4e6c17765e863d1c1"
+source = "git+https://github.com/hlinander/duckdb-rs?rev=b76a4416fc249c885d9ca161de382b1d83869afe#b76a4416fc249c885d9ca161de382b1d83869afe"
 dependencies = [
  "cc",
  "flate2",
