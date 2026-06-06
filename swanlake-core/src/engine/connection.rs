@@ -11,7 +11,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema, SchemaRef};
 use duckdb::types::Value;
 use duckdb::{params_from_iter, Connection};
-use duckdb::{Arrow, ArrowStream, Statement};
+use duckdb::{ArrowStream, Statement};
 use tokio::sync::mpsc;
 use tracing::{debug, info, instrument};
 
@@ -80,8 +80,9 @@ impl DuckDbConnection {
         let trimmed_sql = sql.trim_end_matches(';').trim();
 
         self.with_prepared(trimmed_sql, |stmt| {
-            let arrow = Self::query_arrow(stmt, None)?;
-            let schema = arrow.get_schema();
+            // DuckDB 1.5+ removed the legacy execute-then-arrow-schema path; use
+            // the prepared-statement arrow schema, which does not execute.
+            let schema = stmt.schema_from_prepared()?;
             debug!(field_count = schema.fields().len(), "retrieved schema");
             Ok(schema.as_ref().clone())
         })
@@ -104,8 +105,9 @@ impl DuckDbConnection {
     #[instrument(skip(self), fields(sql = %sql))]
     pub fn execute_query(&self, sql: &str) -> Result<QueryResult, ServerError> {
         self.with_prepared(sql, |stmt| {
-            let arrow = Self::query_arrow(stmt, None)?;
-            let result = Self::collect_query_result(arrow);
+            let schema = stmt.schema_from_prepared()?;
+            let arrow = Self::stream_arrow_with_schema(stmt, None, schema.clone())?;
+            let result = Self::collect_query_result(schema, arrow);
             debug!(
                 batch_count = result.batches.len(),
                 total_rows = result.total_rows,
@@ -292,8 +294,9 @@ impl DuckDbConnection {
         params: &[Value],
     ) -> Result<QueryResult, ServerError> {
         self.with_prepared(sql, |stmt| {
-            let arrow = Self::query_arrow(stmt, Some(params))?;
-            let result = Self::collect_query_result(arrow);
+            let schema = stmt.schema_from_prepared()?;
+            let arrow = Self::stream_arrow_with_schema(stmt, Some(params), schema.clone())?;
+            let result = Self::collect_query_result(schema, arrow);
             debug!(
                 batch_count = result.batches.len(),
                 total_rows = result.total_rows,
@@ -496,27 +499,6 @@ impl DuckDbConnection {
     }
 
     /// Run a query, binding parameters if provided, or filling with NULLs otherwise.
-    ///
-    /// **Warning:** This uses `query_arrow` which materializes all results upfront.
-    /// For large result sets, use `stream_arrow_with_schema` instead.
-    fn query_arrow<'a>(
-        stmt: &'a mut Statement,
-        params: Option<&[Value]>,
-    ) -> Result<Arrow<'a>, ServerError> {
-        match params {
-            Some(values) => Ok(stmt.query_arrow(params_from_iter(values.iter()))?),
-            None => {
-                let param_count = stmt.parameter_count();
-                if param_count == 0 {
-                    Ok(stmt.query_arrow([])?)
-                } else {
-                    let nulls: Vec<Value> = (0..param_count).map(|_| Value::Null).collect();
-                    Ok(stmt.query_arrow(params_from_iter(nulls))?)
-                }
-            }
-        }
-    }
-
     /// Run a query in true streaming mode with backpressure support.
     ///
     /// Unlike `query_arrow`, this uses `execute_streaming` internally which
@@ -542,11 +524,13 @@ impl DuckDbConnection {
     }
 
     /// Collect Arrow batches into a QueryResult with row/byte totals.
-    fn collect_query_result(arrow: Arrow<'_>) -> QueryResult {
-        let schema = arrow.get_schema();
+    fn collect_query_result<I: Iterator<Item = RecordBatch>>(
+        schema: SchemaRef,
+        batches_iter: I,
+    ) -> QueryResult {
         let mut total_rows = 0usize;
         let mut total_bytes = 0usize;
-        let batches: Vec<RecordBatch> = arrow
+        let batches: Vec<RecordBatch> = batches_iter
             .inspect(|batch| {
                 total_rows += batch.num_rows();
                 total_bytes += batch.get_array_memory_size();
