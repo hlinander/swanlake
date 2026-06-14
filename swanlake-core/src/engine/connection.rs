@@ -317,6 +317,13 @@ impl DuckDbConnection {
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The streaming path enables `enable_profiling='json'` on this shared
+        // session connection (for CPU sampling) and never resets it. With
+        // profiling on, a `CREATE TABLE AS SELECT` run through the arrow C-API
+        // returns a null result ("out is null"). Clear it first so DDL/DML
+        // (including CTAS) from the execute action run cleanly. Ignored result:
+        // RESET is a no-op when profiling is already at its default.
+        let _ = conn.execute_batch("RESET enable_profiling");
         conn.execute_batch(sql)?;
         debug!("executed statement");
         Ok(0)
@@ -329,6 +336,15 @@ impl DuckDbConnection {
         sql: &str,
         params: &[Value],
     ) -> Result<usize, ServerError> {
+        // Clear any leaked profiling state before running a (possibly
+        // query-materializing) statement; see `execute_statement`.
+        {
+            let conn = self
+                .conn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = conn.execute_batch("RESET enable_profiling");
+        }
         self.with_prepared(sql, |stmt| {
             let affected = Self::execute_with_params(stmt, params)?;
             debug!(affected, "executed statement with parameters");
@@ -562,5 +578,23 @@ mod tests {
         conn.execute_statement("INSERT INTO t VALUES (1)").unwrap();
         let result = conn.execute_query("SELECT * FROM t").unwrap();
         assert_eq!(result.total_rows, 1);
+    }
+
+    /// The streaming path enables `enable_profiling='json'` on the shared session
+    /// connection and never resets it. With profiling on, a `CREATE TABLE AS
+    /// SELECT` executed through the arrow C-API returns a null result, surfaced by
+    /// duckdb-rs as the opaque "out is null". Execute-statement paths must clear
+    /// profiling first so DDL/DML (including CTAS) run cleanly.
+    #[test]
+    fn execute_statement_succeeds_after_profiling_enabled() {
+        let conn = test_connection();
+        // Simulate the streaming path leaving profiling enabled on the session.
+        conn.execute_batch("SET enable_profiling = 'json'").unwrap();
+        // Pre-fix: this returns Err("out is null").
+        conn.execute_statement("CREATE TABLE t AS SELECT 1 AS a").unwrap();
+        assert_eq!(
+            conn.execute_query("SELECT count(*) FROM t").unwrap().total_rows,
+            1
+        );
     }
 }
