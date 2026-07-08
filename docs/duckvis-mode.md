@@ -66,9 +66,14 @@ This is the **sole** surface that ever serializes `Attachment.secret_config`.
 ## C5 — Token flows
 
 - **Swanlake service account** (aud=duckvis-api): `POST /v1/auth/oauth/token`, form
-  `grant_type=client_credentials` + `resource=duckvis-api`, credentials via HTTP Basic
-  (`base64(client_id:client_secret)`) or body pair — never both. Response
-  `{access_token, token_type, expires_in: 600}`. Refresh proactively (<60s remaining) and once on 401.
+  `grant_type=client_credentials` + `resource=duckvis-api` +
+  `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer` +
+  `client_assertion=<compact JWS>` (RFC 7523) — no Authorization header. The assertion is an
+  Ed25519 compact JWS (RFC 7515, base64url without padding): header exactly
+  `{"alg":"EdDSA","typ":"JWT"}`; claims `iss` = `sub` = the configured client id (the SSA name),
+  `aud` = the configured duckvis issuer URL (verbatim), `iat` = now, `exp` = now + 240s; signed
+  with the SSA's private key. Response `{access_token, token_type, expires_in: 600}`. Refresh
+  proactively (<60s remaining) and once on 401.
 - **User tokens** (aud=swanlake): app calls `POST /v1/auth/token/refresh`
   `{refresh_token, resource:"swanlake"}` → 600s EdDSA JWT. **This rotates the refresh token
   unconditionally** — the app must persist the rotated token and serialize all refresh
@@ -91,8 +96,10 @@ privileged execute path may run an ATTACH.
 ## Swanlake configuration (env, `SWANLAKE_` prefix)
 
 `duckvis_enabled` (bool), `duckvis_api_url`, `duckvis_issuer`, `duckvis_client_id`,
-`duckvis_client_secret`, `duckvis_jwks_max_age_secs` (default 300). All required when enabled.
-`duckvis_client_id` is the system service account's id (its OAuth `client_id`), and
-`duckvis_client_secret` the secret minted by `resource-server key mint`.
+`duckvis_private_key`, `duckvis_jwks_max_age_secs` (default 300). All required when enabled.
+`duckvis_client_id` is the resource-server service account (SSA) name (e.g. `swanlake-wrx80`),
+and `duckvis_private_key` the base64 (standard alphabet) encoding of the SSA's raw 32-byte
+Ed25519 seed, used to sign the C5 client assertion. It must decode to exactly 32 bytes
+(validated at startup) and is never echoed in errors or config logging.
 Duckvis mode should run with in-memory per-session databases; file-based `database_path` shares the
 attached catalog across sessions (DuckDB instance cache) and is rejected/warned at startup.

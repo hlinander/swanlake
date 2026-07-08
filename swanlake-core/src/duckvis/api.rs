@@ -134,7 +134,8 @@ impl DuckvisAuth {
             &self.client,
             &self.api_url,
             &self.client_id,
-            &self.client_secret,
+            &self.issuer,
+            &self.signing_key,
         )
         .await?;
 
@@ -148,7 +149,8 @@ impl DuckvisAuth {
                 &self.client,
                 &self.api_url,
                 &self.client_id,
-                &self.client_secret,
+                &self.issuer,
+                &self.signing_key,
             )
             .await?;
             let retry = self.send_json(url, body, &fresh).await?;

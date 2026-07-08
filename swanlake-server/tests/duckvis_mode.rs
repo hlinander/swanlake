@@ -14,9 +14,9 @@ use std::sync::{Arc, Mutex};
 
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::{Action, FlightDescriptor, Ticket};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD as BASE64_STD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
-use ed25519_dalek::{Signer as _, SigningKey};
+use ed25519_dalek::{Signature, Signer as _, SigningKey};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tonic::transport::Channel;
@@ -31,6 +31,11 @@ use swanlake_core::session::registry::SessionRegistry;
 const SEED_K1: [u8; 32] = [0x11; 32];
 const KID_K1: &str = "SniHfEoJJvxdXLKCu0XBHA";
 const ISS: &str = "https://api.duckvis.test";
+
+/// Seed of the swanlake service-account signing key (distinct from the
+/// duckvis-api token-signing key above) and the SA client id (SSA name).
+const SA_SEED: [u8; 32] = [0x33; 32];
+const SA_CLIENT_ID: &str = "swanlake-rs";
 
 // ---------------------------------------------------------------------------
 // Token minting (mirrors duckvis-api signing.rs)
@@ -170,12 +175,78 @@ async fn spawn_mock_api(state: Arc<MockState>) -> String {
             .into_response()
     }
 
-    async fn oauth_token() -> impl IntoResponse {
+    /// Validate the RFC 7523 signed-JWT client assertion swanlake must send
+    /// (contract C5): frozen header, iss/sub = SA client id, aud = issuer,
+    /// exp = iat + 240, Ed25519 signature over `b64(header).b64(claims)`.
+    fn verify_sa_assertion(jws: &str) -> bool {
+        let parts: Vec<&str> = jws.split('.').collect();
+        let [h, p, s] = parts.as_slice() else {
+            return false;
+        };
+        let Ok(header) = URL_SAFE_NO_PAD.decode(h) else {
+            return false;
+        };
+        if header != br#"{"alg":"EdDSA","typ":"JWT"}"# {
+            return false;
+        }
+        let Ok(sig_bytes) = URL_SAFE_NO_PAD.decode(s) else {
+            return false;
+        };
+        let Ok(sig_bytes) = <[u8; 64]>::try_from(sig_bytes) else {
+            return false;
+        };
+        let vk = SigningKey::from_bytes(&SA_SEED).verifying_key();
+        let signing_input = format!("{h}.{p}");
+        if vk
+            .verify_strict(signing_input.as_bytes(), &Signature::from_bytes(&sig_bytes))
+            .is_err()
+        {
+            return false;
+        }
+        let Ok(claims) = URL_SAFE_NO_PAD
+            .decode(p)
+            .map_err(|_| ())
+            .and_then(|b| serde_json::from_slice::<Value>(&b).map_err(|_| ()))
+        else {
+            return false;
+        };
+        let str_claim = |k: &str| claims.get(k).and_then(Value::as_str);
+        let int_claim = |k: &str| claims.get(k).and_then(Value::as_i64);
+        let (Some(iat), Some(exp)) = (int_claim("iat"), int_claim("exp")) else {
+            return false;
+        };
+        str_claim("iss") == Some(SA_CLIENT_ID)
+            && str_claim("sub") == Some(SA_CLIENT_ID)
+            && str_claim("aud") == Some(ISS)
+            && exp == iat + 240
+            && (iat - now_secs()).abs() <= 300
+    }
+
+    async fn oauth_token(
+        axum::extract::Form(params): axum::extract::Form<
+            std::collections::HashMap<String, String>,
+        >,
+    ) -> impl IntoResponse {
+        let ok = params.get("grant_type").map(String::as_str) == Some("client_credentials")
+            && params.get("client_assertion_type").map(String::as_str)
+                == Some("urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+            && params.get("resource").map(String::as_str) == Some("duckvis-api")
+            && params
+                .get("client_assertion")
+                .is_some_and(|a| verify_sa_assertion(a));
+        if !ok {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "invalid_client" })),
+            )
+                .into_response();
+        }
         Json(json!({
             "access_token": "sa-access-token",
             "token_type": "Bearer",
             "expires_in": 600,
         }))
+        .into_response()
     }
 
     async fn authz_check(State(state): State<Arc<MockState>>) -> impl IntoResponse {
@@ -252,8 +323,10 @@ async fn spawn_server(api_url: &str, mock: Arc<MockState>) -> Harness {
         duckvis_enabled: true,
         duckvis_api_url: Some(api_url.to_string()),
         duckvis_issuer: Some(ISS.to_string()),
-        duckvis_client_id: Some("swanlake-rs".to_string()),
-        duckvis_client_secret: Some("secret".to_string()),
+        duckvis_client_id: Some(SA_CLIENT_ID.to_string()),
+        duckvis_private_key: Some(swanlake_core::config::DuckvisPrivateKey::new(
+            BASE64_STD.encode(SA_SEED),
+        )),
         session_id_mode: SessionIdMode::PeerAddr,
         ..ServerConfig::default()
     };

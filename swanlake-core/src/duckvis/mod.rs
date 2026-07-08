@@ -80,7 +80,9 @@ pub struct DuckvisAuth {
     pub(crate) api_url: String,
     pub(crate) issuer: String,
     pub(crate) client_id: String,
-    pub(crate) client_secret: String,
+    /// Ed25519 key used to sign the RFC 7523 client assertion (C5). Parsed
+    /// once at construction from the configured base64 seed.
+    pub(crate) signing_key: ed25519_dalek::SigningKey,
     pub(crate) client: reqwest::Client,
     pub(crate) sa_token: tokio::sync::Mutex<Option<sa::SaToken>>,
     pub(crate) jwks: tokio::sync::RwLock<jwks::JwksCache>,
@@ -108,10 +110,13 @@ impl DuckvisAuth {
             .duckvis_client_id
             .clone()
             .ok_or_else(|| "duckvis_client_id is required in duckvis mode".to_string())?;
-        let client_secret = config
-            .duckvis_client_secret
-            .clone()
-            .ok_or_else(|| "duckvis_client_secret is required in duckvis mode".to_string())?;
+        let seed = config
+            .duckvis_private_key
+            .as_ref()
+            .ok_or_else(|| "duckvis_private_key is required in duckvis mode".to_string())?
+            .decode_seed()
+            .map_err(|e| e.to_string())?;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
         let max_age = config.duckvis_jwks_max_age_secs.unwrap_or(300);
 
         let client = reqwest::Client::builder()
@@ -122,7 +127,7 @@ impl DuckvisAuth {
             api_url,
             issuer,
             client_id,
-            client_secret,
+            signing_key,
             client,
             sa_token: tokio::sync::Mutex::new(None),
             jwks: tokio::sync::RwLock::new(jwks::JwksCache::new(max_age)),
@@ -230,15 +235,42 @@ mod tests {
 
     #[test]
     fn from_config_builds_when_enabled() {
+        use base64::engine::general_purpose::STANDARD as BASE64_STD;
+        use base64::Engine as _;
+
         let config = ServerConfig {
             duckvis_enabled: true,
             duckvis_api_url: Some("https://api.example".to_string()),
             duckvis_issuer: Some("https://api.example".to_string()),
-            duckvis_client_id: Some("cid".to_string()),
-            duckvis_client_secret: Some("secret".to_string()),
+            duckvis_client_id: Some("swanlake-test".to_string()),
+            duckvis_private_key: Some(crate::config::DuckvisPrivateKey::new(
+                BASE64_STD.encode([0x11u8; 32]),
+            )),
             ..ServerConfig::default()
         };
         let result = DuckvisAuth::from_config(&config).unwrap();
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn from_config_rejects_bad_length_private_key() {
+        use base64::engine::general_purpose::STANDARD as BASE64_STD;
+        use base64::Engine as _;
+
+        let config = ServerConfig {
+            duckvis_enabled: true,
+            duckvis_api_url: Some("https://api.example".to_string()),
+            duckvis_issuer: Some("https://api.example".to_string()),
+            duckvis_client_id: Some("swanlake-test".to_string()),
+            duckvis_private_key: Some(crate::config::DuckvisPrivateKey::new(
+                BASE64_STD.encode([0x11u8; 16]),
+            )),
+            ..ServerConfig::default()
+        };
+        let err = match DuckvisAuth::from_config(&config) {
+            Err(e) => e,
+            Ok(_) => panic!("16-byte seed must be rejected"),
+        };
+        assert!(err.contains("32 bytes"));
     }
 }
