@@ -10,6 +10,7 @@
 
 pub mod cgroup;
 pub mod config;
+pub mod duckvis;
 pub mod engine;
 pub mod error;
 pub mod maintenance;

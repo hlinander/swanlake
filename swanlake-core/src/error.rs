@@ -18,4 +18,8 @@ pub enum ServerError {
     UnsupportedParameter(String),
     #[error("internal error: {0}")]
     Internal(String),
+    /// Raw ATTACH is not permitted in duckvis mode (contract C6). Maps to
+    /// `permission_denied`.
+    #[error("ATTACH is managed by duckvis; use the duckvis_attach action")]
+    AttachNotPermitted,
 }

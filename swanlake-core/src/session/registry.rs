@@ -147,6 +147,18 @@ impl SessionRegistry {
         removed
     }
 
+    /// Look up an existing session by ID without creating one (read lock only).
+    ///
+    /// Used by the duckvis auth gate to inspect a session's auth binding before
+    /// deciding whether to create a new (workspace-scoped) session.
+    pub fn get_by_id(&self, session_id: &SessionId) -> Option<Arc<Session>> {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.sessions.get(session_id).map(|entry| entry.session.clone())
+    }
+
     /// Get or create session by session ID.
     ///
     /// Each session ID gets its own dedicated DuckDB connection, providing
@@ -155,6 +167,18 @@ impl SessionRegistry {
     pub async fn get_or_create_by_id(
         &self,
         session_id: &SessionId,
+    ) -> Result<Arc<Session>, ServerError> {
+        self.get_or_create_by_id_with_auth(session_id, None).await
+    }
+
+    /// Get or create a session by ID, binding the supplied duckvis auth on
+    /// creation. An already-existing session keeps its original auth binding
+    /// (the caller re-verifies the returned session's auth to close the create
+    /// race).
+    pub async fn get_or_create_by_id_with_auth(
+        &self,
+        session_id: &SessionId,
+        auth: Option<crate::session::SessionAuth>,
     ) -> Result<Arc<Session>, ServerError> {
         // Fast path: try to get existing session (read lock)
         {
@@ -211,7 +235,11 @@ impl SessionRegistry {
 
         // Create session with the specified ID and a shared Arc connection
         let connection = Arc::new(connection);
-        let session = Arc::new(Session::new_with_id(session_id.clone(), connection));
+        let session = Arc::new(Session::new_with_id_and_auth(
+            session_id.clone(),
+            connection,
+            auth,
+        ));
 
         // Register session
         {

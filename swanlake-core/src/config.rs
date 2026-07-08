@@ -54,6 +54,20 @@ pub struct ServerConfig {
     /// Override DuckDB memory_limit (e.g. "16GB", "4096MB").
     /// When set, bypasses cgroup and meminfo auto-detection.
     pub memory_limit: Option<String>,
+    /// Enable duckvis mode: authenticate every Flight request against
+    /// duckvis-api-issued tokens and resolve attachments by bind id.
+    pub duckvis_enabled: bool,
+    /// Base URL of the duckvis-api control plane (e.g. "https://api.duckvis.example").
+    pub duckvis_api_url: Option<String>,
+    /// Expected `iss` claim (exact match) on inbound user tokens.
+    pub duckvis_issuer: Option<String>,
+    /// Service-account client id used for the client-credentials token flow.
+    pub duckvis_client_id: Option<String>,
+    /// Service-account client secret used for the client-credentials token flow.
+    pub duckvis_client_secret: Option<String>,
+    /// Fallback max-age (seconds) for the JWKS cache when the response omits
+    /// `Cache-Control: max-age`. Defaults to 300 when unset.
+    pub duckvis_jwks_max_age_secs: Option<u64>,
 }
 
 impl Default for ServerConfig {
@@ -80,6 +94,12 @@ impl Default for ServerConfig {
             metrics_slow_query_threshold_ms: Some(5000),
             metrics_history_size: Some(200),
             memory_limit: None,
+            duckvis_enabled: false,
+            duckvis_api_url: None,
+            duckvis_issuer: None,
+            duckvis_client_id: None,
+            duckvis_client_secret: None,
+            duckvis_jwks_max_age_secs: None,
         }
     }
 }
@@ -120,6 +140,97 @@ impl ServerConfig {
                 bail!("SWANLAKE_CHECKPOINT_POLL_SECONDS must be greater than 0");
             }
         }
+        if self.duckvis_enabled {
+            let missing: Vec<&str> = [
+                ("SWANLAKE_DUCKVIS_API_URL", self.duckvis_api_url.is_none()),
+                ("SWANLAKE_DUCKVIS_ISSUER", self.duckvis_issuer.is_none()),
+                (
+                    "SWANLAKE_DUCKVIS_CLIENT_ID",
+                    self.duckvis_client_id.is_none(),
+                ),
+                (
+                    "SWANLAKE_DUCKVIS_CLIENT_SECRET",
+                    self.duckvis_client_secret.is_none(),
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(name, is_missing)| if is_missing { Some(name) } else { None })
+            .collect();
+            if !missing.is_empty() {
+                bail!(
+                    "duckvis mode requires the following settings: {}",
+                    missing.join(", ")
+                );
+            }
+            let file_backed = self
+                .database_path
+                .as_deref()
+                .is_some_and(|p| !p.trim().is_empty() && p.trim() != ":memory:");
+            if file_backed {
+                bail!(
+                    "SWANLAKE_DATABASE_PATH must not be a file path in duckvis mode: a file-based \
+                     DuckDB \
+                     database shares its attached catalog across all sessions via the instance \
+                     cache, which would leak workspace attachments between sessions. Duckvis mode \
+                     requires in-memory per-session databases (leave SWANLAKE_DATABASE_PATH unset \
+                     or use \":memory:\")."
+                );
+            }
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod duckvis_config_tests {
+    use super::*;
+
+    fn enabled_config() -> ServerConfig {
+        ServerConfig {
+            duckvis_enabled: true,
+            duckvis_api_url: Some("https://api.example".to_string()),
+            duckvis_issuer: Some("https://api.example".to_string()),
+            duckvis_client_id: Some("cid".to_string()),
+            duckvis_client_secret: Some("secret".to_string()),
+            ..ServerConfig::default()
+        }
+    }
+
+    #[test]
+    fn valid_duckvis_config_passes() {
+        assert!(enabled_config().validate().is_ok());
+    }
+
+    #[test]
+    fn duckvis_requires_all_fields() {
+        let mut config = enabled_config();
+        config.duckvis_client_secret = None;
+        let err = config.validate().expect_err("should require client secret");
+        assert!(err.to_string().contains("SWANLAKE_DUCKVIS_CLIENT_SECRET"));
+    }
+
+    #[test]
+    fn duckvis_rejects_file_database_path() {
+        let mut config = enabled_config();
+        config.database_path = Some("/data/warehouse.duckdb".to_string());
+        let err = config.validate().expect_err("should reject file path");
+        assert!(err.to_string().contains("SWANLAKE_DATABASE_PATH"));
+    }
+
+    #[test]
+    fn duckvis_allows_memory_database_path() {
+        let mut config = enabled_config();
+        config.database_path = Some(":memory:".to_string());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn disabled_duckvis_ignores_missing_fields() {
+        let config = ServerConfig {
+            duckvis_enabled: false,
+            database_path: Some("/data/x.duckdb".to_string()),
+            ..ServerConfig::default()
+        };
+        assert!(config.validate().is_ok());
     }
 }

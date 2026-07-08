@@ -56,12 +56,19 @@ async fn main() -> Result<()> {
         config.metrics_history_size.unwrap_or(200),
     ));
 
+    let duckvis = swanlake_core::duckvis::DuckvisAuth::from_config(&config)
+        .map_err(|e| anyhow::anyhow!("failed to initialize duckvis mode: {e}"))?;
+    if duckvis.is_some() {
+        info!("duckvis mode enabled: authenticating all Flight requests");
+    }
+
     let flight_location = format!("grpc://{}:{}", config.advertise_host, config.port);
-    let flight_service = SwanFlightService::new(
+    let flight_service = SwanFlightService::with_duckvis(
         registry.clone(),
         metrics.clone(),
         config.session_id_mode.clone(),
         flight_location,
+        duckvis,
     );
 
     status::spawn_status_server(&config, metrics, registry.clone())?;
