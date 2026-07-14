@@ -130,9 +130,20 @@ impl SchemaCache {
     }
 }
 
+/// Authentication binding for a duckvis-mode session: the token subject and the
+/// workspace the session is scoped to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAuth {
+    pub subject: String,
+    pub workspace_id: String,
+}
+
 /// A client session with dedicated connection and state
 pub struct Session {
     id: SessionId,
+    /// Optional duckvis-mode auth binding. When `Some`, the raw-ATTACH guard
+    /// (contract C6) is active and the session is workspace-scoped.
+    auth: Option<SessionAuth>,
     /// Opaque token assigned at creation. Clients cache this and send it back
     /// via `x-expected-session-nonce` so the server can detect that a session
     /// was silently recreated (after restart or idle eviction).
@@ -153,10 +164,22 @@ impl Session {
     /// Create a new session with a specific ID and shared connection
     #[instrument(skip(connection))]
     pub fn new_with_id(id: SessionId, connection: std::sync::Arc<DuckDbConnection>) -> Self {
+        Self::new_with_id_and_auth(id, connection, None)
+    }
+
+    /// Create a new session with a specific ID, shared connection, and optional
+    /// duckvis auth binding.
+    #[instrument(skip(connection, auth))]
+    pub fn new_with_id_and_auth(
+        id: SessionId,
+        connection: std::sync::Arc<DuckDbConnection>,
+        auth: Option<SessionAuth>,
+    ) -> Self {
         debug!(session_id = %id, "created new session with shared connection");
 
         Self {
             id,
+            auth,
             nonce: uuid::Uuid::new_v4().to_string(),
             connection,
             transactions: Mutex::new(HashSet::new()),
@@ -173,6 +196,30 @@ impl Session {
     /// Opaque nonce assigned at session creation.
     pub fn nonce(&self) -> &str {
         &self.nonce
+    }
+
+    /// The duckvis auth binding for this session, if any.
+    pub fn auth(&self) -> Option<&SessionAuth> {
+        self.auth.as_ref()
+    }
+
+    /// Validate user-supplied SQL against the raw-ATTACH guard (contract C6).
+    ///
+    /// Active only when the session carries duckvis auth. Splits the SQL into
+    /// top-level statements (quote/comment-aware) and rejects any statement whose
+    /// leading keyword is `ATTACH` (case-insensitive), directing the caller to the
+    /// `duckvis_attach` action. `ATTACH` inside string literals or comments does
+    /// not match; `DETACH` is allowed.
+    pub fn validate_user_sql(&self, sql: &str) -> Result<(), ServerError> {
+        if self.auth.is_none() {
+            return Ok(());
+        }
+        for statement in crate::duckvis::attach::split_top_level_statements(sql) {
+            if crate::duckvis::attach::leading_keyword(&statement).as_deref() == Some("ATTACH") {
+                return Err(ServerError::AttachNotPermitted);
+            }
+        }
+        Ok(())
     }
 
     /// Get time since last activity
@@ -291,6 +338,7 @@ impl Session {
     /// Execute a SELECT query
     #[instrument(skip(self), fields(session_id = %self.id, sql = %sql))]
     pub fn execute_query(&self, sql: &str) -> Result<QueryResult, ServerError> {
+        self.validate_user_sql(sql)?;
         self.touch();
         self.with_transaction_recovery(|| self.connection.execute_query(sql), true)
     }
@@ -302,6 +350,7 @@ impl Session {
         sql: &str,
         params: &[Value],
     ) -> Result<QueryResult, ServerError> {
+        self.validate_user_sql(sql)?;
         self.touch();
         self.with_transaction_recovery(
             || self.connection.execute_query_with_params(sql, params),
@@ -318,6 +367,21 @@ impl Session {
     /// Execute a statement (DDL/DML)
     #[instrument(skip(self), fields(session_id = %self.id, sql = %sql))]
     pub fn execute_statement(&self, sql: &str) -> Result<i64, ServerError> {
+        self.validate_user_sql(sql)?;
+        self.execute_statement_inner(sql)
+    }
+
+    /// Execute a statement bypassing the raw-ATTACH guard (contract C6).
+    ///
+    /// This is used ONLY by the `duckvis_attach` action handler to run the
+    /// server-resolved, normalized ATTACH statement on the session connection.
+    /// Never call this with user-supplied SQL.
+    #[instrument(skip(self, sql), fields(session_id = %self.id))]
+    pub fn execute_statement_privileged(&self, sql: &str) -> Result<i64, ServerError> {
+        self.execute_statement_inner(sql)
+    }
+
+    fn execute_statement_inner(&self, sql: &str) -> Result<i64, ServerError> {
         self.touch();
         let result =
             self.with_transaction_recovery(|| self.connection.execute_statement(sql), true);
@@ -327,6 +391,12 @@ impl Session {
         result
     }
 
+    /// Invalidate the session's cached query schemas. Used after a privileged
+    /// ATTACH so subsequent catalog lookups see the new database.
+    pub fn invalidate_schema_cache(&self) {
+        self.clear_schema_cache();
+    }
+
     /// Execute a statement with parameters
     #[instrument(skip(self, params), fields(session_id = %self.id, sql = %sql))]
     pub fn execute_statement_with_params(
@@ -334,6 +404,7 @@ impl Session {
         sql: &str,
         params: &[Value],
     ) -> Result<usize, ServerError> {
+        self.validate_user_sql(sql)?;
         self.touch();
         let result = self.with_transaction_recovery(
             || self.connection.execute_statement_with_params(sql, params),
@@ -348,6 +419,7 @@ impl Session {
     /// Get schema for a query
     #[instrument(skip(self), fields(session_id = %self.id, sql = %sql))]
     pub fn schema_for_query(&self, sql: &str) -> Result<arrow_schema::Schema, ServerError> {
+        self.validate_user_sql(sql)?;
         self.touch();
         let cache_key = Self::schema_cache_key(sql);
         if !cache_key.is_empty() {
@@ -462,6 +534,7 @@ impl Session {
         is_query: bool,
         options: PreparedStatementOptions,
     ) -> Result<StatementHandle, ServerError> {
+        self.validate_user_sql(&sql)?;
         self.touch();
 
         let handle = self.statement_handle_gen.next();
@@ -652,6 +725,107 @@ impl Session {
             operation = op_name,
             "completed transaction"
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use crate::config::ServerConfig;
+    use crate::engine::EngineFactory;
+    use anyhow::{anyhow, Result};
+    use std::sync::Arc;
+
+    fn session_with_auth(auth: Option<SessionAuth>) -> Result<Session> {
+        let config = ServerConfig::default();
+        let factory = EngineFactory::new_for_tests(&config);
+        let conn = factory
+            .create_connection()
+            .map_err(|e| anyhow!("failed to create test connection: {e}"))?;
+        Ok(Session::new_with_id_and_auth(
+            SessionId::from_string("test-session".to_string()),
+            Arc::new(conn),
+            auth,
+        ))
+    }
+
+    fn authed_session() -> Result<Session> {
+        session_with_auth(Some(SessionAuth {
+            subject: "sub-1".to_string(),
+            workspace_id: "ws-1".to_string(),
+        }))
+    }
+
+    #[test]
+    fn guard_rejects_leading_attach() -> Result<()> {
+        let s = authed_session()?;
+        assert!(matches!(
+            s.validate_user_sql("ATTACH 'a.db' AS a"),
+            Err(ServerError::AttachNotPermitted)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn guard_rejects_mixed_case_attach() -> Result<()> {
+        let s = authed_session()?;
+        assert!(matches!(
+            s.validate_user_sql("  aTtAcH 'a.db' AS a"),
+            Err(ServerError::AttachNotPermitted)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn guard_rejects_attach_after_leading_comment() -> Result<()> {
+        let s = authed_session()?;
+        assert!(matches!(
+            s.validate_user_sql("-- comment\n/* block */ ATTACH 'a.db' AS a"),
+            Err(ServerError::AttachNotPermitted)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn guard_rejects_attach_as_second_statement() -> Result<()> {
+        let s = authed_session()?;
+        assert!(matches!(
+            s.validate_user_sql("SELECT 1; ATTACH 'a.db' AS a"),
+            Err(ServerError::AttachNotPermitted)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn guard_allows_attach_inside_string_literal() -> Result<()> {
+        let s = authed_session()?;
+        assert!(s
+            .validate_user_sql("SELECT 'ATTACH is a keyword' AS note")
+            .is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn guard_allows_attach_inside_comment() -> Result<()> {
+        let s = authed_session()?;
+        assert!(s.validate_user_sql("SELECT 1 -- ATTACH here").is_ok());
+        assert!(s.validate_user_sql("/* ATTACH */ SELECT 1").is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn guard_allows_detach() -> Result<()> {
+        let s = authed_session()?;
+        assert!(s.validate_user_sql("DETACH mydb").is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn guard_inactive_without_auth() -> Result<()> {
+        let s = session_with_auth(None)?;
+        // No auth binding → guard is a no-op even for ATTACH.
+        assert!(s.validate_user_sql("ATTACH 'a.db' AS a").is_ok());
         Ok(())
     }
 }

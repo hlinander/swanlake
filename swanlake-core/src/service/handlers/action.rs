@@ -1278,11 +1278,11 @@ pub(crate) async fn do_action_execute_sql(
 
     // Return affected rows as msgpack
     #[derive(Serialize)]
-    struct ExecuteResult {
+    struct SqlActionExecuteResult {
         affected_rows: i64,
     }
 
-    let result_body = rmp_serde::to_vec_named(&ExecuteResult { affected_rows })
+    let result_body = rmp_serde::to_vec_named(&SqlActionExecuteResult { affected_rows })
         .map_err(|e| Status::internal(format!("Failed to serialize execute result: {}", e)))?;
 
     let result = arrow_flight::Result {
@@ -1291,4 +1291,100 @@ pub(crate) async fn do_action_execute_sql(
 
     let output_stream = Box::pin(stream::iter(vec![Ok(result)]));
     Ok(Response::new(output_stream))
+}
+
+/// Body of the `duckvis_attach` action (contract C1).
+#[derive(Debug, Deserialize)]
+struct DuckvisAttachBody {
+    bind_id: String,
+}
+
+/// Success payload for the `duckvis_attach` action (contract C1).
+#[derive(Debug, Serialize)]
+struct DuckvisAttachResult {
+    name: String,
+    attachment_id: String,
+}
+
+/// Handle the `duckvis_attach` action (contract C1).
+///
+/// Resolves a workspace attachment by bind id via duckvis-api, normalizes the
+/// returned ATTACH statement to `ATTACH OR REPLACE … AS "<name>" …`, and executes
+/// it on the session connection through the privileged (guard-bypassing) path.
+///
+/// Secret hygiene: only the bind id and attachment name are ever logged; the
+/// resolved/normalized SQL statement never appears in logs, traces, or errors.
+pub(crate) async fn do_action_duckvis_attach(
+    service: &SwanFlightSqlService,
+    request: Request<Action>,
+) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
+    // Duckvis mode must be enabled.
+    let duckvis = service
+        .duckvis()
+        .ok_or_else(|| Status::unimplemented("duckvis_attach is not available"))?
+        .clone();
+
+    // Runs the auth gate (validates token, binds/checks session workspace).
+    let session = service.prepare_request(&request).await?;
+
+    // The session must carry auth (guaranteed by the auth gate in duckvis mode).
+    let auth = session
+        .auth()
+        .ok_or_else(|| Status::internal("session missing duckvis auth binding"))?
+        .clone();
+
+    // Parse the body: JSON { "bind_id": "<uuid>" }.
+    let body = &request.get_ref().body;
+    let parsed: DuckvisAttachBody = serde_json::from_slice(body).map_err(|_| {
+        Status::invalid_argument("duckvis_attach body must be JSON {\"bind_id\":\"<uuid>\"}")
+    })?;
+    let bind_id = parsed.bind_id.trim().to_string();
+    if uuid::Uuid::parse_str(&bind_id).is_err() {
+        return Err(Status::invalid_argument("bind_id must be a valid uuid"));
+    }
+
+    info!(bind_id = %bind_id, "handling duckvis_attach action");
+
+    // Resolve the attachment via duckvis-api (fail-closed).
+    let resolved = duckvis
+        .resolve_attachment(&auth.subject, &auth.workspace_id, &bind_id)
+        .await
+        .map_err(|e| e.into_status())?
+        .ok_or_else(|| crate::duckvis::DuckvisError::PermissionDenied.into_status())?;
+
+    // Normalize the ATTACH statement. NOTE: `normalized` contains the secret
+    // config and must never be logged.
+    let normalized =
+        crate::duckvis::attach::normalize_attach(&resolved.secret_config, &resolved.name)
+            .map_err(|e| e.into_status())?;
+
+    let attachment_name = resolved.name.clone();
+    let attachment_id = resolved.attachment_id.clone();
+
+    // Execute on the session connection via the privileged (guard-bypassing) path.
+    let session_clone = session.clone();
+    let normalized_for_exec = normalized;
+    tokio::task::spawn_blocking(move || {
+        session_clone.execute_statement_privileged(&normalized_for_exec)
+    })
+    .await
+    .map_err(SwanFlightSqlService::status_from_join)?
+    .map_err(SwanFlightSqlService::status_from_error)?;
+
+    // Invalidate the session schema cache (catalog changed).
+    session.invalidate_schema_cache();
+
+    info!(bind_id = %bind_id, name = %attachment_name, "duckvis_attach completed");
+
+    // Return the single JSON result payload (contract C1).
+    let result_body = serde_json::to_vec(&DuckvisAttachResult {
+        name: attachment_name,
+        attachment_id,
+    })
+    .map_err(|e| Status::internal(format!("failed to serialize duckvis_attach result: {e}")))?;
+
+    let result = arrow_flight::Result {
+        body: result_body.into(),
+    };
+    Ok(Response::new(Box::pin(stream::iter(vec![Ok(result)]))))
 }

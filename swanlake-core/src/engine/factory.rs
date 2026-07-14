@@ -33,6 +33,14 @@ impl EngineFactory {
         Self::new_with_extension_bootstrap(config, false)
     }
 
+    /// Test-support constructor: builds a factory that skips network extension
+    /// bootstrap (INSTALL/LOAD). Intended for integration tests that only need
+    /// in-memory DuckDB connections and cannot reach the extension repositories.
+    #[doc(hidden)]
+    pub fn new_without_extension_bootstrap(config: &ServerConfig) -> Self {
+        Self::new_with_extension_bootstrap(config, false)
+    }
+
     fn new_with_extension_bootstrap(config: &ServerConfig, bootstrap_extensions: bool) -> Self {
         let mut init_statements = Vec::new();
 

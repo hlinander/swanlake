@@ -38,6 +38,8 @@ pub struct SwanFlightSqlService {
     session_id_mode: SessionIdMode,
     /// gRPC location URL for this server, used in FlightEndpoint locations.
     flight_location: String,
+    /// Duckvis-mode auth. `Some` enables the per-request auth gate.
+    duckvis: Option<Arc<crate::duckvis::DuckvisAuth>>,
 }
 
 impl SwanFlightSqlService {
@@ -47,12 +49,28 @@ impl SwanFlightSqlService {
         session_id_mode: SessionIdMode,
         flight_location: String,
     ) -> Self {
+        Self::with_duckvis(registry, metrics, session_id_mode, flight_location, None)
+    }
+
+    pub fn with_duckvis(
+        registry: Arc<SessionRegistry>,
+        metrics: Arc<Metrics>,
+        session_id_mode: SessionIdMode,
+        flight_location: String,
+        duckvis: Option<Arc<crate::duckvis::DuckvisAuth>>,
+    ) -> Self {
         Self {
             registry,
             metrics,
             session_id_mode,
             flight_location,
+            duckvis,
         }
+    }
+
+    /// The duckvis auth handle, if duckvis mode is enabled.
+    pub(crate) fn duckvis(&self) -> Option<&Arc<crate::duckvis::DuckvisAuth>> {
+        self.duckvis.as_ref()
     }
 
     /// Returns the gRPC location URL for FlightEndpoint construction.
@@ -115,10 +133,16 @@ impl SwanFlightSqlService {
     ) -> Result<Arc<Session>, Status> {
         let session_id = self.extract_session_id(request);
         Span::current().record("session_id", session_id.as_ref());
-        let session = self.registry
-            .get_or_create_by_id(&session_id)
-            .await
-            .map_err(Self::status_from_error)?;
+
+        let session = match self.duckvis.as_ref() {
+            Some(duckvis) => self.prepare_request_duckvis(duckvis, request, &session_id).await?,
+            None => self
+                .registry
+                .get_or_create_by_id(&session_id)
+                .await
+                .map_err(Self::status_from_error)?,
+        };
+
         if let Some(expected) = request.metadata().get("x-expected-session-nonce") {
             if let Ok(expected_str) = expected.to_str() {
                 if expected_str != session.nonce() {
@@ -130,6 +154,96 @@ impl SwanFlightSqlService {
             }
         }
         Ok(session)
+    }
+
+    /// Duckvis-mode auth gate (contract C2/C4). Validates the bearer token, binds
+    /// or matches the session to the token subject and workspace, and creates a
+    /// workspace-scoped session on first contact after an `authz/check`.
+    async fn prepare_request_duckvis<T>(
+        &self,
+        duckvis: &Arc<crate::duckvis::DuckvisAuth>,
+        request: &Request<T>,
+        session_id: &SessionId,
+    ) -> Result<Arc<Session>, Status> {
+        use crate::session::SessionAuth;
+
+        // (1) Validate the bearer token.
+        let bearer = request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| crate::duckvis::DuckvisError::Unauthenticated.into_status())?;
+
+        let claims = duckvis
+            .validate_token(bearer)
+            .await
+            .map_err(|e| e.into_status())?;
+
+        // Record the subject on the span (never the token).
+        Span::current().record("duckvis_subject", claims.sub.as_str());
+
+        // Optional workspace header.
+        let workspace_header = request
+            .metadata()
+            .get("x-duckvis-workspace-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+
+        // (3) Existing session: enforce subject + workspace match.
+        if let Some(existing) = self.registry.get_by_id(session_id) {
+            let auth = existing.auth().ok_or_else(|| {
+                // A session without auth in duckvis mode is an internal invariant
+                // violation.
+                Status::internal("session missing duckvis auth binding")
+            })?;
+            if auth.subject != claims.sub {
+                return Err(crate::duckvis::DuckvisError::PermissionDenied.into_status());
+            }
+            if let Some(ws) = &workspace_header {
+                if ws != &auth.workspace_id {
+                    return Err(crate::duckvis::DuckvisError::PermissionDenied.into_status());
+                }
+            }
+            Span::current().record("duckvis_workspace_id", auth.workspace_id.as_str());
+            return Ok(existing);
+        }
+
+        // (4) No session yet: require the workspace header and an allow decision.
+        let workspace_id = workspace_header
+            .ok_or_else(|| crate::duckvis::DuckvisError::InvalidArgument.into_status())?;
+
+        let allowed = duckvis
+            .check_workspace_view(&claims.sub, &workspace_id)
+            .await
+            .map_err(|e| e.into_status())?;
+        if !allowed {
+            return Err(crate::duckvis::DuckvisError::PermissionDenied.into_status());
+        }
+
+        let new_auth = SessionAuth {
+            subject: claims.sub.clone(),
+            workspace_id: workspace_id.clone(),
+        };
+        let session = self
+            .registry
+            .get_or_create_by_id_with_auth(session_id, Some(new_auth.clone()))
+            .await
+            .map_err(Self::status_from_error)?;
+
+        // Re-verify: two clients racing on one session id — the loser (whose auth
+        // does not match the winning binding) is rejected.
+        match session.auth() {
+            Some(bound) if bound == &new_auth => {
+                Span::current().record("duckvis_workspace_id", workspace_id.as_str());
+                Ok(session)
+            }
+            _ => Err(crate::duckvis::DuckvisError::PermissionDenied.into_status()),
+        }
     }
 
     pub(crate) fn status_from_error(err: ServerError) -> Status {
@@ -167,6 +281,11 @@ impl SwanFlightSqlService {
             ServerError::Internal(msg) => {
                 error!(msg = %msg, "internal error");
                 Status::internal(format!("internal error: {msg}"))
+            }
+            ServerError::AttachNotPermitted => {
+                Status::permission_denied(
+                    "ATTACH is managed by duckvis; use the duckvis_attach action",
+                )
             }
         }
     }
@@ -258,8 +377,24 @@ impl SwanFlightService {
         session_id_mode: SessionIdMode,
         flight_location: String,
     ) -> Self {
+        Self::with_duckvis(registry, metrics, session_id_mode, flight_location, None)
+    }
+
+    pub fn with_duckvis(
+        registry: Arc<SessionRegistry>,
+        metrics: Arc<Metrics>,
+        session_id_mode: SessionIdMode,
+        flight_location: String,
+        duckvis: Option<Arc<crate::duckvis::DuckvisAuth>>,
+    ) -> Self {
         Self {
-            inner: SwanFlightSqlService::new(registry, metrics, session_id_mode, flight_location),
+            inner: SwanFlightSqlService::with_duckvis(
+                registry,
+                metrics,
+                session_id_mode,
+                flight_location,
+                duckvis,
+            ),
         }
     }
 
@@ -307,6 +442,13 @@ impl SwanFlightService {
         info!(sql = %sql, "handling raw Flight SQL passthrough (airport_take_flight)");
 
         let session = self.inner.prepare_request(&request).await?;
+
+        // C6 guard: this passthrough runs SQL through connection-level paths
+        // (schema_for_streaming) that bypass the guarded Session methods, so
+        // enforce the raw-ATTACH guard explicitly here.
+        session
+            .validate_user_sql(&sql)
+            .map_err(SwanFlightSqlService::status_from_error)?;
 
         // Check if this is a DDL statement - execute directly without expecting results
         if Self::is_ddl_statement(&sql) {

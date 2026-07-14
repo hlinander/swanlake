@@ -101,6 +101,32 @@ Notes:
 - On first startup (no existing checkpoint record), SwanLake initializes the schedule and waits until the next interval instead of running an immediate checkpoint.
 - Increasing `SWANLAKE_CHECKPOINT_POLL_SECONDS` lowers background polling overhead at the cost of less precise checkpoint timing.
 
+## Duckvis Mode
+
+When enabled, SwanLake authenticates every Flight request against duckvis-api-issued user tokens
+(EdDSA JWTs, `aud=swanlake`), scopes each session to a workspace, and manages database attachments
+through the `duckvis_attach` Flight action instead of raw `ATTACH` SQL. Raw `ATTACH` statements are
+rejected on every SQL path in this mode; `DETACH` remains available.
+
+| Env Var | Description | Default |
+| --- | --- | --- |
+| `SWANLAKE_DUCKVIS_ENABLED` | Enable duckvis mode (authenticated, workspace-scoped sessions) | `false` |
+| `SWANLAKE_DUCKVIS_API_URL` | Base URL of the duckvis-api control plane (e.g. `https://api.duckvis.example`) | _(unset)_ |
+| `SWANLAKE_DUCKVIS_ISSUER` | Expected `iss` claim (exact match) on inbound user tokens | _(unset)_ |
+| `SWANLAKE_DUCKVIS_CLIENT_ID` | Service-account client id for the client-credentials token flow: the resource-server service account (SSA) name (e.g. `swanlake-wrx80`) | _(unset)_ |
+| `SWANLAKE_DUCKVIS_PRIVATE_KEY` | Service-account signing key: base64 (standard alphabet) of the raw 32-byte Ed25519 seed, used to sign the RFC 7523 client assertion presented to the token endpoint | _(unset)_ |
+| `SWANLAKE_DUCKVIS_JWKS_MAX_AGE_SECS` | Fallback JWKS cache max-age (seconds) when the response omits `Cache-Control: max-age` | `300` |
+
+Notes:
+- When `SWANLAKE_DUCKVIS_ENABLED=true`, all four of `SWANLAKE_DUCKVIS_API_URL`,
+  `SWANLAKE_DUCKVIS_ISSUER`, `SWANLAKE_DUCKVIS_CLIENT_ID`, and `SWANLAKE_DUCKVIS_PRIVATE_KEY` are
+  required; startup fails otherwise. `SWANLAKE_DUCKVIS_PRIVATE_KEY` must decode to exactly 32 bytes;
+  it is validated at startup and never echoed in error messages or config logging.
+- Duckvis mode requires in-memory per-session databases. Setting `SWANLAKE_DATABASE_PATH` to a file
+  path is rejected at startup because a file-based DuckDB database shares its attached catalog across
+  all sessions via the DuckDB instance cache, which would leak workspace attachments between sessions.
+  Leave `SWANLAKE_DATABASE_PATH` unset (or `:memory:`).
+
 ## Validation
 
 `ServerConfig::validate()` currently performs only lightweight checks; the remaining options are
