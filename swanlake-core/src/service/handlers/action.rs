@@ -1300,10 +1300,16 @@ struct DuckvisAttachBody {
 }
 
 /// Success payload for the `duckvis_attach` action (contract C1).
+///
+/// `nonce` is the session nonce of the session the attach populated, so the
+/// client can arm its `x-expected-session-nonce` atomically with the attach —
+/// a second `session_info` round-trip could observe a different session
+/// incarnation than the one that received the attachment.
 #[derive(Debug, Serialize)]
 struct DuckvisAttachResult {
     name: String,
     attachment_id: String,
+    nonce: String,
 }
 
 /// Handle the `duckvis_attach` action (contract C1).
@@ -1380,6 +1386,7 @@ pub(crate) async fn do_action_duckvis_attach(
     let result_body = serde_json::to_vec(&DuckvisAttachResult {
         name: attachment_name,
         attachment_id,
+        nonce: session.nonce().to_string(),
     })
     .map_err(|e| Status::internal(format!("failed to serialize duckvis_attach result: {e}")))?;
 

@@ -13,7 +13,13 @@ The only way to attach a database in duckvis mode. Arrow Flight DoAction with:
 
 - action **type**: `duckvis_attach`
 - action **body**: JSON `{"bind_id": "<WorkspaceAttachment uuid>"}`
-- success result: one JSON payload `{"name": "<attached alias>", "attachment_id": "<uuid>"}`
+- success result: one JSON payload
+  `{"name": "<attached alias>", "attachment_id": "<uuid>", "nonce": "<session nonce>"}`.
+  `nonce` names the session incarnation the attach populated; the client arms its
+  `x-expected-session-nonce` from it atomically with the attach, so a session the server
+  reaps and recreates before the client's next request is detected by the C2 nonce check
+  instead of silently serving an attachment-less session. Clients tolerate its absence
+  (pre-nonce servers) by falling back to a `session_info` round-trip.
 
 Server behavior: requires duckvis mode (`unimplemented` otherwise) and an authenticated,
 workspace-bound session. Swanlake calls the C3 endpoint with the session's subject + workspace and
