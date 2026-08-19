@@ -135,11 +135,12 @@ impl DuckDbConnection {
         tx: mpsc::Sender<StreamingBatch>,
         interrupt_handle: Option<std::sync::Arc<duckdb::InterruptHandle>>,
     ) -> Result<(), ServerError> {
-        // Enable CPU time profiling for resource tracking
+        // `no_output` collects CPU metrics without taking DuckDB 1.5.5's JSON
+        // rendering path, which aborts after an attached-catalog stream ends.
         {
             let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
             let _ = conn.execute_batch(
-                "SET enable_profiling = 'json'; \
+                "SET enable_profiling = 'no_output'; \
                  SET custom_profiling_settings = '{\"OPERATOR_CPU_TIME\": \"true\", \"CPU_TIME_ACTUAL\": \"true\"}';"
             );
         }
@@ -216,11 +217,12 @@ impl DuckDbConnection {
         tx: mpsc::Sender<StreamingBatch>,
         interrupt_handle: Option<std::sync::Arc<duckdb::InterruptHandle>>,
     ) -> Result<(), ServerError> {
-        // Enable CPU time profiling for resource tracking
+        // `no_output` collects CPU metrics without taking DuckDB 1.5.5's JSON
+        // rendering path, which aborts after an attached-catalog stream ends.
         {
             let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
             let _ = conn.execute_batch(
-                "SET enable_profiling = 'json'; \
+                "SET enable_profiling = 'no_output'; \
                  SET custom_profiling_settings = '{\"OPERATOR_CPU_TIME\": \"true\", \"CPU_TIME_ACTUAL\": \"true\"}';"
             );
         }
@@ -317,12 +319,12 @@ impl DuckDbConnection {
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // The streaming path enables `enable_profiling='json'` on this shared
-        // session connection (for CPU sampling) and never resets it. With
-        // profiling on, a `CREATE TABLE AS SELECT` run through the arrow C-API
-        // returns a null result ("out is null"). Clear it first so DDL/DML
-        // (including CTAS) from the execute action run cleanly. Ignored result:
-        // RESET is a no-op when profiling is already at its default.
+        // The streaming path enables profiling on this shared session connection
+        // for CPU sampling and never resets it. With profiling on, a
+        // `CREATE TABLE AS SELECT` run through the arrow C-API returns a null
+        // result ("out is null"). Clear it first so DDL/DML (including CTAS)
+        // from the execute action run cleanly. Ignored result: RESET is a no-op
+        // when profiling is already at its default.
         let _ = conn.execute_batch("RESET enable_profiling");
         conn.execute_batch(sql)?;
         debug!("executed statement");
@@ -588,11 +590,47 @@ mod tests {
         );
     }
 
-    /// The streaming path enables `enable_profiling='json'` on the shared session
-    /// connection and never resets it. With profiling on, a `CREATE TABLE AS
-    /// SELECT` executed through the arrow C-API returns a null result, surfaced by
-    /// duckdb-rs as the opaque "out is null". Execute-statement paths must clear
-    /// profiling first so DDL/DML (including CTAS) run cleanly.
+    #[test]
+    fn attached_catalog_schema_probe_can_be_followed_by_streaming_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join("attached.duckdb");
+        {
+            let attached = duckdb::Connection::open(&database_path).unwrap();
+            attached
+                .execute_batch("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1);")
+                .unwrap();
+        }
+
+        let conn = test_connection();
+        conn.execute_statement(&format!(
+            "ATTACH '{}' AS wh",
+            database_path.to_string_lossy().replace('\'', "''")
+        ))
+        .unwrap();
+
+        let schema = conn.schema_for_streaming("SELECT id FROM wh.t").unwrap();
+        assert_eq!(schema.field(0).name(), "id");
+
+        let (tx, mut rx) = mpsc::channel(4);
+        conn.execute_query_streaming("SELECT id FROM wh.t", tx, None)
+            .unwrap();
+
+        let mut total_rows = None;
+        while let Some(message) = rx.blocking_recv() {
+            if let StreamingBatch::Done { total_rows: rows, .. } = message {
+                total_rows = Some(rows);
+            }
+        }
+        assert_eq!(total_rows, Some(1));
+
+        conn.execute_statement("DETACH wh").unwrap();
+    }
+
+    /// The streaming path enables profiling on the shared session connection and
+    /// never resets it. With profiling on, a `CREATE TABLE AS SELECT` executed
+    /// through the arrow C-API returns a null result, surfaced by duckdb-rs as the
+    /// opaque "out is null". Execute-statement paths must clear profiling first
+    /// so DDL/DML (including CTAS) run cleanly.
     #[test]
     fn execute_statement_succeeds_after_profiling_enabled() {
         let conn = test_connection();
