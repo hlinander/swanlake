@@ -13,12 +13,6 @@ use duckdb::InterruptHandle;
 use libduckdb_sys as ffi;
 use tracing::{trace, warn};
 
-extern "C" {
-    /// Thread-safe C API that traverses the profiling tree under lock,
-    /// summing OPERATOR_CPU_TIME across all nodes. Returns seconds.
-    fn duckdb_get_accumulated_cpu_time(connection: ffi::duckdb_connection) -> f64;
-}
-
 /// Snapshot of resource usage at a point in time.
 #[derive(Debug, Clone, Copy)]
 pub struct ResourceSnapshot {
@@ -115,7 +109,7 @@ impl ResourceTracker {
                     // Sample CPU time from query connection's profiler
                     if !query_conn.0.is_null() {
                         let cpu_seconds =
-                            unsafe { duckdb_get_accumulated_cpu_time(query_conn.0) };
+                            unsafe { ffi::duckdb_get_accumulated_cpu_time(query_conn.0) };
                         if cpu_seconds > 0.0 {
                             let us = (cpu_seconds * 1_000_000.0) as u64;
                             cpu.store(us, Ordering::Relaxed);

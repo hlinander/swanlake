@@ -5,8 +5,6 @@
 
 use std::sync::Mutex;
 
-use std::sync::Arc;
-
 use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema, SchemaRef};
 use duckdb::types::Value;
@@ -80,9 +78,8 @@ impl DuckDbConnection {
         let trimmed_sql = sql.trim_end_matches(';').trim();
 
         self.with_prepared(trimmed_sql, |stmt| {
-            // DuckDB 1.5+ removed the legacy execute-then-arrow-schema path; use
-            // the prepared-statement arrow schema, which does not execute.
-            let schema = stmt.schema_from_prepared()?;
+            let stream = Self::stream_arrow_with_params(stmt, None)?;
+            let schema = stream.get_schema();
             debug!(field_count = schema.fields().len(), "retrieved schema");
             Ok(schema.as_ref().clone())
         })
@@ -105,8 +102,8 @@ impl DuckDbConnection {
     #[instrument(skip(self), fields(sql = %sql))]
     pub fn execute_query(&self, sql: &str) -> Result<QueryResult, ServerError> {
         self.with_prepared(sql, |stmt| {
-            let schema = stmt.schema_from_prepared()?;
-            let arrow = Self::stream_arrow_with_schema(stmt, None, schema.clone())?;
+            let arrow = Self::stream_arrow_with_params(stmt, None)?;
+            let schema = arrow.get_schema();
             let result = Self::collect_query_result(schema, arrow);
             debug!(
                 batch_count = result.batches.len(),
@@ -138,15 +135,6 @@ impl DuckDbConnection {
         tx: mpsc::Sender<StreamingBatch>,
         interrupt_handle: Option<std::sync::Arc<duckdb::InterruptHandle>>,
     ) -> Result<(), ServerError> {
-        let schema = self.schema_for_streaming(sql)?;
-        let schema_ref: SchemaRef = Arc::new(schema.clone());
-
-        // Send schema first
-        if tx.blocking_send(StreamingBatch::Schema(schema)).is_err() {
-            debug!("streaming receiver dropped before schema sent");
-            return Ok(());
-        }
-
         // Enable CPU time profiling for resource tracking
         {
             let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -158,7 +146,16 @@ impl DuckDbConnection {
 
         // Now execute the full query in true streaming mode
         self.with_prepared(sql, |stmt| {
-            let arrow = Self::stream_arrow_with_schema(stmt, None, schema_ref)?;
+            let arrow = Self::stream_arrow_with_params(stmt, None)?;
+            let schema = arrow.get_schema();
+
+            if tx
+                .blocking_send(StreamingBatch::Schema(schema.as_ref().clone()))
+                .is_err()
+            {
+                debug!("streaming receiver dropped before schema sent");
+                return Ok(());
+            }
 
             // Stream batches with backpressure
             let mut total_rows = 0usize;
@@ -219,15 +216,6 @@ impl DuckDbConnection {
         tx: mpsc::Sender<StreamingBatch>,
         interrupt_handle: Option<std::sync::Arc<duckdb::InterruptHandle>>,
     ) -> Result<(), ServerError> {
-        let schema = self.schema_for_streaming(sql)?;
-        let schema_ref: SchemaRef = Arc::new(schema.clone());
-
-        // Send schema first
-        if tx.blocking_send(StreamingBatch::Schema(schema)).is_err() {
-            debug!("streaming receiver dropped before schema sent");
-            return Ok(());
-        }
-
         // Enable CPU time profiling for resource tracking
         {
             let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -239,7 +227,16 @@ impl DuckDbConnection {
 
         // Now execute the full query in true streaming mode
         self.with_prepared(sql, |stmt| {
-            let arrow = Self::stream_arrow_with_schema(stmt, Some(params), schema_ref)?;
+            let arrow = Self::stream_arrow_with_params(stmt, Some(params))?;
+            let schema = arrow.get_schema();
+
+            if tx
+                .blocking_send(StreamingBatch::Schema(schema.as_ref().clone()))
+                .is_err()
+            {
+                debug!("streaming receiver dropped before schema sent");
+                return Ok(());
+            }
 
             // Stream batches with backpressure
             let mut total_rows = 0usize;
@@ -294,8 +291,8 @@ impl DuckDbConnection {
         params: &[Value],
     ) -> Result<QueryResult, ServerError> {
         self.with_prepared(sql, |stmt| {
-            let schema = stmt.schema_from_prepared()?;
-            let arrow = Self::stream_arrow_with_schema(stmt, Some(params), schema.clone())?;
+            let arrow = Self::stream_arrow_with_params(stmt, Some(params))?;
+            let schema = arrow.get_schema();
             let result = Self::collect_query_result(schema, arrow);
             debug!(
                 batch_count = result.batches.len(),
@@ -504,20 +501,19 @@ impl DuckDbConnection {
     /// Unlike `query_arrow`, this uses `execute_streaming` internally which
     /// does NOT materialize all results upfront. DuckDB will pause execution
     /// when the consumer is not pulling batches.
-    fn stream_arrow_with_schema<'a>(
+    fn stream_arrow_with_params<'a>(
         stmt: &'a mut Statement,
         params: Option<&[Value]>,
-        schema: SchemaRef,
     ) -> Result<ArrowStream<'a>, ServerError> {
         match params {
-            Some(values) => Ok(stmt.stream_arrow(params_from_iter(values.iter()), schema)?),
+            Some(values) => Ok(stmt.stream_arrow(params_from_iter(values.iter()))?),
             None => {
                 let param_count = stmt.parameter_count();
                 if param_count == 0 {
-                    Ok(stmt.stream_arrow([], schema)?)
+                    Ok(stmt.stream_arrow([])?)
                 } else {
                     let nulls: Vec<Value> = (0..param_count).map(|_| Value::Null).collect();
-                    Ok(stmt.stream_arrow(params_from_iter(nulls), schema)?)
+                    Ok(stmt.stream_arrow(params_from_iter(nulls))?)
                 }
             }
         }
@@ -562,6 +558,34 @@ mod tests {
         conn.execute_statement("INSERT INTO t VALUES (1)").unwrap();
         let result = conn.execute_query("SELECT * FROM t").unwrap();
         assert_eq!(result.total_rows, 1);
+    }
+
+    #[test]
+    fn streaming_result_uses_the_executed_schema() {
+        let conn = test_connection();
+        conn.execute_statement("CREATE TABLE t (id INTEGER, label VARCHAR)")
+            .unwrap();
+        conn.execute_statement("INSERT INTO t VALUES (1, 'one'), (2, 'two')")
+            .unwrap();
+
+        let result = conn
+            .execute_query_with_params(
+                "SELECT id, label FROM t WHERE id > ? ORDER BY id",
+                &[Value::Int(0)],
+            )
+            .unwrap();
+
+        assert_eq!(result.total_rows, 2);
+        assert_eq!(result.schema.field(0).name(), "id");
+        assert_eq!(
+            result.schema.field(0).data_type(),
+            &arrow_schema::DataType::Int32
+        );
+        assert_eq!(result.schema.field(1).name(), "label");
+        assert_eq!(
+            result.schema.field(1).data_type(),
+            &arrow_schema::DataType::Utf8
+        );
     }
 
     /// The streaming path enables `enable_profiling='json'` on the shared session
