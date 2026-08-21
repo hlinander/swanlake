@@ -135,16 +135,6 @@ impl DuckDbConnection {
         tx: mpsc::Sender<StreamingBatch>,
         interrupt_handle: Option<std::sync::Arc<duckdb::InterruptHandle>>,
     ) -> Result<(), ServerError> {
-        // `no_output` collects CPU metrics without taking DuckDB 1.5.5's JSON
-        // rendering path, which aborts after an attached-catalog stream ends.
-        {
-            let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-            let _ = conn.execute_batch(
-                "SET enable_profiling = 'no_output'; \
-                 SET custom_profiling_settings = '{\"OPERATOR_CPU_TIME\": \"true\", \"CPU_TIME_ACTUAL\": \"true\"}';"
-            );
-        }
-
         // Now execute the full query in true streaming mode
         self.with_prepared(sql, |stmt| {
             let arrow = Self::stream_arrow_with_params(stmt, None)?;
@@ -217,16 +207,6 @@ impl DuckDbConnection {
         tx: mpsc::Sender<StreamingBatch>,
         interrupt_handle: Option<std::sync::Arc<duckdb::InterruptHandle>>,
     ) -> Result<(), ServerError> {
-        // `no_output` collects CPU metrics without taking DuckDB 1.5.5's JSON
-        // rendering path, which aborts after an attached-catalog stream ends.
-        {
-            let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-            let _ = conn.execute_batch(
-                "SET enable_profiling = 'no_output'; \
-                 SET custom_profiling_settings = '{\"OPERATOR_CPU_TIME\": \"true\", \"CPU_TIME_ACTUAL\": \"true\"}';"
-            );
-        }
-
         // Now execute the full query in true streaming mode
         self.with_prepared(sql, |stmt| {
             let arrow = Self::stream_arrow_with_params(stmt, Some(params))?;
@@ -319,12 +299,11 @@ impl DuckDbConnection {
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // The streaming path enables profiling on this shared session connection
-        // for CPU sampling and never resets it. With profiling on, a
-        // `CREATE TABLE AS SELECT` run through the arrow C-API returns a null
-        // result ("out is null"). Clear it first so DDL/DML (including CTAS)
-        // from the execute action run cleanly. Ignored result: RESET is a no-op
-        // when profiling is already at its default.
+        // A client may have enabled profiling on this shared session. With
+        // profiling on, a `CREATE TABLE AS SELECT` run through the arrow C-API
+        // returns a null result ("out is null"). Clear it first so DDL/DML
+        // (including CTAS) from the execute action run cleanly. Ignored result:
+        // RESET is a no-op when profiling is already at its default.
         let _ = conn.execute_batch("RESET enable_profiling");
         conn.execute_batch(sql)?;
         debug!("executed statement");
@@ -338,7 +317,7 @@ impl DuckDbConnection {
         sql: &str,
         params: &[Value],
     ) -> Result<usize, ServerError> {
-        // Clear any leaked profiling state before running a (possibly
+        // Clear any client-enabled profiling state before running a (possibly
         // query-materializing) statement; see `execute_statement`.
         {
             let conn = self
@@ -626,11 +605,10 @@ mod tests {
         conn.execute_statement("DETACH wh").unwrap();
     }
 
-    /// The streaming path enables profiling on the shared session connection and
-    /// never resets it. With profiling on, a `CREATE TABLE AS SELECT` executed
-    /// through the arrow C-API returns a null result, surfaced by duckdb-rs as the
-    /// opaque "out is null". Execute-statement paths must clear profiling first
-    /// so DDL/DML (including CTAS) run cleanly.
+    /// A client can enable profiling on a shared session connection. With
+    /// profiling on, a `CREATE TABLE AS SELECT` executed through the arrow C-API
+    /// returns a null result, surfaced by duckdb-rs as the opaque "out is null".
+    /// Execute-statement paths must clear it before DDL/DML (including CTAS).
     #[test]
     fn execute_statement_succeeds_after_profiling_enabled() {
         let conn = test_connection();
