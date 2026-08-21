@@ -24,7 +24,7 @@ CommandStatementUpdate / CommandPreparedStatementUpdate
 ### Statement Handlers (`statement.rs`)
 - `get_flight_info_statement`: Plans a schema for an ad-hoc SQL string and returns a `FlightInfo`/ticket; supports both queries (planned schema) and commands (empty schema) so ExecuteQuery callers can send any SQL.
 - `do_get_statement`: Resolves a ticket and streams results for a prepared or ephemeral statement; executes non-query tickets and reports affected rows when applicable. Falls back to SQL embedded in the ticket if a handle is missing.
-- `do_put_statement_update`: Executes an ad-hoc update statement via DoPut (no result set), returning affected rows.
+- `do_put_statement_update`: Executes an ad-hoc update statement via DoPut (no result set), returning affected rows. When `CommandStatementUpdate.transaction_id` is present, validates the handle and disables aborted-transaction retry so the statement cannot escape into autocommit mode.
 
 ### Prepared Statement Handlers (`prepared.rs`)
 - `do_action_create_prepared_statement`: Creates a prepared statement, infers whether it is a query, and caches schema when possible.

@@ -65,6 +65,107 @@ impl PreparedStatementOptions {
     }
 }
 
+#[cfg(test)]
+mod transaction_tests {
+    use std::sync::Arc;
+
+    use duckdb::Connection;
+
+    use super::*;
+
+    fn session() -> Session {
+        let connection = Connection::open_in_memory().expect("open in-memory DuckDB");
+        Session::new_with_id(
+            SessionId::from_string("transaction-test".to_string()),
+            Arc::new(DuckDbConnection::new(connection)),
+        )
+    }
+
+    fn row_count(session: &Session) -> i64 {
+        session
+            .connection
+            .conn
+            .lock()
+            .expect("lock connection")
+            .query_row("SELECT count(*) FROM tx_rows", [], |row| row.get(0))
+            .expect("read row count")
+    }
+
+    #[test]
+    fn transaction_scoped_statements_commit() {
+        let session = session();
+        session
+            .execute_statement("CREATE TABLE tx_rows (id INTEGER)")
+            .expect("create table");
+
+        let transaction_id = session.begin_transaction().expect("begin transaction");
+        session
+            .execute_statement_in_transaction(
+                "INSERT INTO tx_rows VALUES (1)",
+                transaction_id,
+            )
+            .expect("transactional insert");
+        session
+            .commit_transaction(transaction_id)
+            .expect("commit transaction");
+
+        assert_eq!(row_count(&session), 1);
+    }
+
+    #[test]
+    fn aborted_transaction_statement_is_not_retried_in_autocommit() {
+        let session = session();
+        session
+            .execute_statement("CREATE TABLE tx_rows (id INTEGER)")
+            .expect("create table");
+
+        let transaction_id = session.begin_transaction().expect("begin transaction");
+        session
+            .execute_statement_in_transaction(
+                "INSERT INTO tx_rows VALUES (1)",
+                transaction_id,
+            )
+            .expect("transactional insert");
+        assert!(
+            session
+                .execute_statement_in_transaction(
+                    "INSERT INTO tx_rows VALUES ('not-an-integer')",
+                    transaction_id,
+                )
+                .is_err()
+        );
+        assert!(
+            session
+                .execute_statement_in_transaction(
+                    "INSERT INTO tx_rows VALUES (2)",
+                    transaction_id,
+                )
+                .is_err()
+        );
+        assert!(matches!(
+            session.commit_transaction(transaction_id),
+            Err(ServerError::TransactionAborted)
+        ));
+
+        assert_eq!(row_count(&session), 0);
+    }
+
+    #[test]
+    fn unknown_transaction_cannot_execute_an_update() {
+        let session = session();
+        session
+            .execute_statement("CREATE TABLE tx_rows (id INTEGER)")
+            .expect("create table");
+
+        let result = session.execute_statement_in_transaction(
+            "INSERT INTO tx_rows VALUES (1)",
+            TransactionId::new(999),
+        );
+        assert!(matches!(result, Err(ServerError::TransactionNotFound)));
+        assert_eq!(row_count(&session), 0);
+    }
+}
+
 /// State for a prepared statement including pending parameters
 #[derive(Debug)]
 struct PreparedStatementState {
@@ -319,12 +420,60 @@ impl Session {
     #[instrument(skip(self), fields(session_id = %self.id, sql = %sql))]
     pub fn execute_statement(&self, sql: &str) -> Result<i64, ServerError> {
         self.touch();
-        let result =
-            self.with_transaction_recovery(|| self.connection.execute_statement(sql), true);
+        let result = self.execute_statement_with_recovery(sql, true);
         if result.is_ok() && Self::should_invalidate_schema_cache(sql) {
             self.clear_schema_cache();
         }
         result
+    }
+
+    /// Execute a DDL/DML statement inside an explicit Flight SQL transaction.
+    /// The transaction handle is validated before execution, and an aborted
+    /// statement is never retried in autocommit mode outside that transaction.
+    pub fn execute_statement_in_transaction(
+        &self,
+        sql: &str,
+        transaction_id: TransactionId,
+    ) -> Result<i64, ServerError> {
+        self.touch();
+        self.require_transaction(transaction_id)?;
+        let result = self.execute_statement_with_recovery(sql, false);
+        if result.is_ok() && Self::should_invalidate_schema_cache(sql) {
+            self.clear_schema_cache();
+        }
+        result
+    }
+
+    fn execute_statement_with_recovery(
+        &self,
+        sql: &str,
+        retry_on_abort: bool,
+    ) -> Result<i64, ServerError> {
+        self.with_transaction_recovery(
+            || self.connection.execute_statement(sql),
+            retry_on_abort,
+        )
+    }
+
+    fn require_transaction(&self, transaction_id: TransactionId) -> Result<(), ServerError> {
+        let present = self
+            .transactions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&transaction_id);
+        if present {
+            return Ok(());
+        }
+
+        let mut aborted = self
+            .aborted_transactions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if aborted.remove(&transaction_id) {
+            Err(ServerError::TransactionAborted)
+        } else {
+            Err(ServerError::TransactionNotFound)
+        }
     }
 
     /// Execute a statement with parameters

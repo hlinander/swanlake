@@ -16,6 +16,7 @@ use super::ticket::{StatementTicketKind, TicketStatementPayload};
 use crate::error::ServerError;
 use crate::service::SwanFlightSqlService;
 use crate::session::PreparedStatementOptions;
+use crate::session::id::TransactionId;
 use crate::sql::parser::ParsedStatement;
 
 /// Plans an ad-hoc SQL statement and returns a FlightInfo+ticket that can be
@@ -174,13 +175,25 @@ pub(crate) async fn do_put_statement_update(
     request: Request<PeekableFlightDataStream>,
 ) -> Result<i64, Status> {
     let sql = command.query;
+    let transaction_id = match command.transaction_id {
+        Some(raw) => Some(
+            TransactionId::from_bytes(&raw)
+                .ok_or_else(|| Status::invalid_argument("invalid transaction ID"))?,
+        ),
+        None => None,
+    };
     let session = service.prepare_request(&request).await?;
     let _in_flight = service.metrics.start_update();
     let start = Instant::now();
 
     let sql_for_exec = sql.clone();
-    let result =
-        tokio::task::spawn_blocking(move || session.execute_statement(&sql_for_exec)).await;
+    let result = tokio::task::spawn_blocking(move || match transaction_id {
+        Some(transaction_id) => {
+            session.execute_statement_in_transaction(&sql_for_exec, transaction_id)
+        }
+        None => session.execute_statement(&sql_for_exec),
+    })
+    .await;
     let affected_rows = match result {
         Ok(Ok(rows)) => rows,
         Ok(Err(err)) => {
