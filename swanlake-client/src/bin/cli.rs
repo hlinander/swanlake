@@ -269,3 +269,21 @@ fn errln(args: fmt::Arguments<'_>) -> io::Result<()> {
     let mut stderr = io::stderr().lock();
     writeln!(stderr, "{args}")
 }
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use arrow_array::TimestampMicrosecondArray;
+
+    use super::format_cell_value;
+
+    #[test]
+    fn formats_timestamp_with_named_utc_timezone() -> Result<()> {
+        let timestamps = TimestampMicrosecondArray::from(vec![Some(0)]).with_timezone("UTC");
+
+        let formatted = format_cell_value(&timestamps, 0)?;
+
+        assert!(formatted.starts_with("1970-01-01"));
+        Ok(())
+    }
+}
