@@ -180,6 +180,23 @@ pub fn normalize_attach(secret_config: &str, name: &str) -> Result<String, Duckv
     ))
 }
 
+/// Set one safely-named attached catalog as the session's lookup path. The
+/// default database is deliberately unchanged, so Duckvis can continue to
+/// create its workspace schemas there while unqualified reads such as `runs`
+/// resolve from the project data catalog.
+pub fn catalog_search_path_sql(name: &str) -> Result<String, DuckvisError> {
+    let mut chars = name.chars();
+    if !matches!(chars.next(), Some('a'..='z' | 'A'..='Z' | '_'))
+        || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err(DuckvisError::AttachInvalid);
+    }
+    // Keep the session's existing `main` schema first. Qualifying the attached
+    // entry with its catalog prevents DuckDB from making that catalog the
+    // current database while still allowing unqualified fallback reads.
+    Ok(format!("SET search_path = 'main,{name}.main'"))
+}
+
 struct ParsedAttach {
     path: String,
     options: String,
@@ -402,6 +419,39 @@ mod tests {
     fn normalize_rejects_non_attach() {
         let err = normalize_attach("SELECT 1", "a");
         assert!(matches!(err, Err(DuckvisError::AttachInvalid)));
+    }
+
+    #[test]
+    fn concise_catalog_can_be_installed_on_the_search_path() {
+        assert_eq!(
+            catalog_search_path_sql("duckfeed").unwrap(),
+            "SET search_path = 'main,duckfeed.main'"
+        );
+        assert!(matches!(
+            catalog_search_path_sql("Duckfeed project data"),
+            Err(DuckvisError::AttachInvalid)
+        ));
+    }
+
+    #[test]
+    fn catalog_search_path_resolves_unqualified_tables_without_changing_default() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "ATTACH ':memory:' AS duckfeed; \
+             CREATE TABLE duckfeed.runs (id INTEGER); \
+             INSERT INTO duckfeed.runs VALUES (1); \
+             SET search_path = 'main,duckfeed.main';",
+        )
+        .unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM runs", [], |row| row.get(0))
+            .unwrap();
+        let current: String = conn
+            .query_row("SELECT current_database()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(current, "memory");
     }
 
     #[test]

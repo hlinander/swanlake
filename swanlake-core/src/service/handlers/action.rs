@@ -1297,6 +1297,11 @@ pub(crate) async fn do_action_execute_sql(
 #[derive(Debug, Deserialize)]
 struct DuckvisAttachBody {
     bind_id: String,
+    /// Put the resolved attachment catalog on this session's lookup path.
+    /// Optional for compatibility with clients that predate concise project
+    /// dataset names.
+    #[serde(default)]
+    add_to_search_path: bool,
 }
 
 /// Success payload for the `duckvis_attach` action (contract C1).
@@ -1361,11 +1366,24 @@ pub(crate) async fn do_action_duckvis_attach(
     let attachment_name = resolved.name.clone();
     let attachment_id = resolved.attachment_id.clone();
 
-    // Execute on the session connection via the privileged (guard-bypassing) path.
+    let search_path_sql = parsed
+        .add_to_search_path
+        .then(|| crate::duckvis::attach::catalog_search_path_sql(&attachment_name))
+        .transpose()
+        .map_err(|e| e.into_status())?;
+
+    // Execute on the session connection via the privileged (guard-bypassing)
+    // path. Search-path activation is session-local and follows the authorized
+    // attach on the same connection; it does not change the writable default
+    // database.
     let session_clone = session.clone();
     let normalized_for_exec = normalized;
     tokio::task::spawn_blocking(move || {
-        session_clone.execute_statement_privileged(&normalized_for_exec)
+        session_clone.execute_statement_privileged(&normalized_for_exec)?;
+        if let Some(sql) = search_path_sql {
+            session_clone.execute_statement_privileged(&sql)?;
+        }
+        Ok::<_, crate::error::ServerError>(())
     })
     .await
     .map_err(SwanFlightSqlService::status_from_join)?
