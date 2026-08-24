@@ -64,9 +64,30 @@ impl DuckvisAuth {
         subject: &str,
         workspace_id: &str,
     ) -> Result<bool, DuckvisError> {
+        self.check_workspace(subject, workspace_id, "Workspace.view").await
+    }
+
+    /// `POST {api}/v1/authz/check` for `Workspace.mutate_data` — the writer
+    /// capability probed at session bind. A deny is the normal case (humans and
+    /// bots hold `view` only) and arms attachments `READ_ONLY`; an allow marks
+    /// the session `writer` so attachments arm read-write.
+    pub async fn check_workspace_mutate_data(
+        &self,
+        subject: &str,
+        workspace_id: &str,
+    ) -> Result<bool, DuckvisError> {
+        self.check_workspace(subject, workspace_id, "Workspace.mutate_data").await
+    }
+
+    async fn check_workspace(
+        &self,
+        subject: &str,
+        workspace_id: &str,
+        permission: &str,
+    ) -> Result<bool, DuckvisError> {
         let body = CheckRequest {
             subject,
-            permission: "Workspace.view",
+            permission,
             object: CheckObject {
                 kind: "workspace",
                 id: workspace_id,

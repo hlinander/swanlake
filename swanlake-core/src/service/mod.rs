@@ -225,9 +225,19 @@ impl SwanFlightSqlService {
             return Err(crate::duckvis::DuckvisError::PermissionDenied.into_status());
         }
 
+        // Second check: the writer capability (`Workspace.mutate_data`), fixed
+        // for the session's lifetime. A deny is the normal case (humans and
+        // bots hold `view` only) and means attachments arm `READ_ONLY`; only an
+        // unavailable authz oracle fails the bind (fail closed, contract C4).
+        let writer = duckvis
+            .check_workspace_mutate_data(&claims.sub, &workspace_id)
+            .await
+            .map_err(|e| e.into_status())?;
+
         let new_auth = SessionAuth {
             subject: claims.sub.clone(),
             workspace_id: workspace_id.clone(),
+            writer,
         };
         let session = self
             .registry

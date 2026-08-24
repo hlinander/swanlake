@@ -130,12 +130,15 @@ impl SchemaCache {
     }
 }
 
-/// Authentication binding for a duckvis-mode session: the token subject and the
-/// workspace the session is scoped to.
+/// Authentication binding for a duckvis-mode session: the token subject, the
+/// workspace the session is scoped to, and the writer capability
+/// (`Workspace.mutate_data`, checked once at bind and fixed for the session's
+/// lifetime). Non-writer sessions arm attachments `READ_ONLY`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionAuth {
     pub subject: String,
     pub workspace_id: String,
+    pub writer: bool,
 }
 
 /// A client session with dedicated connection and state
@@ -754,6 +757,7 @@ mod guard_tests {
         session_with_auth(Some(SessionAuth {
             subject: "sub-1".to_string(),
             workspace_id: "ws-1".to_string(),
+            writer: false,
         }))
     }
 

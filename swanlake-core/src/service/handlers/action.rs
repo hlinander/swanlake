@@ -1358,11 +1358,15 @@ pub(crate) async fn do_action_duckvis_attach(
         .map_err(|e| e.into_status())?
         .ok_or_else(|| crate::duckvis::DuckvisError::PermissionDenied.into_status())?;
 
-    // Normalize the ATTACH statement. NOTE: `normalized` contains the secret
-    // config and must never be logged.
-    let normalized =
-        crate::duckvis::attach::normalize_attach(&resolved.secret_config, &resolved.name)
-            .map_err(|e| e.into_status())?;
+    // Normalize the ATTACH statement; a non-writer session arms it READ_ONLY
+    // (write authorization is engine-level, at the attachment access mode).
+    // NOTE: `normalized` contains the secret config and must never be logged.
+    let normalized = crate::duckvis::attach::normalize_attach(
+        &resolved.secret_config,
+        &resolved.name,
+        !auth.writer,
+    )
+    .map_err(|e| e.into_status())?;
 
     let attachment_name = resolved.name.clone();
     let attachment_id = resolved.attachment_id.clone();
