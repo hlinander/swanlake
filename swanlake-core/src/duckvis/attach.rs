@@ -424,8 +424,8 @@ mod tests {
     #[test]
     fn concise_catalog_can_be_installed_on_the_search_path() {
         assert_eq!(
-            catalog_search_path_sql("duckfeed").unwrap(),
-            "SET search_path = 'main,duckfeed.main'"
+            catalog_search_path_sql("feed").unwrap(),
+            "SET search_path = 'main,feed.main'"
         );
         assert!(matches!(
             catalog_search_path_sql("Duckfeed project data"),
@@ -437,10 +437,10 @@ mod tests {
     fn catalog_search_path_resolves_unqualified_tables_without_changing_default() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "ATTACH ':memory:' AS duckfeed; \
-             CREATE TABLE duckfeed.runs (id INTEGER); \
-             INSERT INTO duckfeed.runs VALUES (1); \
-             SET search_path = 'main,duckfeed.main';",
+            "ATTACH ':memory:' AS feed; \
+             CREATE TABLE feed.runs (id INTEGER); \
+             INSERT INTO feed.runs VALUES (1); \
+             SET search_path = 'main,feed.main';",
         )
         .unwrap();
 
