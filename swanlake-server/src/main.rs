@@ -6,7 +6,7 @@ use swanlake_core::engine::EngineFactory;
 use swanlake_core::maintenance::CheckpointService;
 use swanlake_core::metrics::Metrics;
 use swanlake_core::service::SwanFlightService;
-use tonic::transport::Server;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 use tracing::info;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
@@ -62,7 +62,10 @@ async fn main() -> Result<()> {
         info!("duckvis mode enabled: authenticating all Flight requests");
     }
 
-    let flight_location = format!("grpc://{}:{}", config.advertise_host, config.port);
+    // The advertise scheme must match the transport: a TLS server hands clients
+    // `grpc+tls://` endpoint locations so their DoGet dials TLS, not plaintext.
+    let scheme = if config.tls_enabled() { "grpc+tls" } else { "grpc" };
+    let flight_location = format!("{scheme}://{}:{}", config.advertise_host, config.port);
     let flight_service = SwanFlightService::with_duckvis(
         registry.clone(),
         metrics.clone(),
@@ -127,7 +130,18 @@ async fn main() -> Result<()> {
         let _ = shutdown_tx.send(());
     });
 
-    Server::builder()
+    let mut server = Server::builder();
+    if config.tls_enabled() {
+        let cert = std::fs::read(config.tls_cert_path.as_deref().unwrap())
+            .context("failed to read SWANLAKE_TLS_CERT_PATH")?;
+        let key = std::fs::read(config.tls_key_path.as_deref().unwrap())
+            .context("failed to read SWANLAKE_TLS_KEY_PATH")?;
+        server = server
+            .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))
+            .context("failed to configure Flight server TLS")?;
+        info!("TLS enabled on the Flight server");
+    }
+    server
         .add_service(health_service)
         .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(flight_service))
         .serve_with_shutdown(addr, async {

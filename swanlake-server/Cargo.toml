@@ -12,7 +12,7 @@ path = "src/main.rs"
 swanlake-core = { path = "../swanlake-core" }
 anyhow = { workspace = true }
 dotenvy = "0.15.7"
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["tls-ring"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tonic-health = "0.14.4"

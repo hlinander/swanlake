@@ -109,6 +109,12 @@ pub struct ServerConfig {
     /// Fallback max-age (seconds) for the JWKS cache when the response omits
     /// `Cache-Control: max-age`. Defaults to 300 when unset.
     pub duckvis_jwks_max_age_secs: Option<u64>,
+    /// PEM certificate chain enabling TLS on the Flight server
+    /// (`SWANLAKE_TLS_CERT_PATH`). TLS turns on only when both this and the key
+    /// path are set; otherwise the server serves plaintext `grpc://`.
+    pub tls_cert_path: Option<String>,
+    /// PEM private key for [`Self::tls_cert_path`] (`SWANLAKE_TLS_KEY_PATH`).
+    pub tls_key_path: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -141,6 +147,8 @@ impl Default for ServerConfig {
             duckvis_client_id: None,
             duckvis_private_key: None,
             duckvis_jwks_max_age_secs: None,
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 }
@@ -170,7 +178,17 @@ impl ServerConfig {
             .ok_or_else(|| anyhow::anyhow!("unable to resolve bind address for {addr}"))
     }
 
+    /// TLS is enabled when both a certificate and key path are configured.
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_cert_path.is_some() && self.tls_key_path.is_some()
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
+        if self.tls_cert_path.is_some() != self.tls_key_path.is_some() {
+            bail!(
+                "SWANLAKE_TLS_CERT_PATH and SWANLAKE_TLS_KEY_PATH must be set together (or both unset)"
+            );
+        }
         if let Some(hours) = self.checkpoint_interval_hours {
             if hours == 0 {
                 bail!("SWANLAKE_CHECKPOINT_INTERVAL_HOURS must be greater than 0");
