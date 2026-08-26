@@ -150,7 +150,7 @@ impl SessionRegistry {
     /// Look up an existing session by ID without creating one (read lock only).
     ///
     /// Used by the duckvis auth gate to inspect a session's auth binding before
-    /// deciding whether to create a new (workspace-scoped) session.
+    /// deciding whether to create a new (project-scoped) session.
     pub fn get_by_id(&self, session_id: &SessionId) -> Option<Arc<Session>> {
         let inner = self
             .inner

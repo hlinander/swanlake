@@ -25,6 +25,16 @@ pub(crate) mod streaming;
 
 use handlers::ticket::{StatementTicketKind, TicketStatementPayload};
 
+fn duckvis_project_header<T>(request: &Request<T>) -> Option<String> {
+    request
+        .metadata()
+        .get("x-duckvis-project-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 // Phase 2 Complete: All state (prepared statements, transactions) is session-scoped
 // - Each gRPC connection gets a dedicated session (based on remote_addr)
 // - Sessions persist across requests from the same connection
@@ -157,8 +167,8 @@ impl SwanFlightSqlService {
     }
 
     /// Duckvis-mode auth gate (contract C2/C4). Validates the bearer token, binds
-    /// or matches the session to the token subject and workspace, and creates a
-    /// workspace-scoped session on first contact after an `authz/check`.
+    /// or matches the session to the token subject and project, and creates a
+    /// project-scoped session on first contact after an `authz/check`.
     async fn prepare_request_duckvis<T>(
         &self,
         duckvis: &Arc<crate::duckvis::DuckvisAuth>,
@@ -185,16 +195,10 @@ impl SwanFlightSqlService {
         // Record the subject on the span (never the token).
         Span::current().record("duckvis_subject", claims.sub.as_str());
 
-        // Optional workspace header.
-        let workspace_header = request
-            .metadata()
-            .get("x-duckvis-workspace-id")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
+        // Optional project header.
+        let project_header = duckvis_project_header(request);
 
-        // (3) Existing session: enforce subject + workspace match.
+        // (3) Existing session: enforce subject + project match.
         if let Some(existing) = self.registry.get_by_id(session_id) {
             let auth = existing.auth().ok_or_else(|| {
                 // A session without auth in duckvis mode is an internal invariant
@@ -204,21 +208,21 @@ impl SwanFlightSqlService {
             if auth.subject != claims.sub {
                 return Err(crate::duckvis::DuckvisError::PermissionDenied.into_status());
             }
-            if let Some(ws) = &workspace_header {
-                if ws != &auth.workspace_id {
+            if let Some(project_id) = &project_header {
+                if project_id != &auth.project_id {
                     return Err(crate::duckvis::DuckvisError::PermissionDenied.into_status());
                 }
             }
-            Span::current().record("duckvis_workspace_id", auth.workspace_id.as_str());
+            Span::current().record("duckvis_project_id", auth.project_id.as_str());
             return Ok(existing);
         }
 
-        // (4) No session yet: require the workspace header and an allow decision.
-        let workspace_id = workspace_header
+        // (4) No session yet: require the project header and an allow decision.
+        let project_id = project_header
             .ok_or_else(|| crate::duckvis::DuckvisError::InvalidArgument.into_status())?;
 
         let allowed = duckvis
-            .check_workspace_view(&claims.sub, &workspace_id)
+            .check_project_view(&claims.sub, &project_id)
             .await
             .map_err(|e| e.into_status())?;
         if !allowed {
@@ -227,7 +231,7 @@ impl SwanFlightSqlService {
 
         let new_auth = SessionAuth {
             subject: claims.sub.clone(),
-            workspace_id: workspace_id.clone(),
+            project_id: project_id.clone(),
         };
         let session = self
             .registry
@@ -239,7 +243,7 @@ impl SwanFlightSqlService {
         // does not match the winning binding) is rejected.
         match session.auth() {
             Some(bound) if bound == &new_auth => {
-                Span::current().record("duckvis_workspace_id", workspace_id.as_str());
+                Span::current().record("duckvis_project_id", project_id.as_str());
                 Ok(session)
             }
             _ => Err(crate::duckvis::DuckvisError::PermissionDenied.into_status()),
@@ -637,6 +641,31 @@ mod tests {
         let fallback_request = Request::new(());
         let fallback_id = peer_ip_service.extract_session_id(&fallback_request);
         assert!(Uuid::parse_str(fallback_id.as_ref()).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn duckvis_project_header_uses_only_the_public_project_contract() -> Result<()> {
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            "x-duckvis-project-id",
+            "project-1"
+                .parse()
+                .map_err(|e| anyhow!("invalid project metadata value: {e}"))?,
+        );
+        assert_eq!(
+            duckvis_project_header(&request).as_deref(),
+            Some("project-1")
+        );
+
+        let mut legacy = Request::new(());
+        legacy.metadata_mut().insert(
+            "x-duckvis-workspace-id",
+            "workspace-1"
+                .parse()
+                .map_err(|e| anyhow!("invalid workspace metadata value: {e}"))?,
+        );
+        assert_eq!(duckvis_project_header(&legacy), None);
         Ok(())
     }
 

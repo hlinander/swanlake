@@ -217,7 +217,7 @@ impl ServerConfig {
                     "SWANLAKE_DATABASE_PATH must not be a file path in duckvis mode: a file-based \
                      DuckDB \
                      database shares its attached catalog across all sessions via the instance \
-                     cache, which would leak workspace attachments between sessions. Duckvis mode \
+                     cache, which would leak project attachments between sessions. Duckvis mode \
                      requires in-memory per-session databases (leave SWANLAKE_DATABASE_PATH unset \
                      or use \":memory:\")."
                 );

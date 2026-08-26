@@ -131,18 +131,18 @@ impl SchemaCache {
 }
 
 /// Authentication binding for a duckvis-mode session: the token subject and the
-/// workspace the session is scoped to.
+/// project the session is scoped to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionAuth {
     pub subject: String,
-    pub workspace_id: String,
+    pub project_id: String,
 }
 
 /// A client session with dedicated connection and state
 pub struct Session {
     id: SessionId,
     /// Optional duckvis-mode auth binding. When `Some`, the raw-ATTACH guard
-    /// (contract C6) is active and the session is workspace-scoped.
+    /// (contract C6) is active and the session is project-scoped.
     auth: Option<SessionAuth>,
     /// Opaque token assigned at creation. Clients cache this and send it back
     /// via `x-expected-session-nonce` so the server can detect that a session
@@ -753,7 +753,7 @@ mod guard_tests {
     fn authed_session() -> Result<Session> {
         session_with_auth(Some(SessionAuth {
             subject: "sub-1".to_string(),
-            workspace_id: "ws-1".to_string(),
+            project_id: "project-1".to_string(),
         }))
     }
 

@@ -1313,7 +1313,7 @@ struct DuckvisAttachResult {
 
 /// Handle the `duckvis_attach` action (contract C1).
 ///
-/// Resolves a workspace attachment by bind id via duckvis-api, normalizes the
+/// Resolves a project attachment by bind id via duckvis-api, normalizes the
 /// returned ATTACH statement to `ATTACH OR REPLACE … AS "<name>" …`, and executes
 /// it on the session connection through the privileged (guard-bypassing) path.
 ///
@@ -1329,7 +1329,7 @@ pub(crate) async fn do_action_duckvis_attach(
         .ok_or_else(|| Status::unimplemented("duckvis_attach is not available"))?
         .clone();
 
-    // Runs the auth gate (validates token, binds/checks session workspace).
+    // Runs the auth gate (validates token, binds/checks session project).
     let session = service.prepare_request(&request).await?;
 
     // The session must carry auth (guaranteed by the auth gate in duckvis mode).
@@ -1352,7 +1352,7 @@ pub(crate) async fn do_action_duckvis_attach(
 
     // Resolve the attachment via duckvis-api (fail-closed).
     let resolved = duckvis
-        .resolve_attachment(&auth.subject, &auth.workspace_id, &bind_id)
+        .resolve_attachment(&auth.subject, &auth.project_id, &bind_id)
         .await
         .map_err(|e| e.into_status())?
         .ok_or_else(|| crate::duckvis::DuckvisError::PermissionDenied.into_status())?;

@@ -10,7 +10,7 @@ use tracing::warn;
 
 use super::{sa, DuckvisAuth, DuckvisError};
 
-/// A resolved workspace attachment (contract C3 allow path). `secret_config` is
+/// A resolved project attachment (contract C3 allow path). `secret_config` is
 /// the full ATTACH statement and must never be logged.
 #[derive(Debug, Clone)]
 pub struct ResolvedAttachment {
@@ -42,7 +42,7 @@ struct CheckResponse {
 #[derive(Serialize)]
 struct ResolveRequest<'a> {
     subject: &'a str,
-    workspace_id: &'a str,
+    project_id: &'a str,
     bind_id: &'a str,
 }
 
@@ -57,21 +57,14 @@ struct ResolveResponse {
 }
 
 impl DuckvisAuth {
-    /// `POST {api}/v1/authz/check` for `Workspace.view`. Returns the `allow` bit.
+    /// `POST {api}/v1/authz/check` for `Project.view`. Returns the `allow` bit.
     /// Deny → `Ok(false)`; network/5xx → `Err(Unavailable)` (fail closed).
-    pub async fn check_workspace_view(
+    pub async fn check_project_view(
         &self,
         subject: &str,
-        workspace_id: &str,
+        project_id: &str,
     ) -> Result<bool, DuckvisError> {
-        let body = CheckRequest {
-            subject,
-            permission: "Workspace.view",
-            object: CheckObject {
-                kind: "workspace",
-                id: workspace_id,
-            },
-        };
+        let body = project_view_check_request(subject, project_id);
         let url = format!("{}/v1/authz/check", self.api_url.trim_end_matches('/'));
 
         let resp: CheckResponse = self.post_json_with_retry(&url, &body).await?;
@@ -83,14 +76,10 @@ impl DuckvisAuth {
     pub async fn resolve_attachment(
         &self,
         subject: &str,
-        workspace_id: &str,
+        project_id: &str,
         bind_id: &str,
     ) -> Result<Option<ResolvedAttachment>, DuckvisError> {
-        let body = ResolveRequest {
-            subject,
-            workspace_id,
-            bind_id,
-        };
+        let body = resolve_attachment_request(subject, project_id, bind_id);
         let url = format!(
             "{}/v1/authz/resolve-attachment",
             self.api_url.trim_end_matches('/')
@@ -191,5 +180,65 @@ impl DuckvisAuth {
                 warn!(error = %e, "authz request send failed");
                 DuckvisError::Unavailable
             })
+    }
+}
+
+fn project_view_check_request<'a>(subject: &'a str, project_id: &'a str) -> CheckRequest<'a> {
+    CheckRequest {
+        subject,
+        permission: "Project.view",
+        object: CheckObject {
+            kind: "project",
+            id: project_id,
+        },
+    }
+}
+
+fn resolve_attachment_request<'a>(
+    subject: &'a str,
+    project_id: &'a str,
+    bind_id: &'a str,
+) -> ResolveRequest<'a> {
+    ResolveRequest {
+        subject,
+        project_id,
+        bind_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn project_view_check_matches_duckvis_api_contract() -> Result<(), serde_json::Error> {
+        let request = project_view_check_request("subject-1", "project-1");
+
+        assert_eq!(
+            serde_json::to_value(request)?,
+            json!({
+                "subject": "subject-1",
+                "permission": "Project.view",
+                "object": { "kind": "project", "id": "project-1" }
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn attachment_resolution_matches_duckvis_api_contract() -> Result<(), serde_json::Error> {
+        let request = resolve_attachment_request("subject-1", "project-1", "binding-1");
+
+        assert_eq!(
+            serde_json::to_value(request)?,
+            json!({
+                "subject": "subject-1",
+                "project_id": "project-1",
+                "bind_id": "binding-1"
+            })
+        );
+        Ok(())
     }
 }

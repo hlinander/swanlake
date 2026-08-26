@@ -1,4 +1,4 @@
-//! Duckvis mode: authenticated, workspace-scoped sessions backed by duckvis-api.
+//! Duckvis mode: authenticated, project-scoped sessions backed by duckvis-api.
 //!
 //! [`DuckvisAuth`] holds the parsed configuration, a shared `reqwest::Client`, a
 //! cached service-account token, and a JWKS cache. It validates inbound user
@@ -30,10 +30,10 @@ pub enum DuckvisError {
     /// refresh, wrong iss/aud. Generic — no failure-mode split (C4).
     Unauthenticated,
     /// Authorization denied: authz-check deny, token sub ≠ session subject,
-    /// workspace header ≠ session workspace, resolve deny, or a raw ATTACH in
+    /// project header ≠ session project, resolve deny, or a raw ATTACH in
     /// user SQL (C6).
     PermissionDenied,
-    /// Missing `x-duckvis-workspace-id` at session creation, or a malformed
+    /// Missing `x-duckvis-project-id` at session creation, or a malformed
     /// `duckvis_attach` body.
     InvalidArgument,
     /// The resolved/normalized ATTACH statement was not a single ATTACH.

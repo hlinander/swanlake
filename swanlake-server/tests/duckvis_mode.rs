@@ -249,17 +249,34 @@ async fn spawn_mock_api(state: Arc<MockState>) -> String {
         .into_response()
     }
 
-    async fn authz_check(State(state): State<Arc<MockState>>) -> impl IntoResponse {
+    async fn authz_check(
+        State(state): State<Arc<MockState>>,
+        Json(body): Json<Value>,
+    ) -> impl IntoResponse {
         if state.fail_500.load(Ordering::SeqCst) {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({}))).into_response();
+        }
+        if body.get("permission").and_then(Value::as_str) != Some("Project.view")
+            || body.pointer("/object/kind").and_then(Value::as_str) != Some("project")
+            || body.pointer("/object/id").and_then(Value::as_str) != Some(PROJECT)
+        {
+            return (StatusCode::BAD_REQUEST, Json(json!({}))).into_response();
         }
         let allow = state.check_allow.load(Ordering::SeqCst);
         (StatusCode::OK, Json(json!({ "allow": allow }))).into_response()
     }
 
-    async fn resolve_attachment(State(state): State<Arc<MockState>>) -> impl IntoResponse {
+    async fn resolve_attachment(
+        State(state): State<Arc<MockState>>,
+        Json(body): Json<Value>,
+    ) -> impl IntoResponse {
         if state.fail_500.load(Ordering::SeqCst) {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({}))).into_response();
+        }
+        if body.get("project_id").and_then(Value::as_str) != Some(PROJECT)
+            || body.get("bind_id").and_then(Value::as_str) != Some(BIND_ID)
+        {
+            return (StatusCode::BAD_REQUEST, Json(json!({}))).into_response();
         }
         if !state.resolve_allow.load(Ordering::SeqCst) {
             return (StatusCode::OK, Json(json!({ "allow": false }))).into_response();
@@ -522,12 +539,12 @@ async fn run_select(
 }
 
 const SESSION: &str = "test-session-1";
-const WORKSPACE: &str = "22222222-2222-2222-2222-222222222222";
+const PROJECT: &str = "22222222-2222-2222-2222-222222222222";
 const BIND_ID: &str = "33333333-3333-3333-3333-333333333333";
 
-fn ws_headers<'a>(token: &'a str, session: &'a str, workspace: &'a str) -> Vec<(&'a str, &'a str)> {
+fn project_headers<'a>(token: &'a str, session: &'a str, project: &'a str) -> Vec<(&'a str, &'a str)> {
     let mut h = auth_headers(token, session);
-    h.push(("x-duckvis-workspace-id", workspace));
+    h.push(("x-duckvis-project-id", project));
     h
 }
 
@@ -568,7 +585,7 @@ async fn wrong_aud_is_unauthenticated() {
     let mut claims = user_claims("user-1");
     claims["aud"] = json!("duckvis-api");
     let token = format!("Bearer {}", mint_with(KID_K1, &claims));
-    let headers = ws_headers(&token, SESSION, WORKSPACE);
+    let headers = project_headers(&token, SESSION, PROJECT);
     let err = session_info(&mut cli, &headers).await.expect_err("fail");
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
 }
@@ -580,7 +597,7 @@ async fn wrong_iss_is_unauthenticated() {
     let mut claims = user_claims("user-1");
     claims["iss"] = json!("https://evil.example");
     let token = format!("Bearer {}", mint_with(KID_K1, &claims));
-    let headers = ws_headers(&token, SESSION, WORKSPACE);
+    let headers = project_headers(&token, SESSION, PROJECT);
     let err = session_info(&mut cli, &headers).await.expect_err("fail");
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
 }
@@ -594,7 +611,7 @@ async fn expired_token_is_unauthenticated() {
     claims["exp"] = json!(now - 3600);
     claims["nbf"] = json!(now - 3700);
     let token = format!("Bearer {}", mint_with(KID_K1, &claims));
-    let headers = ws_headers(&token, SESSION, WORKSPACE);
+    let headers = project_headers(&token, SESSION, PROJECT);
     let err = session_info(&mut cli, &headers).await.expect_err("fail");
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
 }
@@ -607,7 +624,7 @@ async fn unknown_kid_triggers_jwks_refetch() {
     // refetch. It still fails (the kid is not in the served set), but the mock
     // must have been hit more than once.
     let token = format!("Bearer {}", mint_with("unknown-kid-xyz", &user_claims("user-1")));
-    let headers = ws_headers(&token, SESSION, WORKSPACE);
+    let headers = project_headers(&token, SESSION, PROJECT);
     let err = session_info(&mut cli, &headers).await.expect_err("fail");
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
     // Initial stale-cache fetch + forced unknown-kid refetch ⇒ ≥ 2 hits.
@@ -618,11 +635,11 @@ async fn unknown_kid_triggers_jwks_refetch() {
 }
 
 #[tokio::test]
-async fn missing_workspace_header_is_invalid_argument() {
+async fn missing_project_header_is_invalid_argument() {
     let h = base_harness().await;
     let mut cli = client(&h.endpoint).await;
     let token = format!("Bearer {}", valid_token("user-1"));
-    // No x-duckvis-workspace-id on the session-creating request.
+    // No x-duckvis-project-id on the session-creating request.
     let headers = auth_headers(&token, SESSION);
     let err = session_info(&mut cli, &headers).await.expect_err("fail");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -634,7 +651,7 @@ async fn authz_check_deny_is_permission_denied() {
     h.mock.check_allow.store(false, Ordering::SeqCst);
     let mut cli = client(&h.endpoint).await;
     let token = format!("Bearer {}", valid_token("user-1"));
-    let headers = ws_headers(&token, SESSION, WORKSPACE);
+    let headers = project_headers(&token, SESSION, PROJECT);
     let err = session_info(&mut cli, &headers).await.expect_err("fail");
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
 }
@@ -660,9 +677,9 @@ async fn happy_path_attach_select_detach() {
 
     let mut cli = client(&h.endpoint).await;
     let token = format!("Bearer {}", valid_token("user-1"));
-    let headers = ws_headers(&token, SESSION, WORKSPACE);
+    let headers = project_headers(&token, SESSION, PROJECT);
 
-    // Create the session first (session_info) so the workspace binding is set.
+    // Create the session first (session_info) so the project binding is set.
     session_info(&mut cli, &headers).await.expect("session_info");
 
     // duckvis_attach.
@@ -692,7 +709,7 @@ async fn raw_attach_rejected_via_execute_action() {
     let h = base_harness().await;
     let mut cli = client(&h.endpoint).await;
     let token = format!("Bearer {}", valid_token("user-1"));
-    let headers = ws_headers(&token, SESSION, WORKSPACE);
+    let headers = project_headers(&token, SESSION, PROJECT);
     session_info(&mut cli, &headers).await.expect("session");
 
     let err = execute_sql_action(&mut cli, &headers, "ATTACH 'x.db' AS x")
@@ -706,7 +723,7 @@ async fn raw_attach_rejected_via_action_type_sql() {
     let h = base_harness().await;
     let mut cli = client(&h.endpoint).await;
     let token = format!("Bearer {}", valid_token("user-1"));
-    let headers = ws_headers(&token, SESSION, WORKSPACE);
+    let headers = project_headers(&token, SESSION, PROJECT);
     session_info(&mut cli, &headers).await.expect("session");
 
     let err = action_type_sql(&mut cli, &headers, "ATTACH 'x.db' AS x")
@@ -720,7 +737,7 @@ async fn raw_attach_rejected_in_multi_statement_batch() {
     let h = base_harness().await;
     let mut cli = client(&h.endpoint).await;
     let token = format!("Bearer {}", valid_token("user-1"));
-    let headers = ws_headers(&token, SESSION, WORKSPACE);
+    let headers = project_headers(&token, SESSION, PROJECT);
     session_info(&mut cli, &headers).await.expect("session");
 
     let err = execute_sql_action(&mut cli, &headers, "SELECT 1; ATTACH 'x.db' AS x")
@@ -734,7 +751,7 @@ async fn malformed_attach_body_is_invalid_argument() {
     let h = base_harness().await;
     let mut cli = client(&h.endpoint).await;
     let token = format!("Bearer {}", valid_token("user-1"));
-    let headers = ws_headers(&token, SESSION, WORKSPACE);
+    let headers = project_headers(&token, SESSION, PROJECT);
     session_info(&mut cli, &headers).await.expect("session");
 
     // Not JSON at all.
@@ -760,7 +777,7 @@ async fn resolve_deny_is_permission_denied() {
 
     let mut cli = client(&h.endpoint).await;
     let token = format!("Bearer {}", valid_token("user-1"));
-    let headers = ws_headers(&token, SESSION, WORKSPACE);
+    let headers = project_headers(&token, SESSION, PROJECT);
     session_info(&mut cli, &headers).await.expect("session");
 
     let err = duckvis_attach(&mut cli, &headers, BIND_ID)
@@ -777,7 +794,7 @@ async fn api_500_is_unavailable() {
 
     let mut cli = client(&h.endpoint).await;
     let token = format!("Bearer {}", valid_token("user-1"));
-    let headers = ws_headers(&token, SESSION, WORKSPACE);
+    let headers = project_headers(&token, SESSION, PROJECT);
 
     // Make authz/check return 500 → the session-creating request is unavailable.
     h.mock.fail_500.store(true, Ordering::SeqCst);
@@ -792,7 +809,7 @@ async fn second_client_different_subject_is_permission_denied() {
 
     // First client binds the session to user-1.
     let token1 = format!("Bearer {}", valid_token("user-1"));
-    let headers1 = ws_headers(&token1, SESSION, WORKSPACE);
+    let headers1 = project_headers(&token1, SESSION, PROJECT);
     session_info(&mut cli, &headers1).await.expect("session1");
 
     // Second client, different subject, reuses the same session id.
@@ -805,16 +822,16 @@ async fn second_client_different_subject_is_permission_denied() {
 }
 
 #[tokio::test]
-async fn workspace_header_mismatch_is_permission_denied() {
+async fn project_header_mismatch_is_permission_denied() {
     let h = base_harness().await;
     let mut cli = client(&h.endpoint).await;
     let token = format!("Bearer {}", valid_token("user-1"));
-    let headers = ws_headers(&token, SESSION, WORKSPACE);
+    let headers = project_headers(&token, SESSION, PROJECT);
     session_info(&mut cli, &headers).await.expect("session");
 
-    // Same subject/session but a different workspace header → denied.
-    let other_ws = "44444444-4444-4444-4444-444444444444";
-    let headers2 = ws_headers(&token, SESSION, other_ws);
+    // Same subject/session but a different project header → denied.
+    let other_project = "44444444-4444-4444-4444-444444444444";
+    let headers2 = project_headers(&token, SESSION, other_project);
     let err = session_info(&mut cli, &headers2)
         .await
         .expect_err("should be denied");
