@@ -115,6 +115,13 @@ pub struct ServerConfig {
     pub tls_cert_path: Option<String>,
     /// PEM private key for [`Self::tls_cert_path`] (`SWANLAKE_TLS_KEY_PATH`).
     pub tls_key_path: Option<String>,
+    /// Assert that TLS is terminated by an upstream proxy
+    /// (`SWANLAKE_TLS_TERMINATED_UPSTREAM`). duckvis mode carries bearer tokens
+    /// and query results and therefore refuses to serve plaintext; set this only
+    /// when a reverse proxy (or a trusted local test harness) terminates TLS in
+    /// front of the server, so the native TLS requirement is intentionally
+    /// waived.
+    pub tls_terminated_upstream: bool,
 }
 
 impl Default for ServerConfig {
@@ -149,6 +156,7 @@ impl Default for ServerConfig {
             duckvis_jwks_max_age_secs: None,
             tls_cert_path: None,
             tls_key_path: None,
+            tls_terminated_upstream: false,
         }
     }
 }
@@ -200,6 +208,16 @@ impl ServerConfig {
             }
         }
         if self.duckvis_enabled {
+            // duckvis mode authenticates with bearer tokens and returns query
+            // results; both must not cross the wire in cleartext. Require native
+            // TLS unless an upstream terminator is explicitly declared.
+            if !self.tls_enabled() && !self.tls_terminated_upstream {
+                bail!(
+                    "duckvis mode requires TLS: set SWANLAKE_TLS_CERT_PATH and \
+                     SWANLAKE_TLS_KEY_PATH, or SWANLAKE_TLS_TERMINATED_UPSTREAM=true when a \
+                     reverse proxy terminates TLS in front of the server"
+                );
+            }
             let missing: Vec<&str> = [
                 ("SWANLAKE_DUCKVIS_API_URL", self.duckvis_api_url.is_none()),
                 ("SWANLAKE_DUCKVIS_ISSUER", self.duckvis_issuer.is_none()),
@@ -261,6 +279,9 @@ mod duckvis_config_tests {
             duckvis_issuer: Some("https://api.example".to_string()),
             duckvis_client_id: Some("swanlake-test".to_string()),
             duckvis_private_key: Some(DuckvisPrivateKey::new(valid_key_b64())),
+            // These tests exercise the duckvis-field validation, not transport
+            // security; declare upstream TLS so the TLS requirement is waived.
+            tls_terminated_upstream: true,
             ..ServerConfig::default()
         }
     }
@@ -318,6 +339,27 @@ mod duckvis_config_tests {
     fn duckvis_allows_memory_database_path() {
         let mut config = enabled_config();
         config.database_path = Some(":memory:".to_string());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn duckvis_requires_tls_or_upstream_optout() {
+        let mut config = enabled_config();
+        config.tls_terminated_upstream = false;
+        config.tls_cert_path = None;
+        config.tls_key_path = None;
+        let err = config
+            .validate()
+            .expect_err("duckvis without TLS or opt-out must fail");
+        assert!(err.to_string().contains("duckvis mode requires TLS"));
+    }
+
+    #[test]
+    fn duckvis_accepts_native_tls_without_optout() {
+        let mut config = enabled_config();
+        config.tls_terminated_upstream = false;
+        config.tls_cert_path = Some("/etc/ssl/cert.pem".to_string());
+        config.tls_key_path = Some("/etc/ssl/key.pem".to_string());
         assert!(config.validate().is_ok());
     }
 
