@@ -229,9 +229,18 @@ impl SwanFlightSqlService {
             return Err(crate::duckvis::DuckvisError::PermissionDenied.into_status());
         }
 
+        // Fix the writer capability for this session's lifetime. A deny is
+        // normal and makes attachments read-only; an unavailable authorization
+        // service fails the session bind closed.
+        let writer = duckvis
+            .check_project_mutate_data(&claims.sub, &project_id)
+            .await
+            .map_err(|e| e.into_status())?;
+
         let new_auth = SessionAuth {
             subject: claims.sub.clone(),
             project_id: project_id.clone(),
+            writer,
         };
         let session = self
             .registry

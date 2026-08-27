@@ -1305,10 +1305,14 @@ struct DuckvisAttachBody {
 }
 
 /// Success payload for the `duckvis_attach` action (contract C1).
+///
+/// The nonce identifies the session incarnation populated by the attach, so a
+/// client can arm `x-expected-session-nonce` without a second round trip.
 #[derive(Debug, Serialize)]
 struct DuckvisAttachResult {
     name: String,
     attachment_id: String,
+    nonce: String,
 }
 
 /// Handle the `duckvis_attach` action (contract C1).
@@ -1357,11 +1361,14 @@ pub(crate) async fn do_action_duckvis_attach(
         .map_err(|e| e.into_status())?
         .ok_or_else(|| crate::duckvis::DuckvisError::PermissionDenied.into_status())?;
 
-    // Normalize the ATTACH statement. NOTE: `normalized` contains the secret
-    // config and must never be logged.
-    let normalized =
-        crate::duckvis::attach::normalize_attach(&resolved.secret_config, &resolved.name)
-            .map_err(|e| e.into_status())?;
+    // Non-writer sessions enforce the attachment's access mode inside DuckDB.
+    // NOTE: `normalized` contains the secret config and must never be logged.
+    let normalized = crate::duckvis::attach::normalize_attach(
+        &resolved.secret_config,
+        &resolved.name,
+        !auth.writer,
+    )
+    .map_err(|e| e.into_status())?;
 
     let attachment_name = resolved.name.clone();
     let attachment_id = resolved.attachment_id.clone();
@@ -1398,6 +1405,7 @@ pub(crate) async fn do_action_duckvis_attach(
     let result_body = serde_json::to_vec(&DuckvisAttachResult {
         name: attachment_name,
         attachment_id,
+        nonce: session.nonce().to_string(),
     })
     .map_err(|e| Status::internal(format!("failed to serialize duckvis_attach result: {e}")))?;
 

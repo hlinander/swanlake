@@ -151,7 +151,15 @@ pub fn leading_keyword(statement: &str) -> Option<String> {
 /// double-quoted, or bare) is preserved verbatim; the alias is replaced with the
 /// attachment `name` quoted as a double-quoted identifier (embedded double quotes
 /// doubled); any trailing `(...)` option block is preserved.
-pub fn normalize_attach(secret_config: &str, name: &str) -> Result<String, DuckvisError> {
+///
+/// `read_only` replaces any configured `READ_ONLY [value]` option with the bare
+/// `READ_ONLY` flag. This prevents `READ_ONLY false` from weakening a session's
+/// authorization-derived access mode.
+pub fn normalize_attach(
+    secret_config: &str,
+    name: &str,
+    read_only: bool,
+) -> Result<String, DuckvisError> {
     let statements: Vec<String> = split_top_level_statements(secret_config)
         .into_iter()
         .filter(|s| !s.trim().is_empty())
@@ -168,7 +176,11 @@ pub fn normalize_attach(secret_config: &str, name: &str) -> Result<String, Duckv
 
     let parsed = parse_attach(&statement).ok_or(DuckvisError::AttachInvalid)?;
     let alias = quote_identifier(name);
-    let options = parsed.options.trim();
+    let options = if read_only {
+        enforce_read_only(&parsed.options)
+    } else {
+        parsed.options.trim().to_string()
+    };
     let options_suffix = if options.is_empty() {
         String::new()
     } else {
@@ -178,6 +190,43 @@ pub fn normalize_attach(secret_config: &str, name: &str) -> Result<String, Duckv
         "ATTACH OR REPLACE {} AS {}{}",
         parsed.path, alias, options_suffix
     ))
+}
+
+/// Replace any existing `READ_ONLY [value]` entry and append the bare flag.
+fn enforce_read_only(options: &str) -> String {
+    let trimmed = options.trim();
+    if trimmed.is_empty() {
+        return "(READ_ONLY)".to_string();
+    }
+
+    let tokens = tokenize(trimmed);
+    let inner = if tokens.len() >= 2 {
+        &tokens[1..tokens.len() - 1]
+    } else {
+        &[]
+    };
+    let mut entries: Vec<Vec<String>> = vec![Vec::new()];
+    for token in inner {
+        if token == "," {
+            entries.push(Vec::new());
+        } else if let Some(entry) = entries.last_mut() {
+            entry.push(token.clone());
+        }
+    }
+    entries.retain(|entry| {
+        !entry.is_empty() && !entry[0].eq_ignore_ascii_case("READ_ONLY")
+    });
+    entries.push(vec!["READ_ONLY".to_string()]);
+
+    let mut output = vec!["(".to_string()];
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            output.push(",".to_string());
+        }
+        output.extend(entry.iter().cloned());
+    }
+    output.push(")".to_string());
+    rebuild_options(&output)
 }
 
 /// Set one safely-named attached catalog as the session's lookup path. The
@@ -354,13 +403,13 @@ mod tests {
 
     #[test]
     fn normalize_bare_path() {
-        let out = normalize_attach("ATTACH 'db.duckdb'", "mydb").unwrap();
+        let out = normalize_attach("ATTACH 'db.duckdb'", "mydb", false).unwrap();
         assert_eq!(out, "ATTACH OR REPLACE 'db.duckdb' AS \"mydb\"");
     }
 
     #[test]
     fn normalize_rewrites_existing_alias() {
-        let out = normalize_attach("ATTACH 'db.duckdb' AS original", "mydb").unwrap();
+        let out = normalize_attach("ATTACH 'db.duckdb' AS original", "mydb", false).unwrap();
         assert_eq!(out, "ATTACH OR REPLACE 'db.duckdb' AS \"mydb\"");
     }
 
@@ -369,6 +418,7 @@ mod tests {
         let out = normalize_attach(
             "ATTACH 'pg.db' AS pg (TYPE postgres, READ_ONLY)",
             "warehouse",
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -382,6 +432,7 @@ mod tests {
         let out = normalize_attach(
             "ATTACH OR REPLACE 'file.db' AS x (TYPE DUCKDB)",
             "attname",
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -392,7 +443,7 @@ mod tests {
 
     #[test]
     fn normalize_escapes_embedded_quotes_in_name() {
-        let out = normalize_attach("ATTACH 'db.duckdb'", "we\"ird").unwrap();
+        let out = normalize_attach("ATTACH 'db.duckdb'", "we\"ird", false).unwrap();
         assert_eq!(out, "ATTACH OR REPLACE 'db.duckdb' AS \"we\"\"ird\"");
     }
 
@@ -401,6 +452,7 @@ mod tests {
         let out = normalize_attach(
             "ATTACH 'host=x;port=5432;dbname=y' AS pg (TYPE postgres)",
             "wh",
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -410,14 +462,76 @@ mod tests {
     }
 
     #[test]
+    fn non_writer_adds_read_only_block_when_absent() {
+        let out = normalize_attach("ATTACH 'db.duckdb'", "mydb", true).unwrap();
+        assert_eq!(out, "ATTACH OR REPLACE 'db.duckdb' AS \"mydb\" (READ_ONLY)");
+    }
+
+    #[test]
+    fn non_writer_appends_read_only_to_existing_block() {
+        let out = normalize_attach(
+            "ATTACH 'pg.db' AS pg (TYPE postgres)",
+            "wh",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "ATTACH OR REPLACE 'pg.db' AS \"wh\" (TYPE postgres, READ_ONLY)"
+        );
+    }
+
+    #[test]
+    fn non_writer_does_not_duplicate_read_only() {
+        let out = normalize_attach(
+            "ATTACH 'pg.db' AS pg (TYPE postgres, READ_ONLY)",
+            "wh",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "ATTACH OR REPLACE 'pg.db' AS \"wh\" (TYPE postgres, READ_ONLY)"
+        );
+    }
+
+    #[test]
+    fn non_writer_overrides_read_only_false() {
+        let out = normalize_attach(
+            "ATTACH 'pg.db' AS pg (TYPE postgres, READ_ONLY false)",
+            "wh",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "ATTACH OR REPLACE 'pg.db' AS \"wh\" (TYPE postgres, READ_ONLY)"
+        );
+    }
+
+    #[test]
+    fn writer_preserves_attachment_options() {
+        let out = normalize_attach(
+            "ATTACH 'pg.db' AS pg (TYPE postgres, READ_ONLY false)",
+            "wh",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "ATTACH OR REPLACE 'pg.db' AS \"wh\" (TYPE postgres, READ_ONLY false)"
+        );
+    }
+
+    #[test]
     fn normalize_rejects_multi_statement() {
-        let err = normalize_attach("ATTACH 'a.db' AS a; SELECT 1", "a");
+        let err = normalize_attach("ATTACH 'a.db' AS a; SELECT 1", "a", false);
         assert!(matches!(err, Err(DuckvisError::AttachInvalid)));
     }
 
     #[test]
     fn normalize_rejects_non_attach() {
-        let err = normalize_attach("SELECT 1", "a");
+        let err = normalize_attach("SELECT 1", "a", false);
         assert!(matches!(err, Err(DuckvisError::AttachInvalid)));
     }
 

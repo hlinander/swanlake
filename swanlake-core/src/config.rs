@@ -109,6 +109,15 @@ pub struct ServerConfig {
     /// Fallback max-age (seconds) for the JWKS cache when the response omits
     /// `Cache-Control: max-age`. Defaults to 300 when unset.
     pub duckvis_jwks_max_age_secs: Option<u64>,
+    /// PEM certificate chain for native Flight TLS
+    /// (`SWANLAKE_TLS_CERT_PATH`). Requires [`Self::tls_key_path`].
+    pub tls_cert_path: Option<String>,
+    /// PEM private key for native Flight TLS (`SWANLAKE_TLS_KEY_PATH`).
+    /// Requires [`Self::tls_cert_path`].
+    pub tls_key_path: Option<String>,
+    /// Assert that a proxy terminates TLS before traffic reaches SwanLake
+    /// (`SWANLAKE_TLS_TERMINATED_UPSTREAM`). This does not enable encryption.
+    pub tls_terminated_upstream: bool,
 }
 
 impl Default for ServerConfig {
@@ -141,6 +150,9 @@ impl Default for ServerConfig {
             duckvis_client_id: None,
             duckvis_private_key: None,
             duckvis_jwks_max_age_secs: None,
+            tls_cert_path: None,
+            tls_key_path: None,
+            tls_terminated_upstream: false,
         }
     }
 }
@@ -170,7 +182,17 @@ impl ServerConfig {
             .ok_or_else(|| anyhow::anyhow!("unable to resolve bind address for {addr}"))
     }
 
+    /// Native TLS is active when both PEM paths are configured.
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_cert_path.is_some() && self.tls_key_path.is_some()
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
+        if self.tls_cert_path.is_some() != self.tls_key_path.is_some() {
+            bail!(
+                "SWANLAKE_TLS_CERT_PATH and SWANLAKE_TLS_KEY_PATH must be set together (or both unset)"
+            );
+        }
         if let Some(hours) = self.checkpoint_interval_hours {
             if hours == 0 {
                 bail!("SWANLAKE_CHECKPOINT_INTERVAL_HOURS must be greater than 0");
@@ -182,6 +204,13 @@ impl ServerConfig {
             }
         }
         if self.duckvis_enabled {
+            if !self.tls_enabled() && !self.tls_terminated_upstream {
+                bail!(
+                    "duckvis mode requires TLS: set SWANLAKE_TLS_CERT_PATH and \
+                     SWANLAKE_TLS_KEY_PATH, or set SWANLAKE_TLS_TERMINATED_UPSTREAM=true only \
+                     when a proxy terminates TLS before SwanLake"
+                );
+            }
             let missing: Vec<&str> = [
                 ("SWANLAKE_DUCKVIS_API_URL", self.duckvis_api_url.is_none()),
                 ("SWANLAKE_DUCKVIS_ISSUER", self.duckvis_issuer.is_none()),
@@ -243,6 +272,7 @@ mod duckvis_config_tests {
             duckvis_issuer: Some("https://api.example".to_string()),
             duckvis_client_id: Some("swanlake-test".to_string()),
             duckvis_private_key: Some(DuckvisPrivateKey::new(valid_key_b64())),
+            tls_terminated_upstream: true,
             ..ServerConfig::default()
         }
     }
@@ -301,6 +331,34 @@ mod duckvis_config_tests {
         let mut config = enabled_config();
         config.database_path = Some(":memory:".to_string());
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn tls_certificate_and_key_must_be_configured_together() {
+        let config = ServerConfig {
+            tls_cert_path: Some("/run/cert.pem".to_string()),
+            ..ServerConfig::default()
+        };
+        let err = config.validate().expect_err("certificate without key");
+        assert!(err.to_string().contains("must be set together"));
+    }
+
+    #[test]
+    fn duckvis_requires_native_or_upstream_tls() {
+        let mut config = enabled_config();
+        config.tls_terminated_upstream = false;
+        let err = config.validate().expect_err("plaintext Duckvis mode");
+        assert!(err.to_string().contains("duckvis mode requires TLS"));
+    }
+
+    #[test]
+    fn duckvis_accepts_native_tls() {
+        let mut config = enabled_config();
+        config.tls_terminated_upstream = false;
+        config.tls_cert_path = Some("/run/cert.pem".to_string());
+        config.tls_key_path = Some("/run/key.pem".to_string());
+        assert!(config.validate().is_ok());
+        assert!(config.tls_enabled());
     }
 
     #[test]

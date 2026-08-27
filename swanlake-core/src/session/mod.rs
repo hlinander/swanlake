@@ -130,12 +130,14 @@ impl SchemaCache {
     }
 }
 
-/// Authentication binding for a duckvis-mode session: the token subject and the
-/// project the session is scoped to.
+/// Authentication binding for a duckvis-mode session: the token subject, the
+/// project scope, and the `Project.mutate_data` capability fixed at session
+/// creation. Non-writer sessions arm attachments read-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionAuth {
     pub subject: String,
     pub project_id: String,
+    pub writer: bool,
 }
 
 /// A client session with dedicated connection and state
@@ -754,6 +756,7 @@ mod guard_tests {
         session_with_auth(Some(SessionAuth {
             subject: "sub-1".to_string(),
             project_id: "project-1".to_string(),
+            writer: false,
         }))
     }
 

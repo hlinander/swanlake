@@ -108,6 +108,8 @@ struct MockState {
     jwks_hits: AtomicU64,
     /// authz/check returns this allow value.
     check_allow: AtomicBool,
+    /// Project.mutate_data returns this allow value.
+    mutate_allow: AtomicBool,
     /// resolve-attachment returns this allow value.
     resolve_allow: AtomicBool,
     /// The secret_config to serve from resolve-attachment.
@@ -125,6 +127,7 @@ impl MockState {
     fn new() -> Self {
         let s = MockState::default();
         s.check_allow.store(true, Ordering::SeqCst);
+        s.mutate_allow.store(false, Ordering::SeqCst);
         s.resolve_allow.store(true, Ordering::SeqCst);
         *s.secret_config.lock().unwrap_or_else(|p| p.into_inner()) = String::new();
         *s.attachment_name.lock().unwrap_or_else(|p| p.into_inner()) = "attname".to_string();
@@ -256,13 +259,18 @@ async fn spawn_mock_api(state: Arc<MockState>) -> String {
         if state.fail_500.load(Ordering::SeqCst) {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({}))).into_response();
         }
-        if body.get("permission").and_then(Value::as_str) != Some("Project.view")
+        let permission = body.get("permission").and_then(Value::as_str);
+        if !matches!(permission, Some("Project.view" | "Project.mutate_data"))
             || body.pointer("/object/kind").and_then(Value::as_str) != Some("project")
             || body.pointer("/object/id").and_then(Value::as_str) != Some(PROJECT)
         {
             return (StatusCode::BAD_REQUEST, Json(json!({}))).into_response();
         }
-        let allow = state.check_allow.load(Ordering::SeqCst);
+        let allow = match permission {
+            Some("Project.view") => state.check_allow.load(Ordering::SeqCst),
+            Some("Project.mutate_data") => state.mutate_allow.load(Ordering::SeqCst),
+            _ => false,
+        };
         (StatusCode::OK, Json(json!({ "allow": allow }))).into_response()
     }
 
@@ -681,6 +689,8 @@ async fn happy_path_attach_select_detach() {
 
     // Create the session first (session_info) so the project binding is set.
     session_info(&mut cli, &headers).await.expect("session_info");
+    // The mutate decision is fixed at session creation.
+    h.mock.mutate_allow.store(true, Ordering::SeqCst);
 
     // duckvis_attach.
     let result = duckvis_attach(&mut cli, &headers, BIND_ID)
@@ -691,6 +701,7 @@ async fn happy_path_attach_select_detach() {
         result["attachment_id"],
         json!("11111111-1111-1111-1111-111111111111")
     );
+    assert!(result["nonce"].as_str().is_some_and(|nonce| !nonce.is_empty()));
 
     // Cross-catalog SELECT works.
     let batches = run_select(&mut cli, &headers, "SELECT id FROM wh.t")
@@ -698,10 +709,47 @@ async fn happy_path_attach_select_detach() {
         .expect("select ok");
     assert!(batches >= 1, "expected data from cross-catalog select");
 
+    let err = execute_sql_action(&mut cli, &headers, "INSERT INTO wh.t VALUES (8)")
+        .await
+        .expect_err("non-writer attachment should be read-only");
+    assert_eq!(err.code(), tonic::Code::Internal);
+
     // DETACH is allowed.
     execute_sql_action(&mut cli, &headers, "DETACH wh")
         .await
         .expect("detach ok");
+}
+
+#[tokio::test]
+async fn project_writer_can_mutate_attachment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("writer.duckdb");
+    {
+        let conn = duckdb::Connection::open(&db_path).expect("open temp db");
+        conn.execute_batch("CREATE TABLE t(id INTEGER);")
+            .expect("seed temp db");
+    }
+    let db_path_str = db_path.to_string_lossy().replace('\\', "/");
+
+    let mock = Arc::new(MockState::new());
+    mock.mutate_allow.store(true, Ordering::SeqCst);
+    *mock.secret_config.lock().unwrap_or_else(|p| p.into_inner()) =
+        format!("ATTACH '{db_path_str}' AS ignored_alias");
+    *mock.attachment_name.lock().unwrap_or_else(|p| p.into_inner()) = "wh".to_string();
+    let api_url = spawn_mock_api(mock.clone()).await;
+    let h = spawn_server(&api_url, mock).await;
+
+    let mut cli = client(&h.endpoint).await;
+    let token = format!("Bearer {}", valid_token("writer-1"));
+    let headers = project_headers(&token, SESSION, PROJECT);
+    session_info(&mut cli, &headers).await.expect("session_info");
+    duckvis_attach(&mut cli, &headers, BIND_ID)
+        .await
+        .expect("attach ok");
+
+    execute_sql_action(&mut cli, &headers, "INSERT INTO wh.t VALUES (8)")
+        .await
+        .expect("writer insert");
 }
 
 #[tokio::test]

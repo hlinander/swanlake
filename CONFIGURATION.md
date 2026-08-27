@@ -17,6 +17,9 @@ and boolean flags accept `true/false` (case-insensitive).
 | `SWANLAKE_HOST` | gRPC bind address | `0.0.0.0` |
 | `SWANLAKE_PORT` | gRPC listening port | `4214` |
 | `SWANLAKE_ADVERTISE_HOST` | Host advertised in FlightEndpoint locations (the address clients use to connect back) | `localhost` |
+| `SWANLAKE_TLS_CERT_PATH` | PEM certificate chain for native Flight TLS; requires `SWANLAKE_TLS_KEY_PATH` | _(unset)_ |
+| `SWANLAKE_TLS_KEY_PATH` | PEM private key for native Flight TLS; requires `SWANLAKE_TLS_CERT_PATH` | _(unset)_ |
+| `SWANLAKE_TLS_TERMINATED_UPSTREAM` | Assert that a proxy terminates TLS before SwanLake; does not enable encryption | `false` |
 | `SWANLAKE_MAX_SESSIONS` | Maximum concurrent sessions | `100` |
 | `SWANLAKE_SESSION_TIMEOUT_SECONDS` | Idle timeout before cleanup | `900` (15 min) |
 | `SWANLAKE_SESSION_ID_MODE` | Session identifier source: `peer_addr` (IP:port) or `peer_ip` (IP only) | `peer_addr` |
@@ -118,6 +121,10 @@ rejected on every SQL path in this mode; `DETACH` remains available.
 | `SWANLAKE_DUCKVIS_JWKS_MAX_AGE_SECS` | Fallback JWKS cache max-age (seconds) when the response omits `Cache-Control: max-age` | `300` |
 
 Notes:
+- Duckvis mode requires native Flight TLS or an actual upstream TLS terminator. Native TLS advertises
+  Flight locations as `grpc+tls://`; plaintext Duckvis mode fails at startup. Set
+  `SWANLAKE_TLS_TERMINATED_UPSTREAM=true` only when clients connect through the terminator and direct
+  access to SwanLake's plaintext listener is blocked.
 - When `SWANLAKE_DUCKVIS_ENABLED=true`, all four of `SWANLAKE_DUCKVIS_API_URL`,
   `SWANLAKE_DUCKVIS_ISSUER`, `SWANLAKE_DUCKVIS_CLIENT_ID`, and `SWANLAKE_DUCKVIS_PRIVATE_KEY` are
   required; startup fails otherwise. `SWANLAKE_DUCKVIS_PRIVATE_KEY` must decode to exactly 32 bytes;

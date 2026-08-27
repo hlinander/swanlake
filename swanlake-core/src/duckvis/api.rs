@@ -64,7 +64,28 @@ impl DuckvisAuth {
         subject: &str,
         project_id: &str,
     ) -> Result<bool, DuckvisError> {
-        let body = project_view_check_request(subject, project_id);
+        self.check_project(subject, project_id, "Project.view").await
+    }
+
+    /// `POST {api}/v1/authz/check` for `Project.mutate_data`, fixed for the
+    /// session lifetime. A deny arms attachments read-only; an unavailable
+    /// authorization service fails the session bind closed.
+    pub async fn check_project_mutate_data(
+        &self,
+        subject: &str,
+        project_id: &str,
+    ) -> Result<bool, DuckvisError> {
+        self.check_project(subject, project_id, "Project.mutate_data")
+            .await
+    }
+
+    async fn check_project(
+        &self,
+        subject: &str,
+        project_id: &str,
+        permission: &str,
+    ) -> Result<bool, DuckvisError> {
+        let body = project_check_request(subject, project_id, permission);
         let url = format!("{}/v1/authz/check", self.api_url.trim_end_matches('/'));
 
         let resp: CheckResponse = self.post_json_with_retry(&url, &body).await?;
@@ -183,10 +204,14 @@ impl DuckvisAuth {
     }
 }
 
-fn project_view_check_request<'a>(subject: &'a str, project_id: &'a str) -> CheckRequest<'a> {
+fn project_check_request<'a>(
+    subject: &'a str,
+    project_id: &'a str,
+    permission: &'a str,
+) -> CheckRequest<'a> {
     CheckRequest {
         subject,
-        permission: "Project.view",
+        permission,
         object: CheckObject {
             kind: "project",
             id: project_id,
@@ -214,13 +239,28 @@ mod tests {
 
     #[test]
     fn project_view_check_matches_duckvis_api_contract() -> Result<(), serde_json::Error> {
-        let request = project_view_check_request("subject-1", "project-1");
+        let request = project_check_request("subject-1", "project-1", "Project.view");
 
         assert_eq!(
             serde_json::to_value(request)?,
             json!({
                 "subject": "subject-1",
                 "permission": "Project.view",
+                "object": { "kind": "project", "id": "project-1" }
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn project_mutate_data_check_matches_duckvis_api_contract() -> Result<(), serde_json::Error> {
+        let request = project_check_request("subject-1", "project-1", "Project.mutate_data");
+
+        assert_eq!(
+            serde_json::to_value(request)?,
+            json!({
+                "subject": "subject-1",
+                "permission": "Project.mutate_data",
                 "object": { "kind": "project", "id": "project-1" }
             })
         );
