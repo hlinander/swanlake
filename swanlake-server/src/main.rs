@@ -9,6 +9,8 @@ use swanlake_core::service::SwanFlightService;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 use tracing::info;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
 mod status;
@@ -161,6 +163,25 @@ async fn main() -> Result<()> {
 fn init_tracing(config: &ServerConfig) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,swanlake::service=debug"));
+
+    // Under systemd, reach the journal through its native socket instead of
+    // formatting to stdout. Formatted output carries severity only inside the
+    // text, so journald stamps every line PRIORITY 6 and an ERROR becomes
+    // indistinguishable from an INFO once ingested — no log store can filter on
+    // level. On this path PRIORITY derives from the tracing level and event
+    // fields become journal fields, queryable individually.
+    //
+    // Span lifecycle events have no journald equivalent and are dropped here;
+    // the span an event was emitted from still rides along as SPAN_NAME.
+    if std::env::var_os("JOURNAL_STREAM").is_some() {
+        if let Ok(journald) = tracing_journald::layer() {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(journald)
+                .init();
+            return;
+        }
+    }
 
     if config.log_format == "json" {
         tracing_subscriber::fmt()
