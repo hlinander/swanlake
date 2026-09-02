@@ -159,6 +159,19 @@ impl SessionRegistry {
         inner.sessions.get(session_id).map(|entry| entry.session.clone())
     }
 
+    /// Remove an explicitly closed session and release its capacity permit.
+    /// Any in-flight request keeps its `Arc<Session>` alive until that request
+    /// completes, while future requests with the same id create a fresh
+    /// session incarnation and therefore receive a new nonce.
+    pub fn remove(&self, session_id: &SessionId) -> bool {
+        self.inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sessions
+            .remove(session_id)
+            .is_some()
+    }
+
     /// Get or create session by session ID.
     ///
     /// Each session ID gets its own dedicated DuckDB connection, providing
@@ -365,6 +378,27 @@ mod tests {
             .err()
             .ok_or_else(|| anyhow!("expected max-sessions error for second session"))?;
         assert!(matches!(err, ServerError::MaxSessionsReached));
+        assert_eq!(registry.snapshot().total_sessions, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_remove_releases_session_capacity() -> Result<()> {
+        let (registry, _) = build_registry(1, 60)?;
+        let first = SessionId::from_string("peer:first".to_string());
+        let second = SessionId::from_string("peer:second".to_string());
+
+        registry
+            .get_or_create_by_id(&first)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?;
+        assert!(registry.remove(&first));
+        assert!(!registry.remove(&first));
+        registry
+            .get_or_create_by_id(&second)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?;
+
         assert_eq!(registry.snapshot().total_sessions, 1);
         Ok(())
     }

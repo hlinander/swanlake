@@ -339,6 +339,7 @@ impl FlightSqlService for SwanFlightSqlService {
             "endpoints" => action::do_action_endpoints(self, request).await,
             "execute" => action::do_action_execute(self, request).await,
             "session_info" => action::do_action_session_info(self, request).await,
+            "close_session" => action::do_action_close_session(self, request).await,
             "duckvis_attach" => action::do_action_duckvis_attach(self, request).await,
             _ => {
                 // Check if the action type itself is SQL (Airport uses this pattern for DDL)

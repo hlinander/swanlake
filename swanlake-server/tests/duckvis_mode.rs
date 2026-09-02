@@ -341,6 +341,7 @@ async fn spawn_mock_api(state: Arc<MockState>) -> String {
 struct Harness {
     endpoint: String,
     mock: Arc<MockState>,
+    registry: Arc<SessionRegistry>,
 }
 
 async fn spawn_server(api_url: &str, mock: Arc<MockState>) -> Harness {
@@ -368,7 +369,7 @@ async fn spawn_server(api_url: &str, mock: Arc<MockState>) -> Harness {
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
     let service = SwanFlightService::with_duckvis(
-        registry,
+        Arc::clone(&registry),
         metrics,
         SessionIdMode::PeerAddr,
         format!("grpc://{addr}"),
@@ -390,6 +391,7 @@ async fn spawn_server(api_url: &str, mock: Arc<MockState>) -> Harness {
     Harness {
         endpoint: format!("http://{addr}"),
         mock,
+        registry,
     }
 }
 
@@ -433,6 +435,22 @@ async fn session_info(
     };
     let mut stream = cli.do_action(with_headers(action, headers)).await?.into_inner();
     // Drain the stream.
+    while let Some(item) = futures::StreamExt::next(&mut stream).await {
+        item?;
+    }
+    Ok(())
+}
+
+/// Close the current session and drain the acknowledgement stream.
+async fn close_session(
+    cli: &mut FlightServiceClient<Channel>,
+    headers: &[(&str, &str)],
+) -> Result<(), tonic::Status> {
+    let action = Action {
+        r#type: "close_session".to_string(),
+        body: Default::default(),
+    };
+    let mut stream = cli.do_action(with_headers(action, headers)).await?.into_inner();
     while let Some(item) = futures::StreamExt::next(&mut stream).await {
         item?;
     }
@@ -662,6 +680,36 @@ async fn authz_check_deny_is_permission_denied() {
     let headers = project_headers(&token, SESSION, PROJECT);
     let err = session_info(&mut cli, &headers).await.expect_err("fail");
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn explicit_close_releases_only_the_callers_session() {
+    let h = base_harness().await;
+    let mut cli = client(&h.endpoint).await;
+    let owner_token = format!("Bearer {}", valid_token("user-1"));
+    let owner_headers = project_headers(&owner_token, SESSION, PROJECT);
+    session_info(&mut cli, &owner_headers)
+        .await
+        .expect("create owner session");
+    assert_eq!(h.registry.snapshot().total_sessions, 1);
+
+    let other_token = format!("Bearer {}", valid_token("user-2"));
+    let other_headers = project_headers(&other_token, SESSION, PROJECT);
+    let err = close_session(&mut cli, &other_headers)
+        .await
+        .expect_err("another subject cannot close the session");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert_eq!(h.registry.snapshot().total_sessions, 1);
+
+    close_session(&mut cli, &owner_headers)
+        .await
+        .expect("owner closes session");
+    assert_eq!(h.registry.snapshot().total_sessions, 0);
+
+    session_info(&mut cli, &owner_headers)
+        .await
+        .expect("same id creates a fresh session");
+    assert_eq!(h.registry.snapshot().total_sessions, 1);
 }
 
 #[tokio::test]

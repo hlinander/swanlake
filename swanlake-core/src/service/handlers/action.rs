@@ -1253,6 +1253,27 @@ pub(crate) async fn do_action_session_info(
     Ok(Response::new(Box::pin(stream::iter(vec![Ok(result)]))))
 }
 
+/// Explicitly close the current session and release its registry capacity.
+/// `prepare_request` applies the ordinary token/project/nonce checks before
+/// removal, so a caller cannot close a differently bound Duckvis session by
+/// guessing its id.
+pub(crate) async fn do_action_close_session(
+    service: &SwanFlightSqlService,
+    request: Request<Action>,
+) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
+    let session_id = service.extract_session_id(&request);
+    let session = service.prepare_request(&request).await?;
+    drop(session);
+
+    let removed = service.registry.remove(&session_id);
+    info!(%session_id, removed, "closed session");
+
+    let result = arrow_flight::Result {
+        body: Vec::<u8>::new().into(),
+    };
+    Ok(Response::new(Box::pin(stream::iter(vec![Ok(result)]))))
+}
+
 /// Handle SQL passed directly as the action type (Airport pattern for DDL)
 /// The action type itself contains the SQL to execute
 pub(crate) async fn do_action_execute_sql(

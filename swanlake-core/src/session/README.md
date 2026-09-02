@@ -7,7 +7,7 @@ SwanLake keeps all database state inside **connection-scoped sessions**. Each gR
 - Session ID comes from `Request::remote_addr()` (e.g., `ip:port`); if unavailable, a random UUID is used.
 - On first use, the `SessionRegistry` creates a DuckDB connection via `EngineFactory`, installs DuckLake/HTTPFS/AWS/Postgres, and runs any configured `ducklake_init_sql`.
 - Subsequent requests on the same connection reuse the existing session.
-- Idle sessions are removed when `idle_duration() > session_timeout_seconds` (default 900s / 15 min). The janitor runs every 5 minutes.
+- Clients can release a session immediately with the `close_session` Flight action. Idle sessions are removed when `idle_duration() > session_timeout_seconds` (default 900s / 15 min) as a fallback; the janitor runs every 5 minutes.
 - The registry enforces `max_sessions` (default 100). Errors surface as `ServerError::MaxSessionsReached`.
 
 ## Session State

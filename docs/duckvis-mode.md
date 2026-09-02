@@ -93,6 +93,14 @@ statement's leading keyword is `ATTACH` (case-insensitive, after whitespace/comm
 literals or comments is not a match. `DETACH` remains allowed. Only the `duckvis_attach` handler's
 privileged execute path may run an ATTACH.
 
+## C7 — Explicit session close
+
+Long-running clients that mint distinct `airport-client-session-id` values call the
+`close_session` Flight action when a session is no longer needed. The action uses an empty body and
+the ordinary session headers. In Duckvis mode, the bearer subject, project binding, and optional
+nonce are verified before the session is removed and its capacity permit is released. Idle cleanup
+remains the fallback for clients that disconnect without closing.
+
 ## Swanlake configuration (env, `SWANLAKE_` prefix)
 
 `duckvis_enabled` (bool), `duckvis_api_url`, `duckvis_issuer`, `duckvis_client_id`,
