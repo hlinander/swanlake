@@ -30,6 +30,12 @@ cargo run --bin swanlake-cli --features="cli"
 - **Arrow Flight SQL Server**: High-performance SQL interface over gRPC for efficient querying.
 - **DuckLake**: Extensions for datalake integrations, supporting scalable storage solutions.
 
+Single read queries return VARIANT columns as JSON through Arrow Flight. SwanLake
+also converts an entire output column to JSON when its type contains nested
+VARIANT values. Stored types and computations inside the query retain VARIANT
+semantics; SQL NULLs remain NULL. Schema discovery and streaming apply the same
+result conversion, including prepared queries with parameters.
+
 ## Use Cases
 
 - Building datalakes on Postgres and S3 for unified data access.

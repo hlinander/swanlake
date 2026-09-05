@@ -13,6 +13,7 @@ use duckdb::{ArrowStream, Statement};
 use tokio::sync::mpsc;
 use tracing::{debug, info, instrument};
 
+use super::result_projection;
 use crate::error::ServerError;
 
 use crate::types::duckdb_type_to_arrow;
@@ -77,7 +78,7 @@ impl DuckDbConnection {
     pub fn schema_for_query(&self, sql: &str) -> Result<Schema, ServerError> {
         let trimmed_sql = sql.trim_end_matches(';').trim();
 
-        self.with_prepared(trimmed_sql, |stmt| {
+        self.with_arrow_prepared(trimmed_sql, None, false, |stmt| {
             let stream = Self::stream_arrow_with_params(stmt, None)?;
             let schema = stream.get_schema();
             debug!(field_count = schema.fields().len(), "retrieved schema");
@@ -89,19 +90,16 @@ impl DuckDbConnection {
     /// avoid materializing data, except for statements like EXPLAIN that can't
     /// be used as subqueries.
     pub fn schema_for_streaming(&self, sql: &str) -> Result<Schema, ServerError> {
-        let trimmed = sql.trim_start();
-        if trimmed.starts_with("EXPLAIN") || trimmed.starts_with("explain") {
-            self.schema_for_query(sql)
-        } else {
-            let schema_sql = format!("SELECT * FROM ({}) LIMIT 0", sql.trim_end_matches(';').trim());
-            self.schema_for_query(&schema_sql)
-        }
+        self.with_arrow_prepared(sql, None, true, |stmt| {
+            let stream = Self::stream_arrow_with_params(stmt, None)?;
+            Ok(stream.get_schema().as_ref().clone())
+        })
     }
 
     /// Execute a SELECT query and return results
     #[instrument(skip(self), fields(sql = %sql))]
     pub fn execute_query(&self, sql: &str) -> Result<QueryResult, ServerError> {
-        self.with_prepared(sql, |stmt| {
+        self.with_arrow_prepared(sql, None, false, |stmt| {
             let arrow = Self::stream_arrow_with_params(stmt, None)?;
             let schema = arrow.get_schema();
             let result = Self::collect_query_result(schema, arrow);
@@ -146,7 +144,7 @@ impl DuckDbConnection {
         }
 
         // Now execute the full query in true streaming mode
-        self.with_prepared(sql, |stmt| {
+        self.with_arrow_prepared(sql, None, false, |stmt| {
             let arrow = Self::stream_arrow_with_params(stmt, None)?;
             let schema = arrow.get_schema();
 
@@ -228,7 +226,7 @@ impl DuckDbConnection {
         }
 
         // Now execute the full query in true streaming mode
-        self.with_prepared(sql, |stmt| {
+        self.with_arrow_prepared(sql, Some(params), false, |stmt| {
             let arrow = Self::stream_arrow_with_params(stmt, Some(params))?;
             let schema = arrow.get_schema();
 
@@ -292,7 +290,7 @@ impl DuckDbConnection {
         sql: &str,
         params: &[Value],
     ) -> Result<QueryResult, ServerError> {
-        self.with_prepared(sql, |stmt| {
+        self.with_arrow_prepared(sql, Some(params), false, |stmt| {
             let arrow = Self::stream_arrow_with_params(stmt, Some(params))?;
             let schema = arrow.get_schema();
             let result = Self::collect_query_result(schema, arrow);
@@ -435,11 +433,32 @@ impl DuckDbConnection {
                     row.get::<_, String>(2)?, // null (YES or NO)
                 ))
             })
-            .map_err(ServerError::DuckDb)?;
+            .map_err(ServerError::DuckDb)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if rows
+            .iter()
+            .any(|(_, ty, _)| result_projection::contains_variant(ty))
+        {
+            let sql = format!("SELECT * FROM {table_name}");
+            if let Some(projection) = result_projection::for_query(&conn, &sql, None)? {
+                let mut projected = conn.prepare(&format!("{projection} LIMIT 0"))?;
+                let stream = Self::stream_arrow_with_params(&mut projected, None)?;
+                let schema = stream.get_schema();
+                let fields = schema
+                    .fields()
+                    .iter()
+                    .zip(&rows)
+                    .map(|(field, (_, _, nullable))| {
+                        field.as_ref().clone().with_nullable(nullable == "YES")
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(Schema::new_with_metadata(fields, schema.metadata().clone()));
+            }
+        }
 
         let mut fields = Vec::new();
-        for row in rows {
-            let (name, duckdb_type, null_str) = row.map_err(ServerError::DuckDb)?;
+        for (name, duckdb_type, null_str) in rows {
             let data_type = duckdb_type_to_arrow(&duckdb_type)?;
             let nullable = null_str == "YES";
             fields.push(Field::new(&name, data_type, nullable));
@@ -471,6 +490,40 @@ impl DuckDbConnection {
             ));
         }
         Ok(())
+    }
+
+    /// Apply output conversion before schema discovery or Arrow execution.
+    fn with_arrow_prepared<T, F>(
+        &self,
+        sql: &str,
+        params: Option<&[Value]>,
+        schema_only: bool,
+        f: F,
+    ) -> Result<T, ServerError>
+    where
+        F: FnOnce(&mut Statement) -> Result<T, ServerError>,
+    {
+        Self::validate_sql(sql)?;
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let projection = result_projection::for_query(&conn, sql, params)?;
+        let query = match projection {
+            Some(query) if schema_only => format!("{query} LIMIT 0"),
+            Some(query) => query,
+            None if schema_only
+                && !sql.trim_start().to_ascii_uppercase().starts_with("EXPLAIN") =>
+            {
+                format!(
+                    "SELECT * FROM ({}) LIMIT 0",
+                    sql.trim_end_matches(';').trim()
+                )
+            }
+            None => sql.to_string(),
+        };
+        let mut stmt = conn.prepare(&query)?;
+        f(&mut stmt)
     }
 
     /// Prepare a statement under the connection lock and run the provided closure.
@@ -587,6 +640,181 @@ mod tests {
         assert_eq!(
             result.schema.field(1).data_type(),
             &arrow_schema::DataType::Utf8
+        );
+    }
+
+    fn json_cell(result: &QueryResult, column: usize, row: usize) -> serde_json::Value {
+        let values = result.batches[0]
+            .column(column)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        serde_json::from_str(values.value(row)).unwrap()
+    }
+
+    #[test]
+    fn variant_results_convert_without_changing_storage_or_query_semantics() {
+        let conn = test_connection();
+        conn.execute_batch(
+            "CREATE TABLE run(id INTEGER, config VARIANT); \
+            INSERT INTO run VALUES (1, {'width': 64, 'tags': ['a', 'b']}::VARIANT), \
+            (2, {'dataset': 'test'}::VARIANT), (3, NULL);",
+        )
+        .unwrap();
+        let sql = "SELECT * FROM run ORDER BY id";
+        let schema = conn.schema_for_streaming(sql).unwrap();
+        let result = conn.execute_query(sql).unwrap();
+        assert_eq!(schema, result.schema);
+        assert_eq!(conn.table_schema("run").unwrap(), result.schema);
+        assert_eq!(
+            result.schema.field(0).data_type(),
+            &arrow_schema::DataType::Int32
+        );
+        assert_eq!(
+            result.schema.field(1).data_type(),
+            &arrow_schema::DataType::Utf8
+        );
+        assert_eq!(
+            json_cell(&result, 1, 0),
+            serde_json::json!({"width": 64, "tags": ["a", "b"]})
+        );
+        assert_eq!(
+            json_cell(&result, 1, 1),
+            serde_json::json!({"dataset": "test"})
+        );
+        assert!(result.batches[0].column(1).is_null(2));
+        let filtered = conn
+            .execute_query(
+                "SELECT config.width AS width FROM run \
+            WHERE typeof(config) = 'VARIANT' AND config.width::INTEGER = 64",
+            )
+            .unwrap();
+        assert_eq!(filtered.total_rows, 1);
+        assert_eq!(json_cell(&filtered, 0, 0), serde_json::json!(64));
+    }
+
+    #[test]
+    fn variant_results_preserve_duplicate_names_and_sql_comments() {
+        let conn = test_connection();
+        let sql = "-- leading comment\nSELECT 42::VARIANT AS \"x\"\";雪\", \
+            7 AS \"x\"\";雪\"; -- trailing comment";
+        let result = conn.execute_query(sql).unwrap();
+        assert_eq!(result.schema.field(0).name(), "x\";雪");
+        assert_eq!(result.schema.field(1).name(), "x\";雪");
+        assert_eq!(json_cell(&result, 0, 0), serde_json::json!(42));
+        assert_eq!(
+            result.schema.field(1).data_type(),
+            &arrow_schema::DataType::Int32
+        );
+        assert_eq!(conn.schema_for_streaming(sql).unwrap(), result.schema);
+    }
+
+    #[test]
+    fn variant_results_convert_nested_containers_only_when_needed() {
+        let conn = test_connection();
+        let result = conn
+            .execute_query(
+                "SELECT [42::VARIANT, NULL] AS list, \
+            {'v': 3::VARIANT} AS object, map(['v'], [4::VARIANT]) AS map, \
+            [5::VARIANT]::VARIANT[1] AS array, {'VARIANT': 6} AS ordinary, \
+            union_value(v := 7::VARIANT) AS union_value",
+            )
+            .unwrap();
+        assert_eq!(json_cell(&result, 0, 0), serde_json::json!([42, null]));
+        assert_eq!(json_cell(&result, 1, 0), serde_json::json!({"v": 3}));
+        assert_eq!(json_cell(&result, 2, 0), serde_json::json!({"v": 4}));
+        assert_eq!(json_cell(&result, 3, 0), serde_json::json!([5]));
+        assert!(matches!(
+            result.schema.field(4).data_type(),
+            arrow_schema::DataType::Struct(_)
+        ));
+        assert_eq!(json_cell(&result, 5, 0), serde_json::json!({"v": 7}));
+    }
+
+    #[test]
+    fn variant_results_match_schema_for_parameterized_and_plain_streams() {
+        let conn = test_connection();
+        for parameterized in [false, true] {
+            let sql = if parameterized {
+                "SELECT ?::VARIANT AS config"
+            } else {
+                "SELECT 64::VARIANT AS config"
+            };
+            let schema = conn.schema_for_query(sql).unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            if parameterized {
+                let collected = conn
+                    .execute_query_with_params(sql, &[Value::Int(64)])
+                    .unwrap();
+                assert_eq!(json_cell(&collected, 0, 0), serde_json::json!(64));
+                conn.execute_query_with_params_streaming(sql, &[Value::Int(64)], tx, None)
+                    .unwrap();
+            } else {
+                conn.execute_query_streaming(sql, tx, None).unwrap();
+            }
+            let Some(StreamingBatch::Schema(actual)) = rx.blocking_recv() else {
+                panic!("missing schema")
+            };
+            assert_eq!(schema, actual);
+            let Some(StreamingBatch::Batch(batch)) = rx.blocking_recv() else {
+                panic!("missing batch")
+            };
+            assert_eq!(batch.schema().as_ref(), &schema);
+            let value = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            assert_eq!(value.value(0), "64");
+            assert!(matches!(
+                rx.blocking_recv(),
+                Some(StreamingBatch::Done { total_rows: 1, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn variant_results_evaluate_rows_once_and_keep_json_metadata() {
+        let conn = test_connection();
+        conn.execute_batch("CREATE SEQUENCE s; SET arrow_lossless_conversion = true;")
+            .unwrap();
+        let sql = "SELECT nextval('s')::VARIANT AS v FROM range(3)";
+        let schema = conn.schema_for_streaming(sql).unwrap();
+        let result = conn.execute_query(sql).unwrap();
+        assert_eq!(schema, result.schema);
+        for i in 0..3 {
+            assert_eq!(json_cell(&result, 0, i), serde_json::json!(i + 1));
+        }
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str),
+            Some("arrow.json")
+        );
+        conn.execute_batch("CREATE TABLE run(config VARIANT NOT NULL)")
+            .unwrap();
+        let table_schema = conn.table_schema("run").unwrap();
+        assert_eq!(table_schema.field(0).metadata(), schema.field(0).metadata());
+        assert!(!table_schema.field(0).is_nullable());
+    }
+
+    #[test]
+    fn variant_results_leave_commands_and_batches_on_the_existing_path() {
+        let conn = test_connection();
+        conn.execute_batch("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute_query("WITH source AS (SELECT 1 AS id) INSERT INTO t SELECT id FROM source")
+            .unwrap();
+        let result = conn
+            .execute_query("INSERT INTO t VALUES (2); SELECT * FROM t ORDER BY id")
+            .unwrap();
+        assert_eq!(result.total_rows, 2);
+        assert_eq!(
+            conn.execute_query("EXPLAIN SELECT 42::VARIANT")
+                .unwrap()
+                .total_rows,
+            1
         );
     }
 

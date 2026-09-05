@@ -11,6 +11,7 @@ pub mod connection;
 mod factory;
 pub mod progress;
 pub mod resource_tracker;
+mod result_projection;
 
 pub use connection::{DuckDbConnection, QueryResult, StreamingBatch};
 pub use factory::EngineFactory;
