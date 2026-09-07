@@ -383,6 +383,33 @@ impl Session {
         self.execute_statement_inner(sql)
     }
 
+    pub fn execute_statement_with_telemetry(
+        &self,
+        sql: &str,
+        execution: Option<&str>,
+    ) -> Result<i64, ServerError> {
+        self.validate_user_sql(sql)?;
+        self.touch();
+        let result = self.with_transaction_recovery(
+            || {
+                self.connection
+                    .execute_statement_with_telemetry(sql, execution)
+            },
+            true,
+        );
+        if result.is_ok() && Self::should_invalidate_schema_cache(sql) {
+            self.clear_schema_cache();
+        }
+        result
+    }
+
+    pub fn kernel_updates(&self, request: &str) -> Result<Vec<u8>, ServerError> {
+        match &self.connection.kernel_telemetry {
+            Some(telemetry) => telemetry.read(request),
+            None => Ok(br#"{"version":1,"unsupported":true}"#.to_vec()),
+        }
+    }
+
     fn execute_statement_inner(&self, sql: &str) -> Result<i64, ServerError> {
         self.touch();
         let result =

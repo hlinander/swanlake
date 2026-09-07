@@ -23,6 +23,7 @@ and boolean flags accept `true/false` (case-insensitive).
 | `SWANLAKE_MAX_SESSIONS` | Maximum concurrent sessions | `100` |
 | `SWANLAKE_SESSION_TIMEOUT_SECONDS` | Idle timeout before cleanup | `900` (15 min) |
 | `SWANLAKE_SESSION_ID_MODE` | Session identifier source: `peer_addr` (IP:port) or `peer_ip` (IP only) | `peer_addr` |
+| `SWANLAKE_EXTERNAL_KERNEL_EXTENSION` | Absolute path to the Python extension with session telemetry ABI v1 | _(unset)_ |
 
 ## Logging
 
@@ -138,3 +139,7 @@ Notes:
 
 `ServerConfig::validate()` currently performs only lightweight checks; the remaining options are
 validated as they are consumed (e.g. parsing socket addresses or attaching schemas).
+
+### Python execution telemetry
+
+`SWANLAKE_EXTERNAL_KERNEL_EXTENSION` is the optional absolute path to an `external_kernel` extension providing telemetry ABI v1. Swanlake loads it into each session and exposes session-scoped `execution_updates` Flight actions. Panes in one session share its kernel. Session expiry releases the kernel and bounded output buffers. Execution requests carry the optional `x-duckvis-execution` header as hex-encoded UTF-8 JSON. The telemetry action uses the same authentication and session-nonce checks as execution.

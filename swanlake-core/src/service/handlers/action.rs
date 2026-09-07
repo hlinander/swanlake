@@ -1165,6 +1165,25 @@ pub(crate) async fn do_action_execute(
     request: Request<Action>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
     let session = service.prepare_request(&request).await?;
+    let execution = request
+        .metadata()
+        .get("x-duckvis-execution")
+        .map(|value| {
+            let encoded = value
+                .to_str()
+                .map_err(|_| Status::invalid_argument("invalid execution metadata"))?;
+            if encoded.len() > 32768 {
+                return Err(Status::invalid_argument("execution metadata too large"));
+            }
+            let bytes = hex::decode(encoded)
+                .map_err(|_| Status::invalid_argument("invalid execution metadata"))?;
+            let text = String::from_utf8(bytes)
+                .map_err(|_| Status::invalid_argument("invalid execution metadata"))?;
+            let _: serde_json::Value = serde_json::from_str(&text)
+                .map_err(|_| Status::invalid_argument("invalid execution metadata"))?;
+            Ok(text)
+        })
+        .transpose()?;
     let body = &request.get_ref().body;
 
     info!(
@@ -1176,7 +1195,9 @@ pub(crate) async fn do_action_execute(
     // Try to parse the SQL from the body
     // Airport sends the body as msgpack - try different formats
     let sql = if body.is_empty() {
-        return Err(Status::invalid_argument("execute action requires SQL in body"));
+        return Err(Status::invalid_argument(
+            "execute action requires SQL in body",
+        ));
     } else {
         // First try: parse as msgpack map with "sql" field
         if let Ok(params) = rmp_serde::from_slice::<AirportExecuteParameters>(body) {
@@ -1193,7 +1214,9 @@ pub(crate) async fn do_action_execute(
             info!(sql = %sql_str, "parsed SQL from raw UTF-8");
             sql_str.to_string()
         } else {
-            return Err(Status::invalid_argument("execute action body must be SQL string"));
+            return Err(Status::invalid_argument(
+                "execute action body must be SQL string",
+            ));
         }
     };
 
@@ -1203,7 +1226,7 @@ pub(crate) async fn do_action_execute(
     let sql_clone = sql.clone();
     let session_clone = session.clone();
     let affected_rows = tokio::task::spawn_blocking(move || {
-        session_clone.execute_statement(&sql_clone)
+        session_clone.execute_statement_with_telemetry(&sql_clone, execution.as_deref())
     })
     .await
     .map_err(SwanFlightSqlService::status_from_join)?
@@ -1434,4 +1457,29 @@ pub(crate) async fn do_action_duckvis_attach(
         body: result_body.into(),
     };
     Ok(Response::new(Box::pin(stream::iter(vec![Ok(result)]))))
+}
+
+/// Read only the authenticated session's extension store; no DuckDB lock or SQL.
+pub(crate) async fn do_action_execution_updates(
+    service: &SwanFlightSqlService,
+    request: Request<Action>,
+) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
+    request
+        .metadata()
+        .get("x-expected-session-nonce")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| Status::failed_precondition("telemetry requires a session nonce"))?;
+    let session = service.prepare_request(&request).await?;
+    let body = &request.get_ref().body;
+    if body.len() > 16384 {
+        return Err(Status::invalid_argument("telemetry request too large"));
+    }
+    let text = std::str::from_utf8(body)
+        .map_err(|_| Status::invalid_argument("invalid telemetry request"))?;
+    let body = session
+        .kernel_updates(text)
+        .map_err(SwanFlightSqlService::status_from_error)?;
+    let output = arrow_flight::Result { body: body.into() };
+    Ok(Response::new(Box::pin(stream::iter(vec![Ok(output)]))))
 }

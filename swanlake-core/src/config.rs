@@ -57,6 +57,9 @@ pub struct ServerConfig {
     pub advertise_host: String,
     /// Path to DuckDB database file. Use ":memory:" for in-memory (default).
     pub database_path: Option<String>,
+    /// Optional external_kernel extension with telemetry ABI v1.
+    #[serde(default)]
+    pub external_kernel_extension: Option<String>,
     /// Directory for cache_httpfs disk cache. Enables S3/HTTP caching when set.
     pub cache_directory: Option<String>,
     /// Optional SQL statement executed during startup for ducklake integration.
@@ -127,6 +130,7 @@ impl Default for ServerConfig {
             port: 4214,
             advertise_host: "localhost".to_string(),
             database_path: None,
+            external_kernel_extension: None,
             cache_directory: None,
             ducklake_init_sql: None,
             duckdb_threads: None,

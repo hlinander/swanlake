@@ -345,7 +345,15 @@ struct Harness {
 }
 
 async fn spawn_server(api_url: &str, mock: Arc<MockState>) -> Harness {
+    spawn_server_with_extension(api_url, mock, None).await
+}
+async fn spawn_server_with_extension(
+    api_url: &str,
+    mock: Arc<MockState>,
+    extension: Option<String>,
+) -> Harness {
     let config = ServerConfig {
+        external_kernel_extension: extension,
         duckvis_enabled: true,
         duckvis_api_url: Some(api_url.to_string()),
         duckvis_issuer: Some(ISS.to_string()),
@@ -378,9 +386,7 @@ async fn spawn_server(api_url: &str, mock: Arc<MockState>) -> Harness {
 
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
-            .add_service(
-                arrow_flight::flight_service_server::FlightServiceServer::new(service),
-            )
+            .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(service))
             .serve_with_incoming(incoming)
             .await;
     });
@@ -969,4 +975,145 @@ async fn duckvis_attach_unimplemented_when_mode_off() {
         .await
         .expect_err("should be unimplemented");
     assert_eq!(err.code(), tonic::Code::Unimplemented);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires DUCKVIS_TEST_EXTERNAL_KERNEL, DUCKVIS_TEST_AIRPORT and ipykernel"]
+async fn kernel_telemetry_during_ctas_is_session_scoped_and_replayable() {
+    use std::ffi::{c_char, CStr, CString};
+    let extension = std::env::var("DUCKVIS_TEST_EXTERNAL_KERNEL").expect("extension path");
+    let airport = std::env::var("DUCKVIS_TEST_AIRPORT").expect("airport path");
+    let mock = Arc::new(MockState::new());
+    mock.mutate_allow.store(true, Ordering::Relaxed);
+    let api_url = spawn_mock_api(mock.clone()).await;
+    let h = spawn_server_with_extension(&api_url, mock, Some(extension)).await;
+    let mut cli = client(&h.endpoint).await;
+    let token = format!("Bearer {}", valid_token("telemetry-user-a"));
+    let mut headers = project_headers(&token, "telemetry-a", PROJECT);
+    let mut info = cli
+        .do_action(with_headers(
+            Action {
+                r#type: "session_info".into(),
+                body: Default::default(),
+            },
+            &headers,
+        ))
+        .await
+        .expect("session")
+        .into_inner();
+    let info: Value = rmp_serde::from_slice(&info.message().await.unwrap().unwrap().body).unwrap();
+    let nonce = info["nonce"].as_str().unwrap();
+    headers.push(("x-expected-session-nonce", nonce));
+    let context =
+        json!({"run_id":"pane-a-1","source_hash":"code","track_location":true}).to_string();
+    let context_hex: String = context
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mut exec_headers: Vec<(String, String)> = headers
+        .iter()
+        .map(|(k, v)| ((*k).into(), (*v).into()))
+        .collect();
+    exec_headers.push(("x-duckvis-execution".into(), context_hex));
+    let mut executor = client(&h.endpoint).await;
+    let worker = tokio::spawn(async move {
+        let refs: Vec<_> = exec_headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        execute_sql_action(&mut executor, &refs,
+            "CREATE TABLE telemetry_result AS SELECT * FROM external_kernel('import time\nsecret = 42\nfor i in range(20):\n    print(\"private-a\", i, flush=True)\n    time.sleep(0.1)\nsecret', exec_id := 'code')").await
+    });
+    let request = json!({"version":1,"runs":[{"run_id":"pane-a-1","cursor":0}]}).to_string();
+    let mut live_log = false;
+    let mut live_location = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !worker.is_finished() && std::time::Instant::now() < deadline {
+        let action = Action {
+            r#type: "execution_updates".into(),
+            body: request.clone().into(),
+        };
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cli.do_action(with_headers(action, &headers)),
+        )
+        .await
+        .expect("telemetry must not wait for the SQL lock")
+        .expect("updates");
+        let value: Value =
+            serde_json::from_slice(&response.into_inner().message().await.unwrap().unwrap().body)
+                .unwrap();
+        live_log |= value.to_string().contains("private-a");
+        live_location |= value["runs"][0]["location"]["line"].as_u64().is_some();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    worker.await.unwrap().expect("CTAS");
+    assert!(live_log, "console did not arrive before CTAS finished");
+    assert!(
+        live_location,
+        "location did not arrive before CTAS finished"
+    );
+
+    // Exercise Airport's actual C adapter against the same authenticated session.
+    let endpoint = h.endpoint.replace("http://", "grpc://");
+    let header_json = serde_json::to_string(&headers).unwrap();
+    let airport_result = tokio::task::spawn_blocking(move || {
+        let config = duckdb::Config::default()
+            .allow_unsigned_extensions()
+            .unwrap();
+        let conn = duckdb::Connection::open_in_memory_with_flags(config).unwrap();
+        conn.execute_batch(&format!("LOAD '{}'", airport.replace('\'', "''")))
+            .unwrap();
+        let lib = unsafe { libloading::Library::new(&airport) }.unwrap();
+        type Read =
+            unsafe extern "C" fn(*const c_char, *const c_char, *const c_char) -> *mut c_char;
+        type Free = unsafe extern "C" fn(*mut c_char);
+        let read = unsafe { lib.get::<Read>(b"airport_execution_updates\0") }.unwrap();
+        let free = unsafe { lib.get::<Free>(b"airport_execution_free_string\0") }.unwrap();
+        let (ep, hdr, req) = (
+            CString::new(endpoint).unwrap(),
+            CString::new(header_json).unwrap(),
+            CString::new(request).unwrap(),
+        );
+        let ptr = unsafe { read(ep.as_ptr(), hdr.as_ptr(), req.as_ptr()) };
+        assert!(!ptr.is_null());
+        let value: Value =
+            serde_json::from_str(unsafe { CStr::from_ptr(ptr) }.to_str().unwrap()).unwrap();
+        unsafe { free(ptr) };
+        value
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        airport_result["runs"][0]["state"], "succeeded",
+        "{airport_result}"
+    );
+    assert!(airport_result.to_string().contains("private-a"));
+    assert!(airport_result["runs"][0]["location"].is_null());
+
+    let evil_token = format!("Bearer {}", valid_token("telemetry-user-b"));
+    let mut evil = project_headers(&evil_token, "telemetry-a", PROJECT);
+    evil.push(("x-expected-session-nonce", nonce));
+    let action = Action {
+        r#type: "execution_updates".into(),
+        body: b"{\"version\":1,\"runs\":[]}".as_slice().into(),
+    };
+    assert_eq!(
+        cli.do_action(with_headers(action.clone(), &evil))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let mut wrong_nonce = headers.clone();
+    wrong_nonce.retain(|(k, _)| *k != "x-expected-session-nonce");
+    wrong_nonce.push(("x-expected-session-nonce", "old-session"));
+    assert_eq!(
+        cli.do_action(with_headers(action, &wrong_nonce))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
 }

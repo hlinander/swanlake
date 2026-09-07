@@ -45,6 +45,7 @@ pub struct QueryResult {
 /// shared safely across async tasks.
 pub struct DuckDbConnection {
     pub conn: Mutex<Connection>,
+    pub kernel_telemetry: Option<super::kernel_telemetry::KernelTelemetry>,
 }
 
 impl DuckDbConnection {
@@ -52,6 +53,7 @@ impl DuckDbConnection {
     pub fn new(conn: Connection) -> Self {
         Self {
             conn: Mutex::new(conn),
+            kernel_telemetry: None,
         }
     }
 
@@ -312,11 +314,22 @@ impl DuckDbConnection {
     /// Execute a statement (DDL/DML) without returning results
     #[instrument(skip(self), fields(sql = %sql))]
     pub fn execute_statement(&self, sql: &str) -> Result<i64, ServerError> {
+        self.execute_statement_with_telemetry(sql, None)
+    }
+
+    pub fn execute_statement_with_telemetry(
+        &self,
+        sql: &str,
+        execution: Option<&str>,
+    ) -> Result<i64, ServerError> {
         Self::validate_sql(sql)?;
         let conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(telemetry) = &self.kernel_telemetry {
+            telemetry.set(&conn, execution)?;
+        }
         // The streaming path enables profiling on this shared session connection
         // for CPU sampling and never resets it. With profiling on, a
         // `CREATE TABLE AS SELECT` run through the arrow C-API returns a null
@@ -324,7 +337,11 @@ impl DuckDbConnection {
         // from the execute action run cleanly. Ignored result: RESET is a no-op
         // when profiling is already at its default.
         let _ = conn.execute_batch("RESET enable_profiling");
-        conn.execute_batch(sql)?;
+        let result = conn.execute_batch(sql);
+        if let Some(telemetry) = &self.kernel_telemetry {
+            telemetry.set(&conn, None)?;
+        }
+        result?;
         debug!("executed statement");
         Ok(0)
     }

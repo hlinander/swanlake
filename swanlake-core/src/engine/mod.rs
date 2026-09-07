@@ -8,6 +8,7 @@
 
 pub(crate) mod batch;
 pub mod connection;
+pub mod kernel_telemetry;
 mod factory;
 pub mod progress;
 pub mod resource_tracker;

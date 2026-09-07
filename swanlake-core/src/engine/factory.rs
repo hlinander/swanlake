@@ -19,6 +19,7 @@ pub struct EngineFactory {
     init_sql: String,
     init_lock: Arc<Mutex<()>>,
     database_path: Option<String>,
+    external_kernel_extension: Option<String>,
 }
 
 impl EngineFactory {
@@ -123,6 +124,7 @@ impl EngineFactory {
             init_sql,
             init_lock: Arc::new(Mutex::new(())),
             database_path,
+            external_kernel_extension: config.external_kernel_extension.clone(),
         }
     }
 
@@ -159,7 +161,14 @@ impl EngineFactory {
             total_ms = t0.elapsed().as_millis() as u64,
             "created new DuckDB connection"
         );
-        Ok(DuckDbConnection::new(conn))
+        let telemetry = self
+            .external_kernel_extension
+            .as_deref()
+            .map(|path| crate::engine::kernel_telemetry::KernelTelemetry::load(&conn, path))
+            .transpose()?;
+        let mut connection = DuckDbConnection::new(conn);
+        connection.kernel_telemetry = telemetry;
+        Ok(connection)
     }
 }
 
