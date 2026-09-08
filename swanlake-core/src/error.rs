@@ -2,7 +2,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ServerError {
-    #[error("duckdb error: {0}")]
+    // Engine errors can echo a metadata DSN verbatim (`password=` included), so
+    // the display scrubs; detection code matching on the inner error's own text
+    // (`is_transaction_abort_error`) is unaffected.
+    #[error("duckdb error: {}", crate::scrub::scrub_error_text(&.0.to_string()))]
     DuckDb(#[from] duckdb::Error),
     #[error("arrow error: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
@@ -16,7 +19,7 @@ pub enum ServerError {
     MaxSessionsReached,
     #[error("unsupported parameter type: {0}")]
     UnsupportedParameter(String),
-    #[error("internal error: {0}")]
+    #[error("internal error: {}", crate::scrub::scrub_error_text(.0))]
     Internal(String),
     /// Raw ATTACH is not permitted in duckvis mode (contract C6). Maps to
     /// `permission_denied`.

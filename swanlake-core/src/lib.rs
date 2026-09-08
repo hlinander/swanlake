@@ -15,6 +15,7 @@ pub mod engine;
 pub mod error;
 pub mod maintenance;
 pub mod metrics;
+pub mod scrub;
 pub mod service;
 pub mod session;
 pub mod sql;
