@@ -13,13 +13,14 @@ pub use id::SessionId;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use arrow_schema::Schema;
 use duckdb::types::Value;
 use tracing::{debug, info, instrument, warn};
 
-use crate::engine::{DuckDbConnection, QueryResult};
+use crate::engine::{cancellation::RequestCancellation, DuckDbConnection, QueryResult};
 use crate::error::ServerError;
 use crate::session::id::{
     StatementHandle, StatementHandleGenerator, TransactionId, TransactionIdGenerator,
@@ -160,6 +161,7 @@ pub struct Session {
     statement_handle_gen: StatementHandleGenerator,
     last_activity: Mutex<Instant>,
     schema_cache: Mutex<SchemaCache>,
+    executions: Mutex<HashMap<String, Weak<RequestCancellation>>>,
 }
 
 impl Session {
@@ -192,6 +194,7 @@ impl Session {
             statement_handle_gen: StatementHandleGenerator::new(),
             last_activity: Mutex::new(Instant::now()),
             schema_cache: Mutex::new(SchemaCache::new()),
+            executions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -387,13 +390,14 @@ impl Session {
         &self,
         sql: &str,
         execution: Option<&str>,
+        cancellation: &RequestCancellation,
     ) -> Result<i64, ServerError> {
         self.validate_user_sql(sql)?;
         self.touch();
         let result = self.with_transaction_recovery(
             || {
                 self.connection
-                    .execute_statement_with_telemetry(sql, execution)
+                    .execute_statement_with_telemetry(sql, execution, Some(cancellation))
             },
             true,
         );
@@ -401,6 +405,37 @@ impl Session {
             self.clear_schema_cache();
         }
         result
+    }
+
+    pub fn register_execution(
+        &self,
+        id: &str,
+        cancellation: &Arc<RequestCancellation>,
+    ) -> Result<(), ServerError> {
+        let mut executions = self.executions.lock().unwrap_or_else(|p| p.into_inner());
+        executions.retain(|_, request| request.strong_count() > 0);
+        if executions.contains_key(id) {
+            return Err(ServerError::Internal(
+                "execution request ID is already active".into(),
+            ));
+        }
+        executions.insert(id.into(), Arc::downgrade(cancellation));
+        Ok(())
+    }
+
+    pub fn cancel_execution(&self, id: &str) -> bool {
+        let request = self
+            .executions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .and_then(Weak::upgrade);
+        if let Some(request) = request {
+            request.cancel();
+            true
+        } else {
+            false
+        }
     }
 
     pub fn kernel_updates(&self, request: &str) -> Result<Vec<u8>, ServerError> {

@@ -314,19 +314,23 @@ impl DuckDbConnection {
     /// Execute a statement (DDL/DML) without returning results
     #[instrument(skip(self), fields(sql = %sql))]
     pub fn execute_statement(&self, sql: &str) -> Result<i64, ServerError> {
-        self.execute_statement_with_telemetry(sql, None)
+        self.execute_statement_with_telemetry(sql, None, None)
     }
 
     pub fn execute_statement_with_telemetry(
         &self,
         sql: &str,
         execution: Option<&str>,
+        cancellation: Option<&super::cancellation::RequestCancellation>,
     ) -> Result<i64, ServerError> {
         Self::validate_sql(sql)?;
         let conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let active = cancellation
+            .map(|c| c.activate(conn.interrupt_handle()))
+            .transpose()?;
         if let Some(telemetry) = &self.kernel_telemetry {
             telemetry.set(&conn, execution)?;
         }
@@ -337,11 +341,19 @@ impl DuckDbConnection {
         // from the execute action run cleanly. Ignored result: RESET is a no-op
         // when profiling is already at its default.
         let _ = conn.execute_batch("RESET enable_profiling");
-        let result = conn.execute_batch(sql);
+        let result = cancellation
+            .map_or(Ok(()), |c| c.check())
+            .and_then(|()| conn.execute_batch(sql).map_err(ServerError::from));
+        // Disarm while we still own the connection, including before resetting
+        // telemetry; a late cancellation cannot reach another statement.
+        drop(active);
         if let Some(telemetry) = &self.kernel_telemetry {
             telemetry.set(&conn, None)?;
         }
         result?;
+        if let Some(cancellation) = cancellation {
+            cancellation.check()?;
+        }
         debug!("executed statement");
         Ok(0)
     }

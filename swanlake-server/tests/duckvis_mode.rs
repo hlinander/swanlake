@@ -1117,3 +1117,276 @@ async fn kernel_telemetry_during_ctas_is_session_scoped_and_replayable() {
         tonic::Code::FailedPrecondition
     );
 }
+
+async fn execution_snapshot(
+    cli: &mut FlightServiceClient<Channel>,
+    headers: &[(&str, &str)],
+    run: &str,
+) -> Value {
+    let body = json!({"version":1,"runs":[{"run_id":run,"cursor":0}]}).to_string();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        cli.do_action(with_headers(
+            Action {
+                r#type: "execution_updates".into(),
+                body: body.into(),
+            },
+            headers,
+        )),
+    )
+    .await
+    .expect("updates blocked behind execution")
+    .expect("updates");
+    serde_json::from_slice(&response.into_inner().message().await.unwrap().unwrap().body).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires DUCKVIS_TEST_EXTERNAL_KERNEL, DUCKVIS_TEST_AIRPORT and ipykernel"]
+async fn python_interrupt_through_airport_and_disconnected_flight() {
+    use std::ffi::{c_char, CStr};
+    use std::time::{Duration, Instant};
+    let extension = std::env::var("DUCKVIS_TEST_EXTERNAL_KERNEL").expect("extension path");
+    let airport = std::env::var("DUCKVIS_TEST_AIRPORT").expect("airport path");
+    let mock = Arc::new(MockState::new());
+    mock.mutate_allow.store(true, Ordering::Relaxed);
+    let api_url = spawn_mock_api(mock.clone()).await;
+    let h = spawn_server_with_extension(&api_url, mock, Some(extension)).await;
+    let config = duckdb::Config::default()
+        .allow_unsigned_extensions()
+        .unwrap();
+    let conn = duckdb::Connection::open_in_memory_with_flags(config).unwrap();
+    conn.execute_batch(&format!("LOAD '{}'", airport.replace('\'', "''")))
+        .unwrap();
+    let library = unsafe { libloading::Library::new(&airport) }.unwrap();
+    let session_id = unsafe {
+        let get = library
+            .get::<unsafe extern "C" fn() -> *mut c_char>(b"airport_execution_session_id\0")
+            .unwrap();
+        let free = library
+            .get::<unsafe extern "C" fn(*mut c_char)>(b"airport_execution_free_string\0")
+            .unwrap();
+        let value = get();
+        let id = CStr::from_ptr(value).to_string_lossy().into_owned();
+        free(value);
+        id
+    };
+    let token = format!("Bearer {}", valid_token("interrupt-user"));
+    let mut headers = project_headers(&token, &session_id, PROJECT);
+    let mut observer = client(&h.endpoint).await;
+    let response = observer
+        .do_action(with_headers(
+            Action {
+                r#type: "session_info".into(),
+                body: Default::default(),
+            },
+            &headers,
+        ))
+        .await
+        .unwrap();
+    let info: Value =
+        rmp_serde::from_slice(&response.into_inner().message().await.unwrap().unwrap().body)
+            .unwrap();
+    headers.push(("x-expected-session-nonce", info["nonce"].as_str().unwrap()));
+
+    // The actual Airport action blocks before its first result. Interrupting
+    // local DuckDB must stop an uncooperative remote Python process.
+    let context = json!({"run_id":"stubborn","track_location":true})
+        .to_string()
+        .bytes()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let mut sql_headers = headers
+        .iter()
+        .map(|(k, v)| format!("'{}': '{}'", k, v.replace('\'', "''")))
+        .collect::<Vec<_>>();
+    sql_headers.push(format!("'x-duckvis-execution': '{context}'"));
+    let sql_headers = format!("MAP {{{}}}", sql_headers.join(", "));
+    let endpoint = h.endpoint.replace("http://", "grpc://");
+    let (handle_tx, handle_rx) = tokio::sync::oneshot::channel();
+    let code = "import signal, time\nretained = 42\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nprint('stubborn-ready', flush=True)\ntime.sleep(15)\n42";
+    let sql = format!(
+        "CREATE TABLE stubborn_result AS SELECT * FROM external_kernel('{}', exec_id := 'code')",
+        code.replace('\'', "''")
+    );
+    let worker = tokio::task::spawn_blocking(move || {
+        assert!(handle_tx.send(conn.interrupt_handle()).is_ok());
+        conn.execute_batch(&format!(
+            "SELECT * FROM airport_action('{endpoint}', 'execute', '{}', headers := {sql_headers})",
+            sql.replace('\'', "''")
+        ))
+    });
+    let handle = handle_rx.await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let snapshot = execution_snapshot(&mut observer, &headers, "stubborn").await;
+        if snapshot.to_string().contains("stubborn-ready") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline && !worker.is_finished(),
+            "execution never started: {snapshot}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let cancelled_at = Instant::now();
+    handle.interrupt();
+    let result = tokio::time::timeout(Duration::from_secs(9), worker)
+        .await
+        .expect("Airport interrupt left server computation running")
+        .unwrap();
+    assert!(result.is_err(), "cancelled execution succeeded");
+    assert!(cancelled_at.elapsed() < Duration::from_secs(9));
+    let snapshot = execution_snapshot(&mut observer, &headers, "stubborn").await;
+    assert_eq!(snapshot["runs"][0]["state"], "cancelled", "{snapshot}");
+    assert!(
+        snapshot.to_string().contains("state was cleared"),
+        "missing reset warning: {snapshot}"
+    );
+    execute_sql_action(&mut observer, &headers, "CREATE TABLE recovered AS SELECT * FROM external_kernel('assert \"retained\" not in globals()\nretained = 7\n42', exec_id := 'after-reset')").await.expect("fresh kernel after forced cancellation");
+
+    // A client that disappears must also cancel its detached server task.
+    let context = json!({"run_id":"disconnect","track_location":false})
+        .to_string()
+        .bytes()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let owned_headers = headers
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .chain(std::iter::once(("x-duckvis-execution".into(), context)))
+        .collect::<Vec<_>>();
+    let mut executor = client(&h.endpoint).await;
+    let worker = tokio::spawn(async move {
+        let refs = owned_headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect::<Vec<_>>();
+        execute_sql_action(&mut executor, &refs, "CREATE TABLE disconnect_result AS SELECT * FROM external_kernel('import time\nprint(\"disconnect-ready\", flush=True)\ntime.sleep(15)\n42', exec_id := 'disconnect')").await
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !execution_snapshot(&mut observer, &headers, "disconnect")
+        .await
+        .to_string()
+        .contains("disconnect-ready")
+    {
+        assert!(Instant::now() < deadline && !worker.is_finished());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    worker.abort();
+    let _ = worker.await;
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let snapshot = execution_snapshot(&mut observer, &headers, "disconnect").await;
+        if snapshot["runs"][0]["state"] == "cancelled" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "disconnected request still running: {snapshot}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    execute_sql_action(&mut observer, &headers, "CREATE TABLE preserved AS SELECT * FROM external_kernel('assert retained == 7\n42', exec_id := 'preserved')").await.expect("cooperative cancellation preserves kernel state");
+
+    // Cancel a queued request while another pane owns the session connection.
+    let context = json!({"run_id":"busy"})
+        .to_string()
+        .bytes()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let owned = headers
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .chain(std::iter::once(("x-duckvis-execution".into(), context)))
+        .collect::<Vec<_>>();
+    let mut executor = client(&h.endpoint).await;
+    let busy = tokio::spawn(async move {
+        let refs = owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect::<Vec<_>>();
+        execute_sql_action(&mut executor, &refs, "CREATE TABLE busy_result AS SELECT * FROM external_kernel('import time\nprint(\"busy-ready\", flush=True)\ntime.sleep(3)\nretained', exec_id := 'busy')").await
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !execution_snapshot(&mut observer, &headers, "busy")
+        .await
+        .to_string()
+        .contains("busy-ready")
+    {
+        assert!(Instant::now() < deadline && !busy.is_finished());
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let id = "56fa3278-b98d-4aeb-93e5-4b408cdfba9d";
+    let owned = headers
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .chain(std::iter::once(("x-swanlake-request-id".into(), id.into())))
+        .collect::<Vec<_>>();
+    let mut executor = client(&h.endpoint).await;
+    let queued = tokio::spawn(async move {
+        let refs = owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect::<Vec<_>>();
+        execute_sql_action(&mut executor, &refs, "CREATE TABLE forbidden AS SELECT * FROM external_kernel('retained = 999\n42', exec_id := 'queued')").await
+    });
+    let cancel = Action {
+        r#type: "cancel_execution".into(),
+        body: id.into(),
+    };
+    let evil_token = format!("Bearer {}", valid_token("another-user"));
+    let evil = project_headers(&evil_token, &session_id, PROJECT);
+    assert_eq!(
+        observer
+            .do_action(with_headers(cancel.clone(), &evil))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let other_session = project_headers(&token, "another-session", PROJECT);
+    let response = observer
+        .do_action(with_headers(cancel.clone(), &other_session))
+        .await
+        .unwrap();
+    assert_eq!(
+        response
+            .into_inner()
+            .message()
+            .await
+            .unwrap()
+            .unwrap()
+            .body
+            .as_ref(),
+        b"not_found"
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let response = observer
+            .do_action(with_headers(cancel.clone(), &headers))
+            .await
+            .unwrap();
+        if response
+            .into_inner()
+            .message()
+            .await
+            .unwrap()
+            .unwrap()
+            .body
+            .as_ref()
+            == b"cancelled"
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "queued request did not register");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    busy.await
+        .unwrap()
+        .expect("queued cancellation interrupted the active pane");
+    assert!(
+        queued.await.unwrap().is_err(),
+        "cancelled queued work executed"
+    );
+    execute_sql_action(&mut observer, &headers, "CREATE TABLE still_preserved AS SELECT * FROM external_kernel('assert retained == 7\n42', exec_id := 'after-queue')").await.expect("queued cancellation changed kernel state");
+}

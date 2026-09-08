@@ -261,6 +261,7 @@ impl SwanFlightSqlService {
 
     pub(crate) fn status_from_error(err: ServerError) -> Status {
         match err {
+            ServerError::Cancelled => Status::cancelled("query cancelled"),
             ServerError::DuckDb(e) => {
                 error!(error = %e, "duckdb engine error");
                 Status::internal(format!("duckdb error: {e}"))

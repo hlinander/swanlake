@@ -2,6 +2,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ServerError {
+    #[error("query cancelled")]
+    Cancelled,
     #[error("duckdb error: {0}")]
     DuckDb(#[from] duckdb::Error),
     #[error("arrow error: {0}")]

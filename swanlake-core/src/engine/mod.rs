@@ -7,6 +7,7 @@
 //! - `progress`: Query progress tracking via FFI
 
 pub(crate) mod batch;
+pub mod cancellation;
 pub mod connection;
 pub mod kernel_telemetry;
 mod factory;

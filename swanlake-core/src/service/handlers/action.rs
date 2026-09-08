@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::info;
 
@@ -1165,6 +1166,18 @@ pub(crate) async fn do_action_execute(
     request: Request<Action>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
     let session = service.prepare_request(&request).await?;
+    let cancellation = Arc::new(crate::engine::cancellation::RequestCancellation::default());
+    if let Some(id) = request.metadata().get("x-swanlake-request-id") {
+        let id = id
+            .to_str()
+            .map_err(|_| Status::invalid_argument("invalid request ID"))?;
+        uuid::Uuid::parse_str(id)
+            .map_err(|_| Status::invalid_argument("request ID must be a UUID"))?;
+        session
+            .register_execution(id, &cancellation)
+            .map_err(SwanFlightSqlService::status_from_error)?;
+    }
+    let _cancel_on_disconnect = crate::engine::cancellation::CancelOnDrop(cancellation.clone());
     let execution = request
         .metadata()
         .get("x-duckvis-execution")
@@ -1226,7 +1239,11 @@ pub(crate) async fn do_action_execute(
     let sql_clone = sql.clone();
     let session_clone = session.clone();
     let affected_rows = tokio::task::spawn_blocking(move || {
-        session_clone.execute_statement_with_telemetry(&sql_clone, execution.as_deref())
+        session_clone.execute_statement_with_telemetry(
+            &sql_clone,
+            execution.as_deref(),
+            &cancellation,
+        )
     })
     .await
     .map_err(SwanFlightSqlService::status_from_join)?
@@ -1250,6 +1267,28 @@ pub(crate) async fn do_action_execute(
 
     let output_stream = Box::pin(stream::iter(vec![Ok(result)]));
     Ok(Response::new(output_stream))
+}
+
+/// Cancel one action without acquiring its busy SQL connection. Authentication
+/// and the expected session nonce are checked exactly as for execution.
+pub(crate) async fn do_action_cancel_execution(
+    service: &SwanFlightSqlService,
+    request: Request<Action>,
+) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
+    let session = service.prepare_request(&request).await?;
+    let id = std::str::from_utf8(&request.get_ref().body)
+        .map_err(|_| Status::invalid_argument("invalid request ID"))?;
+    uuid::Uuid::parse_str(id).map_err(|_| Status::invalid_argument("request ID must be a UUID"))?;
+    let cancelled = session.cancel_execution(id);
+    let result = arrow_flight::Result {
+        body: if cancelled {
+            b"cancelled".as_slice()
+        } else {
+            b"not_found".as_slice()
+        }
+        .into(),
+    };
+    Ok(Response::new(Box::pin(stream::iter(vec![Ok(result)]))))
 }
 
 /// Handle the "session_info" action — returns the current session's nonce.
