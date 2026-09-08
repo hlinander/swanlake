@@ -263,8 +263,11 @@ impl SwanFlightSqlService {
         match err {
             ServerError::Cancelled => Status::cancelled("query cancelled"),
             ServerError::DuckDb(e) => {
-                error!(error = %e, "duckdb engine error");
-                Status::internal(format!("duckdb error: {e}"))
+                // The inner error is formatted directly here, bypassing
+                // `ServerError`'s scrubbing display — scrub it in place.
+                let msg = crate::scrub::scrub_error_text(&e.to_string());
+                error!(error = %msg, "duckdb engine error");
+                Status::internal(format!("duckdb error: {msg}"))
             }
             ServerError::Arrow(e) => {
                 error!(error = %e, "arrow conversion error");
@@ -293,6 +296,7 @@ impl SwanFlightSqlService {
                 Status::invalid_argument(format!("unsupported parameter type: {param}"))
             }
             ServerError::Internal(msg) => {
+                let msg = crate::scrub::scrub_error_text(&msg);
                 error!(msg = %msg, "internal error");
                 Status::internal(format!("internal error: {msg}"))
             }
