@@ -41,3 +41,18 @@ CommandStatementUpdate / CommandPreparedStatementUpdate
 
 ### Transaction Handlers (`transaction.rs`)
 - Starts and completes transactions (commit/rollback) for a session, tolerating autocommit no-ops.
+
+## Guarded loader execution
+
+`execute_guarded` accepts the same SQL body and authentication headers as
+`execute`, with optional `x-swanlake-request-id` (UUID). Its single JSON result
+contains `version: 1`, `completed: true`, and `error: null` on success. A rejected
+request or finished SQL error contains `error: {code, message}` using the gRPC
+status code. The envelope is emitted after execution returns; it also covers
+authentication and nonce rejection. Guarded requests omit SQL and body contents
+from action logs because source setup can carry credentials.
+
+`cancel_execution` requests an interrupt for the UUID; its `cancelled` response
+does not acknowledge completion. A caller that must serialize mutations waits
+for the original completion envelope. A lost envelope leaves the result unknown,
+even when cancellation was requested. Existing `execute` results remain MsgPack.
