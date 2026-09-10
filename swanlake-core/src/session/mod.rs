@@ -664,6 +664,17 @@ impl Session {
     /// Get schema for a query
     #[instrument(skip(self), fields(session_id = %self.id, sql = %sql))]
     pub fn schema_for_query(&self, sql: &str) -> Result<arrow_schema::Schema, ServerError> {
+        self.schema_for_query_cancellable(sql, None)
+    }
+
+    pub(crate) fn schema_for_query_cancellable(
+        &self,
+        sql: &str,
+        cancellation: Option<&RequestCancellation>,
+    ) -> Result<arrow_schema::Schema, ServerError> {
+        if let Some(cancellation) = cancellation {
+            cancellation.check()?;
+        }
         self.validate_user_sql(sql)?;
         self.ensure_lockdown()?;
         self.touch();
@@ -680,8 +691,13 @@ impl Session {
             }
         }
 
-        let schema =
-            self.with_transaction_recovery(|| self.connection.schema_for_query(sql), true)?;
+        let schema = self.with_transaction_recovery(
+            || {
+                self.connection
+                    .schema_for_query_cancellable(sql, cancellation)
+            },
+            true,
+        )?;
 
         if !cache_key.is_empty() {
             self.schema_cache

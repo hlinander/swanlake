@@ -28,7 +28,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 use tracing::{debug, error, info, trace, warn};
 
-use crate::engine::{query_progress, ResourceSnapshot, ResourceTracker, StreamingBatch};
+use crate::engine::cancellation::{CancelOnDrop, RequestCancellation};
+use crate::engine::{ResourceSnapshot, ResourceTracker, StreamingBatch, query_progress};
 use crate::session::Session;
 
 use super::SwanFlightSqlService;
@@ -126,8 +127,8 @@ impl SwanFlightSqlService {
     ///
     /// Cancellation support:
     /// - A monitor task watches for receiver closure (client disconnect)
-    /// - When detected, it immediately interrupts DuckDB
-    /// - The stream's Drop impl also calls interrupt as a fallback
+    /// - Disconnects cancel this request while it owns the connection
+    /// - Dropping a completed stream cannot interrupt a subsequent query
     pub(crate) async fn execute_query_streaming(
         session: Arc<Session>,
         sql: String,
@@ -136,64 +137,56 @@ impl SwanFlightSqlService {
         // Create channel for streaming batches (buffer of 4 for pipelining)
         let (tx, rx) = mpsc::channel::<StreamingBatch>(4);
 
-        // Get interrupt handle for cancellation support
-        let interrupt_handle = session.connection.interrupt_handle();
+        let cancellation = Arc::new(RequestCancellation::default());
+        let cancel_on_disconnect = CancelOnDrop(cancellation.clone());
 
-        // Spawn a cancellation monitor task that proactively interrupts DuckDB
-        // as soon as the receiver is closed (client disconnects).
-        // This is more responsive than waiting for the next batch iteration.
-        let tx_monitor = tx.clone();
-        let interrupt_handle_monitor = interrupt_handle.clone();
-        let sql_for_monitor = sql.clone();
-        tokio::spawn(async move {
-            // Wait for the receiver to close (client disconnect or stream drop)
-            tx_monitor.closed().await;
-            // Interrupt DuckDB immediately - don't wait for next batch iteration
-            info!(sql = %sql_for_monitor, "client disconnected, interrupting DuckDB query");
-            interrupt_handle_monitor.interrupt();
-        });
-
-        // Create monitoring connection BEFORE spawning the blocking task,
-        // while the session's connection mutex is still available.
-        // try_clone() creates a sibling connection to the same database via duckdb_connect().
-        // duckdb_memory() is database-wide, so any connection to the same DB works.
-        let resource_tracker = {
-            let conn_guard = session.connection.conn.lock()
+        // Connection acquisition can wait behind another query. Keep that wait
+        // off the async runtime and reject cancelled requests after acquisition.
+        let setup_session = session.clone();
+        let setup_cancellation = cancellation.clone();
+        let (interrupt_handle, monitoring_connection) = tokio::task::spawn_blocking(move || {
+            let conn = setup_session
+                .connection
+                .conn
+                .lock()
                 .map_err(|_| Status::internal("connection mutex poisoned"))?;
-            match conn_guard.try_clone() {
-                Ok(mon_conn) => {
-                    drop(conn_guard);
-                    Arc::new(ResourceTracker::start(mon_conn, interrupt_handle.clone()))
-                }
-                Err(e) => {
-                    drop(conn_guard);
-                    warn!(%e, "failed to clone monitoring connection, resource tracking disabled");
-                    Arc::new(ResourceTracker::disabled())
-                }
+            setup_cancellation
+                .check()
+                .map_err(Self::status_from_error)?;
+            let interrupt = conn.interrupt_handle();
+            let monitor = conn.try_clone();
+            Ok::<_, Status>((interrupt, monitor))
+        })
+        .await
+        .map_err(Self::status_from_join)??;
+        let resource_tracker = match monitoring_connection {
+            Ok(conn) => Arc::new(ResourceTracker::start(conn, interrupt_handle.clone())),
+            Err(e) => {
+                warn!(%e, "failed to clone monitoring connection, resource tracking disabled");
+                Arc::new(ResourceTracker::disabled())
             }
         };
 
-        // Spawn blocking task to execute query and stream batches
-        let interrupt_handle_clone = interrupt_handle.clone();
+        let tx_monitor = tx.clone();
+        let monitor_cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            tx_monitor.closed().await;
+            monitor_cancellation.cancel();
+        });
+
         let sql_clone = sql.clone();
-
         tokio::task::spawn_blocking(move || {
-            // This path executes registration-validated SQL on the connection
-            // directly, so the write-hardening lockdown applies here.
-            let result = session.ensure_lockdown().and_then(|()| match params {
-                Some(ref p) => session.connection.execute_query_with_params_streaming(
-                    &sql_clone,
-                    p,
-                    tx.clone(),
-                    Some(interrupt_handle_clone.clone()),
-                ),
-                None => session.connection.execute_query_streaming(
-                    &sql_clone,
-                    tx.clone(),
-                    Some(interrupt_handle_clone.clone()),
-                ),
-            });
-
+            let result = cancellation
+                .check()
+                .and_then(|()| session.ensure_lockdown())
+                .and_then(|()| {
+                    session.connection.stream_query_cancellable(
+                        &sql_clone,
+                        params.as_deref(),
+                        tx.clone(),
+                        &cancellation,
+                    )
+                });
             if let Err(e) = result {
                 error!(%e, "streaming query execution failed");
                 let _ = tx.blocking_send(StreamingBatch::Error(e));
@@ -206,9 +199,13 @@ impl SwanFlightSqlService {
         let rx_stream = ReceiverStream::new(rx);
 
         // State for tracking schema (needed for batch encoding context)
-        // Pass interrupt handle for cancellation on drop (fallback mechanism)
-        let stream =
-            StreamingBatchToFlightData::new(rx_stream, interrupt_handle, resource_tracker);
+        // Transfer the disconnect guard to the response stream.
+        let stream = StreamingBatchToFlightData::new(
+            rx_stream,
+            interrupt_handle,
+            resource_tracker,
+            cancel_on_disconnect,
+        );
 
         Ok(Response::new(Box::pin(stream)))
     }
@@ -226,8 +223,10 @@ struct StreamingBatchToFlightData<S> {
     inner: S,
     schema: Option<Arc<Schema>>,
     done: bool,
-    /// Interrupt handle for cancellation and progress polling.
+    /// Interrupt handle used only for progress polling.
     interrupt_handle: Arc<InterruptHandle>,
+    /// Cancels only the query belonging to this response, even after completion.
+    _cancel_on_disconnect: CancelOnDrop,
     /// Resource tracker for memory usage sampling.
     resource_tracker: Arc<ResourceTracker>,
     /// Rows sent so far (for fallback progress calculation)
@@ -241,6 +240,7 @@ impl<S> StreamingBatchToFlightData<S> {
         inner: S,
         interrupt_handle: Arc<InterruptHandle>,
         resource_tracker: Arc<ResourceTracker>,
+        cancel_on_disconnect: CancelOnDrop,
     ) -> Self {
         // First tick after 250ms (not immediately), then every 250ms.
         let mut heartbeat = tokio::time::interval_at(
@@ -253,6 +253,7 @@ impl<S> StreamingBatchToFlightData<S> {
             schema: None,
             done: false,
             interrupt_handle,
+            _cancel_on_disconnect: cancel_on_disconnect,
             resource_tracker,
             rows_sent: 0,
             heartbeat,
@@ -265,16 +266,6 @@ impl<S> StreamingBatchToFlightData<S> {
             // Convert percentage (0-100) to fraction (0-1)
             (p.percentage / 100.0).clamp(0.0, 1.0)
         })
-    }
-}
-
-impl<S> Drop for StreamingBatchToFlightData<S> {
-    fn drop(&mut self) {
-        // If the stream wasn't fully consumed (done=false), the client cancelled
-        if !self.done {
-            warn!("streaming query cancelled by client, interrupting DuckDB");
-            self.interrupt_handle.interrupt();
-        }
     }
 }
 
@@ -380,5 +371,127 @@ where
                 Poll::Pending
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use crate::config::ServerConfig;
+    use crate::engine::EngineFactory;
+    use crate::session::{SessionId, registry::SessionRegistry};
+
+    async fn session() -> anyhow::Result<Arc<Session>> {
+        let config = ServerConfig::default();
+        let registry = SessionRegistry::new(
+            &config,
+            Arc::new(EngineFactory::new_without_extension_bootstrap(&config)),
+        )?;
+        Ok(registry
+            .get_or_create_by_id(&SessionId::from_string("stream-cancel".into()))
+            .await?)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_stream_releases_active_query() -> anyhow::Result<()> {
+        let session = session().await?;
+        let cleanup = session.connection.interrupt_handle();
+        let response = SwanFlightSqlService::execute_query_streaming(
+            session.clone(),
+            "SELECT sum(i) FROM range(1000000000) t(i)".into(),
+            None,
+        )
+        .await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while session.connection.conn.try_lock().is_ok() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        drop(response);
+        let released = tokio::time::timeout(Duration::from_secs(2), async {
+            while session.connection.conn.try_lock().is_err() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !released {
+            for _ in 0..100 {
+                if session.connection.conn.try_lock().is_ok() {
+                    break;
+                }
+                cleanup.interrupt();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        let next = tokio::task::spawn_blocking(move || {
+            session.execute_statement("CREATE TABLE after_stream_cancel AS SELECT 42 AS value")
+        });
+        tokio::time::timeout(Duration::from_secs(5), next).await???;
+        assert!(released, "disconnected stream left its query running");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_stream_setup_allows_deadline_to_fire() -> anyhow::Result<()> {
+        let session = session().await?;
+        let connection = session.connection.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _lock = connection.conn.lock().unwrap();
+            let _ = ready_tx.send(());
+            // Bound the pre-fix failure: a synchronous setup lock stalls the
+            // sole runtime thread, preventing its request deadline from firing.
+            let _ = release_rx.recv_timeout(Duration::from_secs(1));
+        });
+        ready_rx.await?;
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            SwanFlightSqlService::execute_query_streaming(session.clone(), "SELECT 1".into(), None),
+        )
+        .await;
+        let _ = release_tx.send(());
+        blocker.await?;
+        assert!(
+            result.is_err(),
+            "waiting for a connection blocked the request deadline"
+        );
+        let next = tokio::task::spawn_blocking(move || {
+            session.execute_statement("CREATE TABLE after_queued_cancel AS SELECT 42 AS value")
+        });
+        tokio::time::timeout(Duration::from_secs(2), next).await???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_completed_response_cannot_interrupt_next_query() -> anyhow::Result<()> {
+        let session = session().await?;
+        let completed =
+            SwanFlightSqlService::execute_query_streaming(session.clone(), "SELECT 1".into(), None)
+                .await?;
+        // Let the producer finish, but leave its small result unconsumed.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let connection = session.connection.clone();
+        let next = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
+            let conn = connection.conn.lock().unwrap();
+            // A late interrupt must not hit the next owner of this connection.
+            let _ = ready_tx.send(());
+            Ok(
+                conn.query_row("SELECT sum(i) FROM range(100000000) t(i)", [], |row| {
+                    row.get(0)
+                })?,
+            )
+        });
+        ready_rx.await?;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(completed);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), next).await???,
+            4999999950000000
+        );
+        Ok(())
     }
 }

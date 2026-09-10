@@ -535,14 +535,19 @@ impl SwanFlightService {
         let sql_for_schema = sql.clone();
         let session_clone = Arc::clone(&session);
 
-        let interrupt_handle = session.connection.interrupt_handle();
-        let schema = run_interruptible(interrupt_handle, move || {
-            // Binding can open files, and this path bypasses the guarded
-            // Session methods — the write-hardening lockdown applies here.
+        let cancellation = Arc::new(crate::engine::cancellation::RequestCancellation::default());
+        let _cancel_on_disconnect = crate::engine::cancellation::CancelOnDrop(cancellation.clone());
+        let schema = tokio::task::spawn_blocking(move || {
+            // Binding can open files; apply the same lockdown as execution.
+            cancellation.check()?;
             session_clone.ensure_lockdown()?;
-            session_clone.connection.schema_for_streaming(&sql_for_schema)
+            session_clone
+                .connection
+                .schema_for_query_cancellable(&sql_for_schema, Some(&cancellation))
         })
-        .await?;
+        .await
+        .map_err(SwanFlightSqlService::status_from_join)?
+        .map_err(SwanFlightSqlService::status_from_error)?;
 
         let ticket_payload = TicketStatementPayload::new(StatementTicketKind::Ephemeral)
             .with_fallback_sql(&sql)
