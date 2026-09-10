@@ -1492,5 +1492,79 @@ async fn guarded_execution_acknowledges_sql_errors_and_auth_rejections() {
     fenced_headers.push(("x-expected-session-nonce", "incorrect-nonce"));
     let fenced = execute(&mut cli, &fenced_headers, "SELECT 1").await;
     assert_eq!(fenced["completed"], true);
-    assert_eq!(fenced["error"]["code"], tonic::Code::FailedPrecondition as i32);
+    assert_eq!(
+        fenced["error"]["code"],
+        tonic::Code::FailedPrecondition as i32
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disconnected_read_rpcs_release_the_session() {
+    use arrow_flight::sql::client::FlightSqlServiceClient;
+    use std::time::Duration;
+    let h = base_harness().await;
+    let token = format!("Bearer {}", valid_token("read-cancellation"));
+    for raw in [false, true] {
+        let session = if raw {
+            "raw-read-cancellation"
+        } else {
+            "typed-read-cancellation"
+        };
+        let headers = project_headers(&token, session, PROJECT);
+        let mut cli = client(&h.endpoint).await;
+        let mut sql_cli = FlightSqlServiceClient::new_from_inner(cli.clone());
+        for (key, value) in &headers {
+            sql_cli.set_header(*key, *value);
+        }
+        run_select(&mut cli, &headers, "SELECT 1").await.unwrap();
+        // PIVOT binds its categories by reading rows, before GetFlightInfo can
+        // return a schema. Dropping the RPC must cancel that server-side work.
+        let sql = "SELECT * FROM (PIVOT (SELECT i % 2 AS category, i FROM range(1000000000) t(i)) ON category USING sum(i))";
+        if raw {
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(150),
+                    cli.get_flight_info(with_headers(FlightDescriptor::new_cmd(sql), &headers))
+                )
+                .await
+                .is_err()
+            );
+        } else {
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(150),
+                    sql_cli.execute(sql.into(), None)
+                )
+                .await
+                .is_err()
+            );
+        }
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run_select(&mut cli, &headers, "SELECT 42"),
+        )
+        .await
+        .expect("schema planning survived the dropped RPC")
+        .unwrap();
+
+        let info = sql_cli
+            .execute("SELECT sum(i) FROM range(1000000000) t(i)".into(), None)
+            .await
+            .unwrap();
+        let ticket = info.endpoint.into_iter().next().unwrap().ticket.unwrap();
+        let stream = cli
+            .do_get(with_headers(ticket, &headers))
+            .await
+            .unwrap()
+            .into_inner();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(stream);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run_select(&mut cli, &headers, "SELECT 43"),
+        )
+        .await
+        .expect("stream execution survived the dropped RPC")
+        .unwrap();
+    }
 }

@@ -43,12 +43,14 @@ pub(crate) async fn get_flight_info_statement(
         );
     }
 
+    let cancellation = Arc::new(crate::engine::cancellation::RequestCancellation::default());
+    let _cancel_on_disconnect = crate::engine::cancellation::CancelOnDrop(cancellation.clone());
     let should_plan_schema = !multi_statement && (returns_rows || parsed.is_none());
     let schema = if should_plan_schema {
         let sql_for_schema = sql.clone();
         let session_for_schema = Arc::clone(&session);
         match tokio::task::spawn_blocking(move || {
-            session_for_schema.schema_for_query(&sql_for_schema)
+            session_for_schema.schema_for_query_cancellable(&sql_for_schema, Some(&cancellation))
         })
         .await
         {
@@ -57,8 +59,13 @@ pub(crate) async fn get_flight_info_statement(
                 returns_rows = true;
                 schema
             }
+            Ok(Err(ServerError::Cancelled)) => {
+                return Err(SwanFlightSqlService::status_from_error(
+                    ServerError::Cancelled,
+                ));
+            }
             Ok(Err(err)) if returns_rows => {
-                return Err(SwanFlightSqlService::status_from_error(err))
+                return Err(SwanFlightSqlService::status_from_error(err));
             }
             Ok(Err(err)) => {
                 debug!(%err, "treating statement as command after schema planning failed");
@@ -256,5 +263,93 @@ async fn execute_ephemeral_ticket_statement(
         Ok(SwanFlightSqlService::empty_affected_rows_response(
             affected_rows,
         ))
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use crate::config::{ServerConfig, SessionIdMode};
+    use crate::engine::EngineFactory;
+    use crate::metrics::Metrics;
+    use crate::session::{SessionId, registry::SessionRegistry};
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_schema_planning_releases_the_connection() -> anyhow::Result<()> {
+        let config = ServerConfig::default();
+        let registry = Arc::new(SessionRegistry::new(
+            &config,
+            Arc::new(EngineFactory::new_without_extension_bootstrap(&config)),
+        )?);
+        let session = registry
+            .get_or_create_by_id(&SessionId::from_string("planning-cancel".into()))
+            .await?;
+        let cleanup = session.connection.interrupt_handle();
+        let service = SwanFlightSqlService::new(
+            registry,
+            Arc::new(Metrics::new(100, 16)),
+            SessionIdMode::PeerAddr,
+            "grpc://localhost:1".into(),
+        );
+        // Dynamic PIVOT reads its categories during binding, before DoGet.
+        let sql = "PIVOT (SELECT i % 2 AS category, i FROM range(1000000000) t(i)) ON category USING sum(i)";
+        let mut request = Request::new(FlightDescriptor::new_cmd(sql));
+        request
+            .metadata_mut()
+            .insert("airport-client-session-id", "planning-cancel".parse()?);
+        let task = tokio::spawn(async move {
+            get_flight_info_statement(
+                &service,
+                CommandStatementQuery {
+                    query: sql.into(),
+                    transaction_id: None,
+                },
+                request,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if session.connection.conn.try_lock().is_err() {
+                    break;
+                }
+                assert!(!task.is_finished(), "planning finished before cancellation");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        task.abort();
+        let _ = task.await;
+        let released = tokio::time::timeout(Duration::from_secs(2), async {
+            while session.connection.conn.try_lock().is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        // Clean up even on the pre-fix failure, so no blocking task survives.
+        if !released {
+            for _ in 0..100 {
+                if session.connection.conn.try_lock().is_ok() {
+                    break;
+                }
+                cleanup.interrupt();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        let connection = session.connection.clone();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                connection.execute_statement("CREATE TABLE after_cancel AS SELECT 42 AS value")
+            }),
+        )
+        .await???;
+        assert!(
+            released,
+            "disconnect left schema planning running on SwanLake"
+        );
+        Ok(())
     }
 }

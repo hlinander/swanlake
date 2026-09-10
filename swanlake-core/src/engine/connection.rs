@@ -72,19 +72,40 @@ impl DuckDbConnection {
     /// Bind read queries once and export their types through an empty local
     /// result. Commands retain their existing Arrow execution path.
     pub fn schema_for_query(&self, sql: &str) -> Result<Schema, ServerError> {
+        self.schema_for_query_cancellable(sql, None)
+    }
+
+    pub(crate) fn schema_for_query_cancellable(
+        &self,
+        sql: &str,
+        cancellation: Option<&super::cancellation::RequestCancellation>,
+    ) -> Result<Schema, ServerError> {
         Self::validate_sql(sql)?;
-        {
-            let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(query) = result_projection::schema_query(&conn, sql)? {
-                let mut stmt = conn.prepare(&query)?;
-                let stream = Self::stream_arrow_with_params(&mut stmt, None)?;
-                return Ok(stream.get_schema().as_ref().clone());
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let active = cancellation
+            .map(|c| c.activate(conn.interrupt_handle()))
+            .transpose()?;
+        let result = (|| {
+            let query = match result_projection::schema_query(&conn, sql)? {
+                Some(query) => query,
+                None => {
+                    let body = sql.trim_end_matches(';').trim();
+                    result_projection::for_query(&conn, body, None)?
+                        .unwrap_or_else(|| body.to_string())
+                }
+            };
+            if let Some(cancellation) = cancellation {
+                cancellation.check()?;
             }
-        }
-        self.with_arrow_prepared(sql.trim_end_matches(';').trim(), None, |stmt| {
-            let stream = Self::stream_arrow_with_params(stmt, None)?;
+            let mut stmt = conn.prepare(&query)?;
+            let stream = Self::stream_arrow_with_params(&mut stmt, None)?;
             Ok(stream.get_schema().as_ref().clone())
-        })
+        })();
+        drop(active);
+        if let Some(cancellation) = cancellation {
+            cancellation.check()?;
+        }
+        result
     }
 
     /// Streaming and buffered query discovery export the same bound schema.
@@ -120,19 +141,53 @@ impl DuckDbConnection {
     /// 2. `Batch` - Zero or more record batches
     /// 3. `Done` - Final message with totals, OR `Error` if something failed
     ///
-    /// Pass an optional interrupt handle to enable cancellation when the
-    /// receiver is closed.
-    #[instrument(skip(self, tx, interrupt_handle), fields(sql = %sql))]
+    /// Stream a read query, optionally interrupting when the receiver closes.
     pub fn execute_query_streaming(
         &self,
         sql: &str,
         tx: mpsc::Sender<StreamingBatch>,
         interrupt_handle: Option<std::sync::Arc<duckdb::InterruptHandle>>,
     ) -> Result<(), ServerError> {
+        self.stream_query(sql, None, tx, interrupt_handle, None)
+    }
+
+    /// Parameterized form of execute_query_streaming.
+    pub fn execute_query_with_params_streaming(
+        &self,
+        sql: &str,
+        params: &[Value],
+        tx: mpsc::Sender<StreamingBatch>,
+        interrupt_handle: Option<std::sync::Arc<duckdb::InterruptHandle>>,
+    ) -> Result<(), ServerError> {
+        self.stream_query(sql, Some(params), tx, interrupt_handle, None)
+    }
+
+    pub(crate) fn stream_query_cancellable(
+        &self,
+        sql: &str,
+        params: Option<&[Value]>,
+        tx: mpsc::Sender<StreamingBatch>,
+        cancellation: &super::cancellation::RequestCancellation,
+    ) -> Result<(), ServerError> {
+        self.stream_query(sql, params, tx, None, Some(cancellation))
+    }
+
+    #[instrument(skip(self, tx, params, interrupt_handle, cancellation), fields(sql = %sql))]
+    fn stream_query(
+        &self,
+        sql: &str,
+        params: Option<&[Value]>,
+        tx: mpsc::Sender<StreamingBatch>,
+        interrupt_handle: Option<std::sync::Arc<duckdb::InterruptHandle>>,
+        cancellation: Option<&super::cancellation::RequestCancellation>,
+    ) -> Result<(), ServerError> {
         // `no_output` collects CPU metrics without taking DuckDB 1.5.5's JSON
         // rendering path, which aborts after an attached-catalog stream ends.
         {
             let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(cancellation) = cancellation {
+                cancellation.check()?;
+            }
             let _ = conn.execute_batch(
                 "SET enable_profiling = 'no_output'; \
                  SET custom_profiling_settings = '{\"OPERATOR_CPU_TIME\": \"true\", \"CPU_TIME_ACTUAL\": \"true\"}';"
@@ -140,8 +195,8 @@ impl DuckDbConnection {
         }
 
         // Now execute the full query in true streaming mode
-        self.with_arrow_prepared(sql, None, |stmt| {
-            let arrow = Self::stream_arrow_with_params(stmt, None)?;
+        self.with_arrow_prepared_cancellable(sql, params, cancellation, |stmt| {
+            let arrow = Self::stream_arrow_with_params(stmt, params)?;
             let schema = arrow.get_schema();
 
             if tx
@@ -203,95 +258,7 @@ impl DuckDbConnection {
         })
     }
 
-    /// Execute a query with parameters and stream results through a channel.
-    ///
-    /// This method uses DuckDB's true streaming execution with backpressure.
-    ///
-    /// Pass an optional interrupt handle to enable cancellation when the
-    /// receiver is closed.
-    #[instrument(skip(self, tx, params, interrupt_handle), fields(sql = %sql, param_count = params.len()))]
-    pub fn execute_query_with_params_streaming(
-        &self,
-        sql: &str,
-        params: &[Value],
-        tx: mpsc::Sender<StreamingBatch>,
-        interrupt_handle: Option<std::sync::Arc<duckdb::InterruptHandle>>,
-    ) -> Result<(), ServerError> {
-        // `no_output` collects CPU metrics without taking DuckDB 1.5.5's JSON
-        // rendering path, which aborts after an attached-catalog stream ends.
-        {
-            let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-            let _ = conn.execute_batch(
-                "SET enable_profiling = 'no_output'; \
-                 SET custom_profiling_settings = '{\"OPERATOR_CPU_TIME\": \"true\", \"CPU_TIME_ACTUAL\": \"true\"}';"
-            );
-        }
-
-        // Now execute the full query in true streaming mode
-        self.with_arrow_prepared(sql, Some(params), |stmt| {
-            let arrow = Self::stream_arrow_with_params(stmt, Some(params))?;
-            let schema = arrow.get_schema();
-
-            if tx
-                .blocking_send(StreamingBatch::Schema(schema.as_ref().clone()))
-                .is_err()
-            {
-                debug!("streaming receiver dropped before schema sent");
-                return Ok(());
-            }
-
-            // Stream batches with backpressure
-            let mut total_rows = 0usize;
-            let mut total_bytes = 0usize;
-            let mut batch_count = 0usize;
-            for batch in arrow {
-                // Check if client cancelled before processing batch
-                if tx.is_closed() {
-                    info!(batch_count, total_rows, "streaming receiver closed, interrupting query");
-                    if let Some(ref handle) = interrupt_handle {
-                        handle.interrupt();
-                    }
-                    return Ok(());
-                }
-
-                batch_count += 1;
-                let batch_rows = batch.num_rows();
-                let batch_bytes = batch.get_array_memory_size();
-                total_rows += batch_rows;
-                total_bytes += batch_bytes;
-
-                debug!(
-                    batch_count,
-                    batch_rows,
-                    batch_bytes,
-                    total_rows,
-                    total_bytes,
-                    "streaming batch (with params)"
-                );
-
-                if tx.blocking_send(StreamingBatch::Batch(batch)).is_err() {
-                    info!(batch_count, total_rows, "streaming receiver dropped, interrupting query");
-                    if let Some(ref handle) = interrupt_handle {
-                        handle.interrupt();
-                    }
-                    return Ok(());
-                }
-            }
-
-            // Send completion message
-            let _ = tx.blocking_send(StreamingBatch::Done {
-                total_rows,
-                total_bytes,
-            });
-            info!(
-                batch_count,
-                total_rows, total_bytes, "streaming query with params completed"
-            );
-            Ok(())
-        })
-    }
-
-    /// Execute a query with parameters
+    /// Execute a query with bound parameters.
     #[instrument(skip(self, params), fields(sql = %sql, param_count = params.len()))]
     pub fn execute_query_with_params(
         &self,
@@ -537,15 +504,41 @@ impl DuckDbConnection {
     where
         F: FnOnce(&mut Statement) -> Result<T, ServerError>,
     {
+        self.with_arrow_prepared_cancellable(sql, params, None, f)
+    }
+
+    fn with_arrow_prepared_cancellable<T, F>(
+        &self,
+        sql: &str,
+        params: Option<&[Value]>,
+        cancellation: Option<&super::cancellation::RequestCancellation>,
+        f: F,
+    ) -> Result<T, ServerError>
+    where
+        F: FnOnce(&mut Statement) -> Result<T, ServerError>,
+    {
         Self::validate_sql(sql)?;
         let conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let query =
-            result_projection::for_query(&conn, sql, params)?.unwrap_or_else(|| sql.to_string());
-        let mut stmt = conn.prepare(&query)?;
-        f(&mut stmt)
+        let active = cancellation
+            .map(|c| c.activate(conn.interrupt_handle()))
+            .transpose()?;
+        let result = (|| {
+            let query = result_projection::for_query(&conn, sql, params)?
+                .unwrap_or_else(|| sql.to_string());
+            if let Some(cancellation) = cancellation {
+                cancellation.check()?;
+            }
+            let mut stmt = conn.prepare(&query)?;
+            f(&mut stmt)
+        })();
+        drop(active);
+        if let Some(cancellation) = cancellation {
+            cancellation.check()?;
+        }
+        result
     }
 
     /// Prepare a statement under the connection lock and run the provided closure.
