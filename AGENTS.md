@@ -6,7 +6,7 @@ Concise reference for language-model agents working on the SwanLake codebase.
 - **Purpose**: Arrow Flight SQL server backed by DuckDB with optional DuckLake extensions.
 - **Runtime**: Rust async service (`tokio`) exposing prepared statements, streaming results, and session-scoped state.
 - **Sessions**: Each gRPC connection owns a DuckDB connection; idle sessions auto-expire (default 15 min).
-- **Performance**: Schema discovery executes queries as-is, relying on DuckDB's lazy streaming to avoid unnecessary data scanning.
+- **Performance**: Read-query schema discovery binds once with DESCRIBE and exports the types through an empty local result.
 
 ## Code Map
 - `swanlake-server/src/main.rs` — bootstrap: config load, tracing, gRPC server, session janitor.

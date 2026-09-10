@@ -18,16 +18,9 @@ pub(super) fn for_query(
     let Some(body) = query_body(sql) else {
         return Ok(None);
     };
-    let Ok(mut describe) = conn.prepare(&format!("DESCRIBE {body}")) else {
-        // WITH can also introduce DML, which DESCRIBE cannot wrap.
+    let Some(columns) = describe_columns(conn, body, params)? else {
         return Ok(None);
     };
-    let nulls = vec![Value::Null; describe.parameter_count()];
-    let columns = describe
-        .query_map(params_from_iter(params.unwrap_or(&nulls)), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
     let variants = columns
         .iter()
         .map(|(_, ty)| contains_variant(ty))
@@ -62,6 +55,51 @@ pub(super) fn for_query(
         "SELECT {projection} FROM (\n{body}\n) AS \"__swanlake_result\"({})",
         names.join(", ")
     )))
+}
+
+/// Build a local, empty result with the bound query's exported types. Binding
+/// may read remote metadata; the schema result never binds that source again.
+pub(super) fn schema_query(conn: &Connection, sql: &str) -> Result<Option<String>, ServerError> {
+    let Some(body) = query_body(sql) else {
+        return Ok(None);
+    };
+    let Some(columns) = describe_columns(conn, body, None)? else {
+        return Ok(None);
+    };
+    let projection = columns
+        .iter()
+        .map(|(name, ty)| {
+            let exported_type = if contains_variant(ty) {
+                "JSON"
+            } else {
+                ty.as_str()
+            };
+            format!(
+                "CAST(NULL AS {exported_type}) AS \"{}\"",
+                name.replace('"', "\"\"")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(Some(format!("SELECT {projection} WHERE false")))
+}
+
+fn describe_columns(
+    conn: &Connection,
+    body: &str,
+    params: Option<&[Value]>,
+) -> Result<Option<Vec<(String, String)>>, ServerError> {
+    let Ok(mut describe) = conn.prepare(&format!("DESCRIBE {body}")) else {
+        // WITH can also introduce DML, which DESCRIBE cannot wrap.
+        return Ok(None);
+    };
+    let nulls = vec![Value::Null; describe.parameter_count()];
+    let columns = describe
+        .query_map(params_from_iter(params.unwrap_or(&nulls)), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(columns))
 }
 
 /// DESCRIBE emits VARIANT types before an array suffix, container delimiter or
