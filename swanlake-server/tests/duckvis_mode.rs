@@ -1462,3 +1462,35 @@ async fn python_interrupt_through_airport_and_disconnected_flight() {
     );
     execute_sql_action(&mut observer, &headers, "CREATE TABLE still_preserved AS SELECT * FROM external_kernel('assert retained == 7\n42', exec_id := 'after-queue')").await.expect("queued cancellation changed kernel state");
 }
+
+#[tokio::test]
+async fn guarded_execution_acknowledges_sql_errors_and_auth_rejections() {
+    async fn execute(
+        cli: &mut FlightServiceClient<Channel>,
+        headers: &[(&str, &str)],
+        sql: &str,
+    ) -> Value {
+        let response = cli.do_action(with_headers(Action {
+            r#type: "execute_guarded".into(), body: sql.as_bytes().to_vec().into(),
+        }, headers)).await.unwrap();
+        let first = response.into_inner().message().await.unwrap().unwrap();
+        serde_json::from_slice(&first.body).unwrap()
+    }
+    let h = base_harness().await;
+    let mut cli = client(&h.endpoint).await;
+    let token = format!("Bearer {}", valid_token("guarded-user"));
+    let headers = project_headers(&token, "guarded-session", PROJECT);
+    let success = execute(&mut cli, &headers, "SELECT 1").await;
+    assert_eq!(success, json!({"version":1, "completed":true, "error":null}));
+    let failed = execute(&mut cli, &headers, "SELECT * FROM missing_table").await;
+    assert_eq!(failed["completed"], true);
+    assert!(failed["error"]["message"].as_str().unwrap().contains("missing_table"));
+    let denied = execute(&mut cli, &[], "SELECT 1").await;
+    assert_eq!(denied["completed"], true);
+    assert_eq!(denied["error"]["code"], tonic::Code::Unauthenticated as i32);
+    let mut fenced_headers = headers.clone();
+    fenced_headers.push(("x-expected-session-nonce", "incorrect-nonce"));
+    let fenced = execute(&mut cli, &fenced_headers, "SELECT 1").await;
+    assert_eq!(fenced["completed"], true);
+    assert_eq!(fenced["error"]["code"], tonic::Code::FailedPrecondition as i32);
+}

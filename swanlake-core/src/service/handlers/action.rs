@@ -1159,12 +1159,32 @@ struct AirportExecuteParameters {
     sql: String,
 }
 
+/// Completion acknowledgement for loaders that must distinguish a finished SQL
+/// error from a lost RPC. This envelope is sent only after execution has returned;
+/// cancel_execution acknowledges an interrupt request, not completion.
+pub(crate) async fn do_action_execute_guarded(
+    service: &SwanFlightSqlService,
+    request: Request<Action>,
+) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
+    let error = do_action_execute(service, request).await.err().map(
+        |status| serde_json::json!({"code": status.code() as i32, "message": status.message()}),
+    );
+    let body = serde_json::to_vec(&serde_json::json!({
+        "version": 1, "completed": true, "error": error
+    }))
+    .map_err(|e| Status::internal(e.to_string()))?;
+    Ok(Response::new(Box::pin(stream::iter(vec![Ok(
+        arrow_flight::Result { body: body.into() },
+    )]))))
+}
+
 /// Handle the "execute" action from DuckDB Airport extension
 /// Executes arbitrary SQL (DDL/DML) that doesn't return rows
 pub(crate) async fn do_action_execute(
     service: &SwanFlightSqlService,
     request: Request<Action>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
+    let guarded = request.get_ref().r#type == "execute_guarded";
     let session = service.prepare_request(&request).await?;
     let cancellation = Arc::new(crate::engine::cancellation::RequestCancellation::default());
     if let Some(id) = request.metadata().get("x-swanlake-request-id") {
@@ -1199,11 +1219,14 @@ pub(crate) async fn do_action_execute(
         .transpose()?;
     let body = &request.get_ref().body;
 
-    info!(
-        body_len = body.len(),
-        body_hex = %hex::encode(&body[..body.len().min(100)]),
-        "handling execute action"
-    );
+    // Guarded loader statements can contain source credentials.
+    if !guarded {
+        info!(
+            body_len = body.len(),
+            body_hex = %hex::encode(&body[..body.len().min(100)]),
+            "handling execute action"
+        );
+    }
 
     // Try to parse the SQL from the body
     // Airport sends the body as msgpack - try different formats
@@ -1214,17 +1237,23 @@ pub(crate) async fn do_action_execute(
     } else {
         // First try: parse as msgpack map with "sql" field
         if let Ok(params) = rmp_serde::from_slice::<AirportExecuteParameters>(body) {
-            info!(sql = %params.sql, "parsed SQL from msgpack map");
+            if !guarded {
+                info!(sql = %params.sql, "parsed SQL from msgpack map");
+            }
             params.sql
         }
         // Second try: parse as raw msgpack string
         else if let Ok(sql_str) = rmp_serde::from_slice::<String>(body) {
-            info!(sql = %sql_str, "parsed SQL from msgpack string");
+            if !guarded {
+                info!(sql = %sql_str, "parsed SQL from msgpack string");
+            }
             sql_str
         }
         // Third try: treat as raw UTF-8 string
         else if let Ok(sql_str) = std::str::from_utf8(body) {
-            info!(sql = %sql_str, "parsed SQL from raw UTF-8");
+            if !guarded {
+                info!(sql = %sql_str, "parsed SQL from raw UTF-8");
+            }
             sql_str.to_string()
         } else {
             return Err(Status::invalid_argument(
@@ -1233,7 +1262,9 @@ pub(crate) async fn do_action_execute(
         }
     };
 
-    info!(sql = %sql, "executing action SQL");
+    if !guarded {
+        info!(sql = %sql, "executing action SQL");
+    }
 
     // Execute the SQL statement
     let sql_clone = sql.clone();
@@ -1249,7 +1280,9 @@ pub(crate) async fn do_action_execute(
     .map_err(SwanFlightSqlService::status_from_join)?
     .map_err(SwanFlightSqlService::status_from_error)?;
 
-    info!(sql = %sql, affected_rows, "execute action completed");
+    if !guarded {
+        info!(sql = %sql, affected_rows, "execute action completed");
+    }
 
     // Return affected rows as msgpack
     // Airport expects a result that can be converted to a table
