@@ -1442,7 +1442,7 @@ pub(crate) async fn do_action_duckvis_attach(
         .resolve_attachment(&auth.subject, &auth.project_id, &bind_id)
         .await
         .map_err(|e| e.into_status())?
-        .ok_or_else(|| crate::duckvis::DuckvisError::PermissionDenied.into_status())?;
+        .ok_or_else(|| crate::duckvis::DuckvisError::AttachmentNotResolvable.into_status())?;
 
     // Non-writer sessions enforce the attachment's access mode inside DuckDB.
     // NOTE: `normalized` contains the secret config and must never be logged.

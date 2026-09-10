@@ -29,10 +29,29 @@ pub enum DuckvisError {
     /// Missing/malformed/expired/bad-signature token, unknown kid after JWKS
     /// refresh, wrong iss/aud. Generic — no failure-mode split (C4).
     Unauthenticated,
-    /// Authorization denied: authz-check deny, token sub ≠ session subject,
-    /// project header ≠ session project, resolve deny, or a raw ATTACH in
-    /// user SQL (C6).
+    /// Authorization denied by the oracle: `check_project_view` or
+    /// `check_project_mutate_data` said no. Keeps the bare "permission denied"
+    /// text — it is the one cause for which that string is the whole truth.
+    ///
+    /// The four variants below were folded into this one until 2026-09-10.
+    /// They all still map to `Code::PermissionDenied`, so nothing on the wire
+    /// changes; they differ only in message. C4's requirement is that
+    /// `Unauthenticated` never reveals *why a token failed*, and that variant
+    /// is untouched — a caller who has already authenticated and is being told
+    /// about their own session learns nothing they could not learn by asking.
+    /// Flattening them cost a day of chat-runner downtime that no one could
+    /// diagnose, because "permission denied" was equally consistent with an
+    /// unpinned attachment and with a session that had simply been evicted.
     PermissionDenied,
+    /// The token's subject is not the subject this session is bound to.
+    SessionSubjectMismatch,
+    /// The project header is not the project this session is bound to.
+    SessionProjectMismatch,
+    /// Two clients raced to bind one session id and this one lost.
+    SessionBindRace,
+    /// duckvis-api resolved the bind_id to nothing: no project pin allowlists
+    /// this attachment.
+    AttachmentNotResolvable,
     /// Missing `x-duckvis-project-id` at session creation, or a malformed
     /// `duckvis_attach` body.
     InvalidArgument,
@@ -49,6 +68,18 @@ impl DuckvisError {
         match self {
             DuckvisError::Unauthenticated => Status::unauthenticated("authentication required"),
             DuckvisError::PermissionDenied => Status::permission_denied("permission denied"),
+            DuckvisError::SessionSubjectMismatch => {
+                Status::permission_denied("session is bound to a different subject")
+            }
+            DuckvisError::SessionProjectMismatch => {
+                Status::permission_denied("session is bound to a different project")
+            }
+            DuckvisError::SessionBindRace => {
+                Status::permission_denied("session bind lost a race with another client")
+            }
+            DuckvisError::AttachmentNotResolvable => {
+                Status::permission_denied("attachment is not allowlisted for this project")
+            }
             DuckvisError::InvalidArgument => Status::invalid_argument("invalid argument"),
             DuckvisError::AttachInvalid => {
                 Status::invalid_argument("invalid attachment configuration")
@@ -65,6 +96,12 @@ impl std::fmt::Display for DuckvisError {
         let s = match self {
             DuckvisError::Unauthenticated => "unauthenticated",
             DuckvisError::PermissionDenied => "permission denied",
+            DuckvisError::SessionSubjectMismatch => "session is bound to a different subject",
+            DuckvisError::SessionProjectMismatch => "session is bound to a different project",
+            DuckvisError::SessionBindRace => "session bind lost a race with another client",
+            DuckvisError::AttachmentNotResolvable => {
+                "attachment is not allowlisted for this project"
+            }
             DuckvisError::InvalidArgument => "invalid argument",
             DuckvisError::AttachInvalid => "invalid attachment configuration",
             DuckvisError::Unavailable => "service unavailable",

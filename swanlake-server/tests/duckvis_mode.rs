@@ -688,6 +688,78 @@ async fn authz_check_deny_is_permission_denied() {
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
 }
 
+/// A session the server no longer has must report session LOSS, not a
+/// permission problem — even when the re-bind that would replace it is denied.
+///
+/// The client sends a nonce, so it believes it holds a live session; the
+/// registry has none, because the idle sweep took it. Until the tripwire ran
+/// ahead of the bind, this request fell through to the create path and
+/// reported whatever the authz oracle said. On a deny that is `permission
+/// denied` — the same text an unpinned attachment produces — so duckvis could
+/// not tell the two apart, parked the attachment in `Error`, and re-fired it
+/// against the same dead session on every bearer refresh. That is the
+/// 2026-09-10 chat-runner outage, and this is the assertion that keeps it
+/// fixed.
+#[tokio::test]
+async fn a_lost_session_reports_session_loss_even_when_the_rebind_is_denied() {
+    let h = base_harness().await;
+    let mut cli = client(&h.endpoint).await;
+    let token = format!("Bearer {}", valid_token("user-1"));
+
+    // Nothing under this session id: exactly what eviction leaves behind.
+    assert_eq!(h.registry.snapshot().total_sessions, 0);
+    // And the re-bind would be refused — the case that used to be masked.
+    h.mock.check_allow.store(false, Ordering::SeqCst);
+
+    let mut headers = project_headers(&token, SESSION, PROJECT);
+    headers.push(("x-expected-session-nonce", "nonce-of-the-evicted-session"));
+    let err = session_info(&mut cli, &headers).await.expect_err("fail");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    // duckvis's `is_session_loss_error` matches this text. It is what makes the
+    // client drop its nonce and re-attach instead of retrying into the grave.
+    assert!(
+        err.message().contains("session was recreated"),
+        "{}",
+        err.message()
+    );
+}
+
+/// The boundary: a client that never claimed a session still gets a plain
+/// authorization failure. Without this, the tripwire above would relabel every
+/// genuine deny as session loss and send clients into a reset loop.
+#[tokio::test]
+async fn a_denied_first_contact_is_not_reported_as_session_loss() {
+    let h = base_harness().await;
+    h.mock.check_allow.store(false, Ordering::SeqCst);
+    let mut cli = client(&h.endpoint).await;
+    let token = format!("Bearer {}", valid_token("user-1"));
+    // No nonce header: this caller is not asserting a prior session.
+    let headers = project_headers(&token, SESSION, PROJECT);
+    let err = session_info(&mut cli, &headers).await.expect_err("fail");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert_eq!(err.message(), "permission denied");
+}
+
+/// Every denial keeps `Code::PermissionDenied` — nothing on the wire changes —
+/// but each now says which of the folded causes it was.
+#[tokio::test]
+async fn a_subject_mismatch_names_itself() {
+    let h = base_harness().await;
+    let mut cli = client(&h.endpoint).await;
+    let owner = format!("Bearer {}", valid_token("user-1"));
+    session_info(&mut cli, &project_headers(&owner, SESSION, PROJECT))
+        .await
+        .expect("create owner session");
+
+    let other = format!("Bearer {}", valid_token("user-2"));
+    let err = session_info(&mut cli, &project_headers(&other, SESSION, PROJECT))
+        .await
+        .expect_err("another subject cannot ride this session");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert_eq!(err.message(), "session is bound to a different subject");
+}
+
 #[tokio::test]
 async fn explicit_close_releases_only_the_callers_session() {
     let h = base_harness().await;

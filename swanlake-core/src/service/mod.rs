@@ -198,19 +198,53 @@ impl SwanFlightSqlService {
         // Optional project header.
         let project_header = duckvis_project_header(request);
 
+        let existing = self.registry.get_by_id(session_id);
+
+        // (2) Session-loss tripwire, ahead of the bind below.
+        //
+        // A client sends `x-expected-session-nonce` only when it believes it
+        // holds a live session. If the registry has none, that session is gone
+        // — idle-evicted, or lost to a restart — which is a fact about the
+        // session, not a question about the caller's permissions.
+        //
+        // This must run BEFORE (4) re-binds, because the re-bind masks it in
+        // exactly the case that matters. A bind that SUCCEEDS mints a fresh
+        // nonce and the check in `prepare_request` reports the loss correctly;
+        // a bind that is DENIED returns `permission denied` — the same string
+        // this server returns for an unpinned attachment and for a subject
+        // mismatch. A client cannot tell those apart, so it cannot know to
+        // reset: duckvis parks the attachment in `Error` and re-fires it
+        // against the same dead session on every bearer refresh, forever. That
+        // is the 2026-09-10 chat-runner outage.
+        //
+        // Placed after (1) rather than at the top of `prepare_request` because
+        // session ids are client-chosen: answering this before the token is
+        // validated would let an unauthenticated caller probe which session
+        // ids exist.
+        if existing.is_none() {
+            if let Some(expected) = request.metadata().get("x-expected-session-nonce") {
+                if let Ok(expected_str) = expected.to_str() {
+                    return Err(Status::failed_precondition(format!(
+                        "session was recreated: expected nonce {}, got none",
+                        expected_str
+                    )));
+                }
+            }
+        }
+
         // (3) Existing session: enforce subject + project match.
-        if let Some(existing) = self.registry.get_by_id(session_id) {
+        if let Some(existing) = existing {
             let auth = existing.auth().ok_or_else(|| {
                 // A session without auth in duckvis mode is an internal invariant
                 // violation.
                 Status::internal("session missing duckvis auth binding")
             })?;
             if auth.subject != claims.sub {
-                return Err(crate::duckvis::DuckvisError::PermissionDenied.into_status());
+                return Err(crate::duckvis::DuckvisError::SessionSubjectMismatch.into_status());
             }
             if let Some(project_id) = &project_header {
                 if project_id != &auth.project_id {
-                    return Err(crate::duckvis::DuckvisError::PermissionDenied.into_status());
+                    return Err(crate::duckvis::DuckvisError::SessionProjectMismatch.into_status());
                 }
             }
             Span::current().record("duckvis_project_id", auth.project_id.as_str());
@@ -255,7 +289,7 @@ impl SwanFlightSqlService {
                 Span::current().record("duckvis_project_id", project_id.as_str());
                 Ok(session)
             }
-            _ => Err(crate::duckvis::DuckvisError::PermissionDenied.into_status()),
+            _ => Err(crate::duckvis::DuckvisError::SessionBindRace.into_status()),
         }
     }
 
