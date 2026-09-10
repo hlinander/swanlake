@@ -178,7 +178,9 @@ impl SwanFlightSqlService {
         let sql_clone = sql.clone();
 
         tokio::task::spawn_blocking(move || {
-            let result = match params {
+            // This path executes registration-validated SQL on the connection
+            // directly, so the write-hardening lockdown applies here.
+            let result = session.ensure_lockdown().and_then(|()| match params {
                 Some(ref p) => session.connection.execute_query_with_params_streaming(
                     &sql_clone,
                     p,
@@ -190,7 +192,7 @@ impl SwanFlightSqlService {
                     tx.clone(),
                     Some(interrupt_handle_clone.clone()),
                 ),
-            };
+            });
 
             if let Err(e) = result {
                 error!(%e, "streaming query execution failed");

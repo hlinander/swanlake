@@ -1456,6 +1456,12 @@ pub(crate) async fn do_action_duckvis_attach(
     let attachment_name = resolved.name.clone();
     let attachment_id = resolved.attachment_id.clone();
 
+    // The armed lake's data root feeds the session lockdown's allowed set
+    // (write-hardening §4); a metadata-only attach contributes none.
+    if let Some(root) = crate::duckvis::attach::attach_data_path(&normalized) {
+        session.register_armed_root(&root);
+    }
+
     let search_path_sql = parsed
         .add_to_search_path
         .then(|| crate::duckvis::attach::catalog_search_path_sql(&attachment_name))

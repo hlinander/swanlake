@@ -23,7 +23,7 @@ use crate::config::ServerConfig;
 use crate::engine::EngineFactory;
 use crate::error::ServerError;
 use crate::session::id::SessionId;
-use crate::session::Session;
+use crate::session::{LockdownTemplate, Session};
 
 /// Registry for managing all active sessions
 #[derive(Clone)]
@@ -33,6 +33,8 @@ pub struct SessionRegistry {
     max_sessions: usize,
     session_timeout: Duration,
     session_permits: Arc<Semaphore>,
+    /// Write-hardening lockdown template stamped onto every authed session.
+    lockdown: LockdownTemplate,
 }
 
 #[derive(Clone, Serialize)]
@@ -66,6 +68,19 @@ impl SessionRegistry {
             "session registry initialized"
         );
 
+        let lockdown = LockdownTemplate {
+            scratch_directory: config.scratch_directory.clone().unwrap_or_else(|| {
+                std::env::temp_dir()
+                    .join("swanlake-scratch")
+                    .to_string_lossy()
+                    .into_owned()
+            }),
+            scratch_max_size: config
+                .scratch_max_size
+                .clone()
+                .unwrap_or_else(|| "10GB".to_string()),
+        };
+
         Ok(Self {
             inner: Arc::new(RwLock::new(RegistryInner {
                 sessions: HashMap::new(),
@@ -74,6 +89,7 @@ impl SessionRegistry {
             max_sessions,
             session_timeout,
             session_permits: Arc::new(Semaphore::new(max_sessions)),
+            lockdown,
         })
     }
 
@@ -246,12 +262,15 @@ impl SessionRegistry {
         .await
         .map_err(|e| ServerError::Internal(format!("connection task failed: {e}")))??;
 
-        // Create session with the specified ID and a shared Arc connection
+        // Create session with the specified ID and a shared Arc connection.
+        // The lockdown template rides only on authed (duckvis) sessions.
         let connection = Arc::new(connection);
+        let lockdown = auth.as_ref().map(|_| self.lockdown.clone());
         let session = Arc::new(Session::new_with_id_and_auth(
             session_id.clone(),
             connection,
             auth,
+            lockdown,
         ));
 
         // Register session

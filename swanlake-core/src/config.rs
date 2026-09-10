@@ -95,6 +95,14 @@ pub struct ServerConfig {
     /// Override DuckDB memory_limit (e.g. "16GB", "4096MB").
     /// When set, bypasses cgroup and meminfo auto-detection.
     pub memory_limit: Option<String>,
+    /// Per-instance scratch directory pinned as every duckvis session's
+    /// `temp_directory` and the one sanctioned write target for non-writers
+    /// (`SWANLAKE_SCRATCH_DIRECTORY`). Defaults to `swanlake-scratch` under
+    /// the OS temp directory.
+    pub scratch_directory: Option<String>,
+    /// `max_temp_directory_size` cap for duckvis sessions
+    /// (`SWANLAKE_SCRATCH_MAX_SIZE`). Defaults to `10GB`.
+    pub scratch_max_size: Option<String>,
     /// Enable duckvis mode: authenticate every Flight request against
     /// duckvis-api-issued tokens and resolve attachments by bind id.
     pub duckvis_enabled: bool,
@@ -148,6 +156,8 @@ impl Default for ServerConfig {
             metrics_slow_query_threshold_ms: Some(5000),
             metrics_history_size: Some(200),
             memory_limit: None,
+            scratch_directory: None,
+            scratch_max_size: None,
             duckvis_enabled: false,
             duckvis_api_url: None,
             duckvis_issuer: None,

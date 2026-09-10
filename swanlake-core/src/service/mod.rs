@@ -305,6 +305,9 @@ impl SwanFlightSqlService {
                     "ATTACH is managed by duckvis; use the duckvis_attach action",
                 )
             }
+            ServerError::WriteNotPermitted(what) => Status::permission_denied(format!(
+                "{what} requires the project's write permission"
+            )),
         }
     }
 
@@ -497,6 +500,9 @@ impl SwanFlightService {
 
         let interrupt_handle = session.connection.interrupt_handle();
         let schema = run_interruptible(interrupt_handle, move || {
+            // Binding can open files, and this path bypasses the guarded
+            // Session methods — the write-hardening lockdown applies here.
+            session_clone.ensure_lockdown()?;
             session_clone.connection.schema_for_streaming(&sql_for_schema)
         })
         .await?;

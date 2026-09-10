@@ -120,6 +120,15 @@ rejected on every SQL path in this mode; `DETACH` remains available.
 | `SWANLAKE_DUCKVIS_CLIENT_ID` | Service-account client id for the client-credentials token flow: the resource-server service account (SSA) name (e.g. `swanlake-wrx80`) | _(unset)_ |
 | `SWANLAKE_DUCKVIS_PRIVATE_KEY` | Service-account signing key: base64 (standard alphabet) of the raw 32-byte Ed25519 seed, used to sign the RFC 7523 client assertion presented to the token endpoint | _(unset)_ |
 | `SWANLAKE_DUCKVIS_JWKS_MAX_AGE_SECS` | Fallback JWKS cache max-age (seconds) when the response omits `Cache-Control: max-age` | `300` |
+| `SWANLAKE_SCRATCH_DIRECTORY` | Directory for session spill files (`temp_directory`); a session without the project write permission may also `COPY` into it | `swanlake-scratch` under the OS temp directory |
+| `SWANLAKE_SCRATCH_MAX_SIZE` | `max_temp_directory_size` for the scratch directory | `10GB` |
+
+Before an authenticated session's first user statement, SwanLake freezes its DuckDB configuration
+(`lock_configuration`): persistent secrets and extension install/autoload are disabled for every
+session; a session whose token lacks the project write permission additionally loses
+`enable_external_access` and is confined to `allowed_directories` = the data roots of its armed
+attachments plus the scratch directory. Statement admission rejects `COPY` to a file, `EXPORT
+DATABASE`, and `CALL ducklake_*` for such sessions.
 
 Notes:
 - Duckvis mode requires native Flight TLS or an actual upstream TLS terminator. Native TLS advertises

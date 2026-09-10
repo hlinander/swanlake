@@ -144,6 +144,141 @@ pub fn leading_keyword(statement: &str) -> Option<String> {
     Some(statement[start..i].to_uppercase())
 }
 
+/// Replace `--` line comments and `/* */` block comments with a single space,
+/// preserving quoted strings, so token scans over the result cannot be steered
+/// by comment text.
+pub fn strip_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    let n = bytes.len();
+
+    while i < n {
+        let ch = bytes[i] as char;
+        match ch {
+            '\'' | '"' => {
+                let quote = ch;
+                out.push(ch);
+                i += 1;
+                while i < n {
+                    let c = bytes[i] as char;
+                    out.push(c);
+                    i += 1;
+                    if c == quote {
+                        if i < n && bytes[i] as char == quote {
+                            out.push(quote);
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            '-' if i + 1 < n && bytes[i + 1] as char == '-' => {
+                i += 2;
+                while i < n && bytes[i] as char != '\n' {
+                    i += 1;
+                }
+                out.push(' ');
+            }
+            '/' if i + 1 < n && bytes[i + 1] as char == '*' => {
+                i += 2;
+                while i < n {
+                    if bytes[i] as char == '*' && i + 1 < n && bytes[i + 1] as char == '/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push(' ');
+            }
+            _ => {
+                out.push(ch);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The data root an armed ATTACH grants read access to: the value of the
+/// option block's `DATA_PATH` entry, unquoted. `None` for a statement with no
+/// option block or no `DATA_PATH` (a remote metadata-only attach).
+pub fn attach_data_path(statement: &str) -> Option<String> {
+    let parsed = parse_attach(statement)?;
+    let tokens = tokenize(&parsed.options);
+    let mut idx = 0usize;
+    while idx + 1 < tokens.len() {
+        if tokens[idx].eq_ignore_ascii_case("DATA_PATH") {
+            return Some(unquote(&tokens[idx + 1]));
+        }
+        idx += 1;
+    }
+    None
+}
+
+/// Whether a `CALL` statement invokes a `ducklake_*` function, under any
+/// catalog qualification or identifier quoting — DuckLake maintenance calls
+/// are writer operations (write-hardening §3).
+pub fn call_targets_ducklake(statement: &str) -> bool {
+    let tokens = tokenize(&strip_comments(statement));
+    if !tokens.first().is_some_and(|t| t.eq_ignore_ascii_case("CALL")) {
+        return false;
+    }
+    // Reassemble the function name from the tokens before the argument list;
+    // quoting splits a qualified name across tokens.
+    let mut name = String::new();
+    for token in &tokens[1..] {
+        if token == "(" {
+            break;
+        }
+        name.push_str(&unquote(token).to_ascii_lowercase());
+    }
+    name.rsplit('.').next().is_some_and(|f| f.starts_with("ducklake_"))
+}
+
+/// Whether a `COPY` statement's sink is a file: the first top-level
+/// `TO`/`FROM` keyword after `COPY` decides — `TO` writes a file, `FROM`
+/// loads into a table. A `COPY` with neither classifies as a file write
+/// (fail-safe).
+pub fn copy_writes_file(statement: &str) -> bool {
+    let tokens = tokenize(&strip_comments(statement));
+    if !tokens.first().is_some_and(|t| t.eq_ignore_ascii_case("COPY")) {
+        return false;
+    }
+    let mut depth = 0i32;
+    for token in &tokens[1..] {
+        match token.as_str() {
+            "(" => depth += 1,
+            ")" => depth -= 1,
+            _ if depth == 0 => {
+                if token.eq_ignore_ascii_case("TO") {
+                    return true;
+                }
+                if token.eq_ignore_ascii_case("FROM") {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Strip one level of matching outer quotes and collapse doubled inner quotes.
+fn unquote(token: &str) -> String {
+    let bytes = token.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0] as char;
+        if (first == '\'' || first == '"') && bytes[bytes.len() - 1] as char == first {
+            let inner = &token[1..token.len() - 1];
+            let doubled = format!("{first}{first}");
+            return inner.replace(&doubled, &first.to_string());
+        }
+    }
+    token.to_string()
+}
+
 /// Normalize an ATTACH statement to `ATTACH OR REPLACE <path> AS "<name>"[ (options)]`.
 ///
 /// The input must be a single ATTACH statement (any surrounding whitespace/comments
@@ -585,6 +720,64 @@ mod tests {
     fn splitter_ignores_semicolons_in_block_comment() {
         let segs = split_top_level_statements("SELECT 1 /* a;b;c */; SELECT 2");
         assert_eq!(segs.len(), 2);
+    }
+
+    #[test]
+    fn strip_comments_removes_comments_and_keeps_quotes() {
+        let stripped = strip_comments("SELECT 1 -- COPY TO\n, 2 /* EXPORT */, ' -- inside '");
+        assert!(!stripped.contains("COPY"));
+        assert!(!stripped.contains("EXPORT"));
+        assert!(stripped.contains("' -- inside '"));
+        assert!(stripped.contains('\n'));
+    }
+
+    #[test]
+    fn data_path_extracts_the_lake_root() {
+        let statement = "ATTACH OR REPLACE 'ducklake:postgres:host=x dbname=y' AS \"lake\" \
+                         (DATA_PATH '/data/lakes/lake1', ENCRYPTED, READ_ONLY)";
+        assert_eq!(
+            attach_data_path(statement).as_deref(),
+            Some("/data/lakes/lake1")
+        );
+    }
+
+    #[test]
+    fn data_path_absent_for_metadata_only_attach() {
+        assert_eq!(
+            attach_data_path("ATTACH OR REPLACE 'pg.db' AS \"wh\" (TYPE postgres, READ_ONLY)"),
+            None
+        );
+        assert_eq!(attach_data_path("ATTACH OR REPLACE 'db.duckdb' AS \"x\""), None);
+    }
+
+    #[test]
+    fn data_path_unquotes_escaped_paths() {
+        let statement = "ATTACH 'x' AS a (DATA_PATH '/data/it''s here')";
+        assert_eq!(attach_data_path(statement).as_deref(), Some("/data/it's here"));
+    }
+
+    #[test]
+    fn call_classifier_matches_ducklake_functions() {
+        assert!(call_targets_ducklake("CALL ducklake_expire_snapshots('lake')"));
+        assert!(call_targets_ducklake("cAlL DuckLake_Merge_Adjacent_Files()"));
+        assert!(call_targets_ducklake("CALL lake.ducklake_expire_snapshots()"));
+        assert!(call_targets_ducklake("CALL \"ducklake_expire_snapshots\"()"));
+        assert!(call_targets_ducklake("CALL /* c */ ducklake_cleanup_old_files()"));
+        assert!(!call_targets_ducklake("CALL pragma_version()"));
+        assert!(!call_targets_ducklake("SELECT 1"));
+    }
+
+    #[test]
+    fn copy_classifier_separates_file_sinks_from_loads() {
+        assert!(copy_writes_file("COPY t TO 'f.csv'"));
+        assert!(copy_writes_file("COPY (SELECT a FROM t) TO 'out.parquet' (FORMAT parquet)"));
+        assert!(copy_writes_file("copy /* to */ t tO 'f'"));
+        assert!(copy_writes_file("COPY t TO 's3://bucket/f.parquet'"));
+        assert!(copy_writes_file("COPY t"));
+        assert!(!copy_writes_file("COPY t FROM 'f.csv'"));
+        assert!(!copy_writes_file("COPY t (a, b) FROM 'f.csv'"));
+        assert!(!copy_writes_file("COPY FROM DATABASE a TO b"));
+        assert!(!copy_writes_file("SELECT 1"));
     }
 
     #[test]

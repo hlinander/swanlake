@@ -141,12 +141,81 @@ pub struct SessionAuth {
     pub writer: bool,
 }
 
+/// Write-hardening engine-lockdown template (swanlake_write_hardening.md §4):
+/// the per-instance scratch configuration bound into each duckvis session at
+/// creation. The session applies the block once, before its first user
+/// statement reaches the engine.
+#[derive(Debug, Clone)]
+pub struct LockdownTemplate {
+    pub scratch_directory: String,
+    pub scratch_max_size: String,
+}
+
+/// Lockdown progress: the armed lake data roots collected while arming, and
+/// whether the block ran. Once applied, the allowed set is frozen for the
+/// session's life.
+#[derive(Debug, Default)]
+struct LockdownState {
+    applied: bool,
+    roots: std::collections::BTreeSet<String>,
+}
+
+/// The §4 lockdown block. The profiling mode is pre-set to the values the
+/// streaming path re-asserts per query (errors ignored), so the frozen
+/// configuration already carries them. `lock_configuration` is last; a
+/// non-writer additionally loses external access, confined to the armed lake
+/// roots plus the scratch directory.
+fn lockdown_sql(
+    template: &LockdownTemplate,
+    writer: bool,
+    roots: &std::collections::BTreeSet<String>,
+) -> String {
+    let mut block = vec![
+        "SET enable_profiling = 'no_output'".to_string(),
+        "SET custom_profiling_settings = \
+         '{\"OPERATOR_CPU_TIME\": \"true\", \"CPU_TIME_ACTUAL\": \"true\"}'"
+            .to_string(),
+        "SET allow_persistent_secrets = false".to_string(),
+        "SET autoinstall_known_extensions = false".to_string(),
+        "SET autoload_known_extensions = false".to_string(),
+        "SET allow_community_extensions = false".to_string(),
+    ];
+    if !writer {
+        block.push(format!(
+            "SET temp_directory = '{}'",
+            escape_sql_literal(&template.scratch_directory)
+        ));
+        block.push(format!(
+            "SET max_temp_directory_size = '{}'",
+            escape_sql_literal(&template.scratch_max_size)
+        ));
+        let list = roots
+            .iter()
+            .chain(std::iter::once(&template.scratch_directory))
+            .map(|dir| format!("'{}'", escape_sql_literal(dir)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        block.push(format!("SET allowed_directories = [{list}]"));
+        block.push("SET enable_external_access = false".to_string());
+    }
+    block.push("SET lock_configuration = true".to_string());
+    block.join(";\n")
+}
+
+fn escape_sql_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 /// A client session with dedicated connection and state
 pub struct Session {
     id: SessionId,
     /// Optional duckvis-mode auth binding. When `Some`, the raw-ATTACH guard
-    /// (contract C6) is active and the session is project-scoped.
+    /// (contract C6) and statement admission are active and the session is
+    /// project-scoped.
     auth: Option<SessionAuth>,
+    /// Write-hardening lockdown template; `None` outside duckvis mode.
+    lockdown: Option<LockdownTemplate>,
+    lockdown_state: Mutex<LockdownState>,
     /// Opaque token assigned at creation. Clients cache this and send it back
     /// via `x-expected-session-nonce` so the server can detect that a session
     /// was silently recreated (after restart or idle eviction).
@@ -168,22 +237,26 @@ impl Session {
     /// Create a new session with a specific ID and shared connection
     #[instrument(skip(connection))]
     pub fn new_with_id(id: SessionId, connection: std::sync::Arc<DuckDbConnection>) -> Self {
-        Self::new_with_id_and_auth(id, connection, None)
+        Self::new_with_id_and_auth(id, connection, None, None)
     }
 
-    /// Create a new session with a specific ID, shared connection, and optional
-    /// duckvis auth binding.
-    #[instrument(skip(connection, auth))]
+    /// Create a new session with a specific ID, shared connection, optional
+    /// duckvis auth binding, and the write-hardening lockdown template that
+    /// binds an authed session's engine before its first user statement.
+    #[instrument(skip(connection, auth, lockdown))]
     pub fn new_with_id_and_auth(
         id: SessionId,
         connection: std::sync::Arc<DuckDbConnection>,
         auth: Option<SessionAuth>,
+        lockdown: Option<LockdownTemplate>,
     ) -> Self {
         debug!(session_id = %id, "created new session with shared connection");
 
         Self {
             id,
             auth,
+            lockdown,
+            lockdown_state: Mutex::new(LockdownState::default()),
             nonce: uuid::Uuid::new_v4().to_string(),
             connection,
             transactions: Mutex::new(HashSet::new()),
@@ -208,23 +281,85 @@ impl Session {
         self.auth.as_ref()
     }
 
-    /// Validate user-supplied SQL against the raw-ATTACH guard (contract C6).
+    /// Validate user-supplied SQL against the raw-ATTACH guard (contract C6)
+    /// and, for non-writer sessions, statement admission (write-hardening §3).
     ///
     /// Active only when the session carries duckvis auth. Splits the SQL into
-    /// top-level statements (quote/comment-aware) and rejects any statement whose
-    /// leading keyword is `ATTACH` (case-insensitive), directing the caller to the
-    /// `duckvis_attach` action. `ATTACH` inside string literals or comments does
-    /// not match; `DETACH` is allowed.
+    /// top-level statements (quote/comment-aware); any `ATTACH` statement is
+    /// rejected toward the `duckvis_attach` action (`DETACH` is allowed). A
+    /// non-writer additionally loses the file-write verbs the engine cannot
+    /// distinguish inside its allowed roots: `COPY` with a file sink (`COPY …
+    /// FROM` stays), `EXPORT DATABASE`, and `CALL ducklake_*` maintenance.
     pub fn validate_user_sql(&self, sql: &str) -> Result<(), ServerError> {
-        if self.auth.is_none() {
+        let Some(auth) = self.auth.as_ref() else {
             return Ok(());
-        }
+        };
         for statement in crate::duckvis::attach::split_top_level_statements(sql) {
-            if crate::duckvis::attach::leading_keyword(&statement).as_deref() == Some("ATTACH") {
+            let Some(keyword) = crate::duckvis::attach::leading_keyword(&statement) else {
+                continue;
+            };
+            if keyword == "ATTACH" {
                 return Err(ServerError::AttachNotPermitted);
+            }
+            if !auth.writer {
+                match keyword.as_str() {
+                    "EXPORT" => return Err(ServerError::WriteNotPermitted("EXPORT DATABASE")),
+                    "CALL" if crate::duckvis::attach::call_targets_ducklake(&statement) => {
+                        return Err(ServerError::WriteNotPermitted("CALL ducklake_*"));
+                    }
+                    "COPY" if crate::duckvis::attach::copy_writes_file(&statement) => {
+                        return Err(ServerError::WriteNotPermitted("COPY to a file"));
+                    }
+                    _ => {}
+                }
             }
         }
         Ok(())
+    }
+
+    /// Apply the write-hardening engine lockdown (swanlake_write_hardening.md
+    /// §4) once, before the first user statement reaches the engine. A
+    /// non-writer gets the confining variant — external access off, the armed
+    /// roots plus scratch as the allowed set, configuration locked; a writer
+    /// keeps external access and locks the flag set. Sessions without duckvis
+    /// auth are out of scope.
+    pub(crate) fn ensure_lockdown(&self) -> Result<(), ServerError> {
+        let (Some(template), Some(auth)) = (self.lockdown.as_ref(), self.auth.as_ref()) else {
+            return Ok(());
+        };
+        let mut state = self
+            .lockdown_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.applied {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&template.scratch_directory).map_err(|e| {
+            ServerError::Internal(format!("failed to create session scratch directory: {e}"))
+        })?;
+        let sql = lockdown_sql(template, auth.writer, &state.roots);
+        self.connection.execute_batch(&sql)?;
+        state.applied = true;
+        info!(session_id = %self.id, writer = auth.writer, "session write-hardening lockdown applied");
+        Ok(())
+    }
+
+    /// Record an armed lake's data root into the lockdown's allowed set.
+    /// After the lockdown ran the set is frozen; a late root is dropped and
+    /// the engine refuses the out-of-set path — fail closed.
+    pub fn register_armed_root(&self, root: &str) {
+        let mut state = self
+            .lockdown_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.applied {
+            warn!(
+                session_id = %self.id,
+                "data root armed after lockdown; the allowed set is frozen"
+            );
+            return;
+        }
+        state.roots.insert(root.to_string());
     }
 
     /// Get time since last activity
@@ -344,6 +479,7 @@ impl Session {
     #[instrument(skip(self), fields(session_id = %self.id, sql = %sql))]
     pub fn execute_query(&self, sql: &str) -> Result<QueryResult, ServerError> {
         self.validate_user_sql(sql)?;
+        self.ensure_lockdown()?;
         self.touch();
         self.with_transaction_recovery(|| self.connection.execute_query(sql), true)
     }
@@ -356,6 +492,7 @@ impl Session {
         params: &[Value],
     ) -> Result<QueryResult, ServerError> {
         self.validate_user_sql(sql)?;
+        self.ensure_lockdown()?;
         self.touch();
         self.with_transaction_recovery(
             || self.connection.execute_query_with_params(sql, params),
@@ -365,6 +502,9 @@ impl Session {
 
     /// Return the number of parameters expected by a statement.
     pub fn parameter_count(&self, sql: &str) -> Result<usize, ServerError> {
+        // Binding a statement can open files (table functions), so the
+        // lockdown precedes it.
+        self.ensure_lockdown()?;
         self.touch();
         self.with_transaction_recovery(|| self.connection.parameter_count(sql), true)
     }
@@ -373,6 +513,7 @@ impl Session {
     #[instrument(skip(self), fields(session_id = %self.id, sql = %sql))]
     pub fn execute_statement(&self, sql: &str) -> Result<i64, ServerError> {
         self.validate_user_sql(sql)?;
+        self.ensure_lockdown()?;
         self.execute_statement_inner(sql)
     }
 
@@ -393,6 +534,7 @@ impl Session {
         cancellation: &RequestCancellation,
     ) -> Result<i64, ServerError> {
         self.validate_user_sql(sql)?;
+        self.ensure_lockdown()?;
         self.touch();
         let result = self.with_transaction_recovery(
             || {
@@ -469,6 +611,7 @@ impl Session {
         params: &[Value],
     ) -> Result<usize, ServerError> {
         self.validate_user_sql(sql)?;
+        self.ensure_lockdown()?;
         self.touch();
         let result = self.with_transaction_recovery(
             || self.connection.execute_statement_with_params(sql, params),
@@ -484,6 +627,7 @@ impl Session {
     #[instrument(skip(self), fields(session_id = %self.id, sql = %sql))]
     pub fn schema_for_query(&self, sql: &str) -> Result<arrow_schema::Schema, ServerError> {
         self.validate_user_sql(sql)?;
+        self.ensure_lockdown()?;
         self.touch();
         let cache_key = Self::schema_cache_key(sql);
         if !cache_key.is_empty() {
@@ -522,6 +666,7 @@ impl Session {
         table_name: &str,
         batches: Vec<arrow_array::RecordBatch>,
     ) -> Result<usize, ServerError> {
+        self.ensure_lockdown()?;
         self.touch();
         self.with_transaction_recovery(
             || {
@@ -811,6 +956,7 @@ mod guard_tests {
             SessionId::from_string("test-session".to_string()),
             Arc::new(conn),
             auth,
+            None,
         ))
     }
 
@@ -891,6 +1037,265 @@ mod guard_tests {
         let s = session_with_auth(None)?;
         // No auth binding → guard is a no-op even for ATTACH.
         assert!(s.validate_user_sql("ATTACH 'a.db' AS a").is_ok());
+        Ok(())
+    }
+
+    fn writer_session() -> Result<Session> {
+        session_with_auth(Some(SessionAuth {
+            subject: "sub-1".to_string(),
+            project_id: "project-1".to_string(),
+            writer: true,
+        }))
+    }
+
+    #[test]
+    fn admission_rejects_copy_to_file_for_non_writer() -> Result<()> {
+        let s = authed_session()?;
+        for sql in [
+            "COPY t TO 'out.csv'",
+            "COPY (SELECT 1) TO 'out.parquet' (FORMAT parquet)",
+            "SELECT 1; COPY t TO 'out.csv'",
+            "cOpY /* from */ t TO 'out.csv'",
+            "COPY t",
+        ] {
+            assert!(
+                matches!(
+                    s.validate_user_sql(sql),
+                    Err(ServerError::WriteNotPermitted(_))
+                ),
+                "expected rejection: {sql}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn admission_allows_copy_from_for_non_writer() -> Result<()> {
+        let s = authed_session()?;
+        assert!(s.validate_user_sql("COPY t FROM 'in.csv'").is_ok());
+        assert!(s.validate_user_sql("COPY t (a, b) FROM 'in.csv'").is_ok());
+        assert!(s.validate_user_sql("COPY FROM DATABASE a TO b").is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn admission_rejects_export_database_for_non_writer() -> Result<()> {
+        let s = authed_session()?;
+        assert!(matches!(
+            s.validate_user_sql("EXPORT DATABASE 'dir'"),
+            Err(ServerError::WriteNotPermitted(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn admission_rejects_ducklake_calls_for_non_writer() -> Result<()> {
+        let s = authed_session()?;
+        for sql in [
+            "CALL ducklake_expire_snapshots('lake')",
+            "CALL lake.ducklake_merge_adjacent_files()",
+            "SELECT 1; CALL \"ducklake_cleanup_old_files\"()",
+        ] {
+            assert!(
+                matches!(
+                    s.validate_user_sql(sql),
+                    Err(ServerError::WriteNotPermitted(_))
+                ),
+                "expected rejection: {sql}"
+            );
+        }
+        assert!(s.validate_user_sql("CALL pragma_version()").is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn admission_passes_writer() -> Result<()> {
+        let s = writer_session()?;
+        assert!(s.validate_user_sql("COPY t TO 'out.csv'").is_ok());
+        assert!(s.validate_user_sql("EXPORT DATABASE 'dir'").is_ok());
+        assert!(s
+            .validate_user_sql("CALL ducklake_expire_snapshots('lake')")
+            .is_ok());
+        // ATTACH stays rejected regardless of the write permission.
+        assert!(matches!(
+            s.validate_user_sql("ATTACH 'a.db' AS a"),
+            Err(ServerError::AttachNotPermitted)
+        ));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lockdown_tests {
+    use super::*;
+    use crate::config::ServerConfig;
+    use crate::engine::EngineFactory;
+    use anyhow::{anyhow, Result};
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    fn template(scratch: &std::path::Path) -> LockdownTemplate {
+        LockdownTemplate {
+            scratch_directory: scratch.to_string_lossy().into_owned(),
+            scratch_max_size: "1GB".to_string(),
+        }
+    }
+
+    fn raw_batch(conn: &DuckDbConnection, sql: &str) -> std::result::Result<(), duckdb::Error> {
+        let raw = conn.conn.lock().unwrap_or_else(|p| p.into_inner());
+        raw.execute_batch(sql)
+    }
+
+    fn raw_setting(conn: &DuckDbConnection, name: &str) -> Result<String> {
+        let raw = conn.conn.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(raw.query_row(
+            &format!("SELECT current_setting('{name}')::VARCHAR"),
+            [],
+            |row| row.get::<_, String>(0),
+        )?)
+    }
+
+    fn test_connection() -> Result<DuckDbConnection> {
+        let config = ServerConfig::default();
+        let factory = EngineFactory::new_for_tests(&config);
+        factory
+            .create_connection()
+            .map_err(|e| anyhow!("failed to create test connection: {e}"))
+    }
+
+    #[test]
+    fn non_writer_lockdown_confines_and_freezes() -> Result<()> {
+        let lake = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let scratch = tempfile::tempdir()?;
+        std::fs::write(lake.path().join("t.csv"), "a,b\n1,2\n")?;
+
+        let conn = test_connection()?;
+        let mut roots = BTreeSet::new();
+        roots.insert(lake.path().to_string_lossy().into_owned());
+        raw_batch(&conn, &lockdown_sql(&template(scratch.path()), false, &roots))
+            .map_err(|e| anyhow!("lockdown block failed: {e}"))?;
+
+        assert_eq!(raw_setting(&conn, "enable_external_access")?, "false");
+        assert_eq!(raw_setting(&conn, "allow_persistent_secrets")?, "false");
+        assert_eq!(raw_setting(&conn, "lock_configuration")?, "true");
+
+        let csv = lake.path().join("t.csv");
+        raw_batch(
+            &conn,
+            &format!(
+                "CREATE TABLE t AS SELECT * FROM read_csv_auto('{}')",
+                csv.display()
+            ),
+        )
+        .map_err(|e| anyhow!("in-root read failed: {e}"))?;
+
+        // File writes outside the allowed set fail; the scratch directory
+        // accepts them (§5 residual).
+        let denied = outside.path().join("out.csv");
+        assert!(raw_batch(&conn, &format!("COPY t TO '{}'", denied.display())).is_err());
+        let permitted = scratch.path().join("out.csv");
+        raw_batch(&conn, &format!("COPY t TO '{}'", permitted.display()))
+            .map_err(|e| anyhow!("scratch write failed: {e}"))?;
+
+        assert!(raw_batch(&conn, "SET enable_external_access = true").is_err());
+        assert!(raw_batch(&conn, "SET allowed_directories = ['/']").is_err());
+        assert!(raw_batch(&conn, "SET lock_configuration = false").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn writer_lockdown_keeps_external_access() -> Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let out = tempfile::tempdir()?;
+        let conn = test_connection()?;
+
+        raw_batch(
+            &conn,
+            &lockdown_sql(&template(scratch.path()), true, &BTreeSet::new()),
+        )
+        .map_err(|e| anyhow!("lockdown block failed: {e}"))?;
+
+        assert_eq!(raw_setting(&conn, "enable_external_access")?, "true");
+        assert_eq!(raw_setting(&conn, "lock_configuration")?, "true");
+
+        raw_batch(&conn, "CREATE TABLE t AS SELECT 1 AS a")?;
+        let target = out.path().join("w.csv");
+        raw_batch(&conn, &format!("COPY t TO '{}'", target.display()))
+            .map_err(|e| anyhow!("writer file write failed: {e}"))?;
+
+        assert!(raw_batch(&conn, "SET allow_community_extensions = true").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn lockdown_stays_per_connection() -> Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let config = ServerConfig::default();
+        let factory = EngineFactory::new_for_tests(&config);
+        let locked = factory
+            .create_connection()
+            .map_err(|e| anyhow!("failed to create test connection: {e}"))?;
+        raw_batch(
+            &locked,
+            &lockdown_sql(&template(scratch.path()), false, &BTreeSet::new()),
+        )
+        .map_err(|e| anyhow!("lockdown block failed: {e}"))?;
+
+        let sibling = factory
+            .create_connection()
+            .map_err(|e| anyhow!("failed to create test connection: {e}"))?;
+        assert_eq!(raw_setting(&sibling, "lock_configuration")?, "false");
+        assert_eq!(raw_setting(&sibling, "enable_external_access")?, "true");
+        Ok(())
+    }
+
+    #[test]
+    fn session_applies_lockdown_before_first_statement() -> Result<()> {
+        let lake = tempfile::tempdir()?;
+        let scratch = tempfile::tempdir()?;
+        std::fs::write(lake.path().join("t.csv"), "a,b\n1,2\n")?;
+
+        let session = Session::new_with_id_and_auth(
+            SessionId::from_string("lockdown-test".to_string()),
+            Arc::new(test_connection()?),
+            Some(SessionAuth {
+                subject: "sub-1".to_string(),
+                project_id: "project-1".to_string(),
+                writer: false,
+            }),
+            Some(template(scratch.path())),
+        );
+        session.register_armed_root(&lake.path().to_string_lossy());
+
+        let result = session
+            .execute_query("SELECT current_setting('lock_configuration')::VARCHAR AS v")
+            .map_err(|e| anyhow!("{e}"))?;
+        let batch = result.batches.first().ok_or_else(|| anyhow!("no batch"))?;
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .ok_or_else(|| anyhow!("not a string column"))?;
+        assert_eq!(column.value(0), "true");
+
+        // The root armed before the first statement is readable.
+        let csv = lake.path().join("t.csv");
+        session
+            .execute_query(&format!("SELECT * FROM read_csv_auto('{}')", csv.display()))
+            .map_err(|e| anyhow!("in-root read failed: {e}"))?;
+
+        // A root armed after lockdown does not widen the allowed set.
+        let late = tempfile::tempdir()?;
+        std::fs::write(late.path().join("t.csv"), "a\n1\n")?;
+        session.register_armed_root(&late.path().to_string_lossy());
+        let late_csv = late.path().join("t.csv");
+        assert!(session
+            .execute_query(&format!(
+                "SELECT * FROM read_csv_auto('{}')",
+                late_csv.display()
+            ))
+            .is_err());
         Ok(())
     }
 }

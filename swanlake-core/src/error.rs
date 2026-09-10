@@ -27,4 +27,8 @@ pub enum ServerError {
     /// `permission_denied`.
     #[error("ATTACH is managed by duckvis; use the duckvis_attach action")]
     AttachNotPermitted,
+    /// A file-writing statement was rejected for a non-writer session
+    /// (write-hardening statement admission). Maps to `permission_denied`.
+    #[error("{0} requires the project's write permission")]
+    WriteNotPermitted(&'static str),
 }
