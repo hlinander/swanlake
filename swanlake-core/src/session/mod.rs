@@ -372,6 +372,34 @@ impl Session {
         state.roots.insert(root.to_string());
     }
 
+    /// The data-file roots a just-armed DuckLake catalog actually reads and
+    /// writes, from its metadata (`ducklake_options`). Authoritative for the
+    /// lockdown allowed set: the ATTACH `DATA_PATH` option is a creation-time
+    /// override, so re-attaching an existing lake carries no root in the
+    /// statement while the lake's files still live under the metadata path.
+    /// Distinct values cover a table- or schema-scoped `data_path` override.
+    /// Runs on the raw connection so it does not trip the lockdown before the
+    /// caller registers the roots it returns.
+    pub fn ducklake_data_roots(&self, catalog: &str) -> Result<Vec<String>, ServerError> {
+        let sql = format!(
+            "SELECT DISTINCT value FROM ducklake_options('{}') \
+             WHERE option_name = 'data_path' AND value IS NOT NULL",
+            escape_sql_literal(catalog)
+        );
+        let conn = self
+            .connection
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut roots = Vec::new();
+        for row in rows {
+            roots.push(row?);
+        }
+        Ok(roots)
+    }
+
     /// Get time since last activity
     pub fn idle_duration(&self) -> Duration {
         let last = self

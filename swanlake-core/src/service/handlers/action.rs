@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::service::SwanFlightSqlService;
 use super::ticket::{StatementTicketKind, TicketStatementPayload};
@@ -1455,11 +1455,17 @@ pub(crate) async fn do_action_duckvis_attach(
 
     let attachment_name = resolved.name.clone();
     let attachment_id = resolved.attachment_id.clone();
+    // A non-writer session is confined to its armed lakes' data roots; a
+    // writer keeps external access and is not directory-confined.
+    let confine = !auth.writer;
 
-    // The armed lake's data root feeds the session lockdown's allowed set
-    // (write-hardening §4); a metadata-only attach contributes none.
-    if let Some(root) = crate::duckvis::attach::attach_data_path(&normalized) {
-        session.register_armed_root(&root);
+    // A DATA_PATH option pins the root before the attach runs; for a re-attach
+    // that carries none, the authoritative roots come from the lake metadata
+    // after arming (below). Both feed the lockdown allowed set (§4).
+    if confine {
+        if let Some(root) = crate::duckvis::attach::attach_data_path(&normalized) {
+            session.register_armed_root(&root);
+        }
     }
 
     let search_path_sql = parsed
@@ -1474,8 +1480,26 @@ pub(crate) async fn do_action_duckvis_attach(
     // database.
     let session_clone = session.clone();
     let normalized_for_exec = normalized;
+    let roots_catalog = confine.then(|| attachment_name.clone());
     tokio::task::spawn_blocking(move || {
         session_clone.execute_statement_privileged(&normalized_for_exec)?;
+        // Register the lake's real data roots from its metadata, before the
+        // lockdown freezes the allowed set on the first user statement. A
+        // non-DuckLake catalog has no such metadata; the query errors and
+        // contributes no root (its access is network, governed by
+        // enable_external_access).
+        if let Some(catalog) = roots_catalog {
+            match session_clone.ducklake_data_roots(&catalog) {
+                Ok(roots) => {
+                    for root in roots {
+                        session_clone.register_armed_root(&root);
+                    }
+                }
+                Err(e) => {
+                    debug!("no DuckLake data roots for armed catalog: {e}");
+                }
+            }
+        }
         if let Some(sql) = search_path_sql {
             session_clone.execute_statement_privileged(&sql)?;
         }
