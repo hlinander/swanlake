@@ -25,7 +25,10 @@ pub enum StreamingBatch {
     /// A record batch
     Batch(RecordBatch),
     /// Query completed with totals
-    Done { total_rows: usize, total_bytes: usize },
+    Done {
+        total_rows: usize,
+        total_bytes: usize,
+    },
     /// Error occurred
     Error(ServerError),
 }
@@ -66,42 +69,33 @@ impl DuckDbConnection {
         conn.interrupt_handle()
     }
 
-    /// Get the schema for a query without executing the full query.
-    ///
-    /// **Implementation Note:**
-    /// DuckDB-rs doesn't provide a `Statement::schema()` method to get schema
-    /// without execution. We execute the query as-is and rely on DuckDB's lazy
-    /// evaluation to avoid pulling all data unnecessarily.
-    ///
-    /// This approach:
-    /// 1. Is simple and always correct
-    /// 2. Works with all SQL syntax (SHOW, DESCRIBE, PRAGMA, etc.)
-    /// 3. Relies on DuckDB's streaming to avoid memory issues
+    /// Bind read queries once and export their types through an empty local
+    /// result. Commands retain their existing Arrow execution path.
     pub fn schema_for_query(&self, sql: &str) -> Result<Schema, ServerError> {
-        let trimmed_sql = sql.trim_end_matches(';').trim();
-
-        self.with_arrow_prepared(trimmed_sql, None, false, |stmt| {
-            let stream = Self::stream_arrow_with_params(stmt, None)?;
-            let schema = stream.get_schema();
-            debug!(field_count = schema.fields().len(), "retrieved schema");
-            Ok(schema.as_ref().clone())
-        })
-    }
-
-    /// Schema planning for streaming: wraps in `SELECT * FROM () LIMIT 0` to
-    /// avoid materializing data, except for statements like EXPLAIN that can't
-    /// be used as subqueries.
-    pub fn schema_for_streaming(&self, sql: &str) -> Result<Schema, ServerError> {
-        self.with_arrow_prepared(sql, None, true, |stmt| {
+        Self::validate_sql(sql)?;
+        {
+            let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(query) = result_projection::schema_query(&conn, sql)? {
+                let mut stmt = conn.prepare(&query)?;
+                let stream = Self::stream_arrow_with_params(&mut stmt, None)?;
+                return Ok(stream.get_schema().as_ref().clone());
+            }
+        }
+        self.with_arrow_prepared(sql.trim_end_matches(';').trim(), None, |stmt| {
             let stream = Self::stream_arrow_with_params(stmt, None)?;
             Ok(stream.get_schema().as_ref().clone())
         })
     }
 
+    /// Streaming and buffered query discovery export the same bound schema.
+    pub fn schema_for_streaming(&self, sql: &str) -> Result<Schema, ServerError> {
+        self.schema_for_query(sql)
+    }
+
     /// Execute a SELECT query and return results
     #[instrument(skip(self), fields(sql = %sql))]
     pub fn execute_query(&self, sql: &str) -> Result<QueryResult, ServerError> {
-        self.with_arrow_prepared(sql, None, false, |stmt| {
+        self.with_arrow_prepared(sql, None, |stmt| {
             let arrow = Self::stream_arrow_with_params(stmt, None)?;
             let schema = arrow.get_schema();
             let result = Self::collect_query_result(schema, arrow);
@@ -146,7 +140,7 @@ impl DuckDbConnection {
         }
 
         // Now execute the full query in true streaming mode
-        self.with_arrow_prepared(sql, None, false, |stmt| {
+        self.with_arrow_prepared(sql, None, |stmt| {
             let arrow = Self::stream_arrow_with_params(stmt, None)?;
             let schema = arrow.get_schema();
 
@@ -197,8 +191,14 @@ impl DuckDbConnection {
             }
 
             // Send completion message
-            let _ = tx.blocking_send(StreamingBatch::Done { total_rows, total_bytes });
-            info!(batch_count, total_rows, total_bytes, "streaming query completed");
+            let _ = tx.blocking_send(StreamingBatch::Done {
+                total_rows,
+                total_bytes,
+            });
+            info!(
+                batch_count,
+                total_rows, total_bytes, "streaming query completed"
+            );
             Ok(())
         })
     }
@@ -228,7 +228,7 @@ impl DuckDbConnection {
         }
 
         // Now execute the full query in true streaming mode
-        self.with_arrow_prepared(sql, Some(params), false, |stmt| {
+        self.with_arrow_prepared(sql, Some(params), |stmt| {
             let arrow = Self::stream_arrow_with_params(stmt, Some(params))?;
             let schema = arrow.get_schema();
 
@@ -279,8 +279,14 @@ impl DuckDbConnection {
             }
 
             // Send completion message
-            let _ = tx.blocking_send(StreamingBatch::Done { total_rows, total_bytes });
-            info!(batch_count, total_rows, total_bytes, "streaming query with params completed");
+            let _ = tx.blocking_send(StreamingBatch::Done {
+                total_rows,
+                total_bytes,
+            });
+            info!(
+                batch_count,
+                total_rows, total_bytes, "streaming query with params completed"
+            );
             Ok(())
         })
     }
@@ -292,7 +298,7 @@ impl DuckDbConnection {
         sql: &str,
         params: &[Value],
     ) -> Result<QueryResult, ServerError> {
-        self.with_arrow_prepared(sql, Some(params), false, |stmt| {
+        self.with_arrow_prepared(sql, Some(params), |stmt| {
             let arrow = Self::stream_arrow_with_params(stmt, Some(params))?;
             let schema = arrow.get_schema();
             let result = Self::collect_query_result(schema, arrow);
@@ -526,7 +532,6 @@ impl DuckDbConnection {
         &self,
         sql: &str,
         params: Option<&[Value]>,
-        schema_only: bool,
         f: F,
     ) -> Result<T, ServerError>
     where
@@ -537,20 +542,8 @@ impl DuckDbConnection {
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let projection = result_projection::for_query(&conn, sql, params)?;
-        let query = match projection {
-            Some(query) if schema_only => format!("{query} LIMIT 0"),
-            Some(query) => query,
-            None if schema_only
-                && !sql.trim_start().to_ascii_uppercase().starts_with("EXPLAIN") =>
-            {
-                format!(
-                    "SELECT * FROM ({}) LIMIT 0",
-                    sql.trim_end_matches(';').trim()
-                )
-            }
-            None => sql.to_string(),
-        };
+        let query =
+            result_projection::for_query(&conn, sql, params)?.unwrap_or_else(|| sql.to_string());
         let mut stmt = conn.prepare(&query)?;
         f(&mut stmt)
     }
@@ -633,6 +626,109 @@ mod tests {
     fn test_connection() -> DuckDbConnection {
         let conn = Connection::open_in_memory().expect("failed to open in-memory db");
         DuckDbConnection::new(conn)
+    }
+
+    #[test]
+    fn schema_discovery_preserves_exported_types_and_duplicate_names() {
+        let conn = test_connection();
+        for sql in [
+            "SELECT 1::DECIMAL(30, 4) AS d, [1, 2] AS a, {'x': 1, 'y': ['a']} AS s, 'a'::ENUM('a', 'b') AS e",
+            "SELECT NULL AS n, 1::UBIGINT AS u, now() AS t, uuid() AS id, INTERVAL '1 day' AS i, 'a'::JSON AS j WHERE false",
+            "SELECT 1 AS dup, 'x' AS dup, 2 AS \"quoted\"\"name\"",
+            "VALUES (1, 'a'), (2, 'b')",
+            "WITH data AS (SELECT [1, 2] AS items) SELECT * FROM data",
+        ] {
+            assert_eq!(conn.schema_for_query(sql).unwrap(), conn.execute_query(sql).unwrap().schema, "{sql}");
+        }
+    }
+
+    #[test]
+    fn schema_discovery_does_not_evaluate_aggregate_inputs() {
+        let conn = test_connection();
+        conn.execute_batch("CREATE SEQUENCE schema_probe").unwrap();
+        let sql = "SELECT sum(nextval('schema_probe')) AS total FROM range(10)";
+        let schema = conn.schema_for_query(sql).unwrap();
+        let result = conn.execute_query(sql).unwrap();
+        assert_eq!(schema, result.schema);
+        let total = conn
+            .execute_query("SELECT currval('schema_probe')")
+            .unwrap();
+        let value = total.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+        assert_eq!(value.value(0), 10);
+    }
+
+    #[test]
+    #[ignore = "requires the DuckDB httpfs extension and a loopback listener"]
+    fn schema_discovery_avoids_reexecuting_remote_glob() {
+        use std::io::{Read, Write};
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct Source {
+            stop: Arc<AtomicBool>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for Source {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::Relaxed);
+                if let Some(thread) = self.thread.take() {
+                    thread.join().unwrap();
+                }
+            }
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let requests = count.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let _source = Source {
+            stop,
+            thread: Some(std::thread::spawn(move || {
+                while !stopping.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                                .unwrap();
+                            let mut request = Vec::new();
+                            let mut buffer = [0; 4096];
+                            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                                let n = stream.read(&mut buffer).unwrap();
+                                if n == 0 {
+                                    break;
+                                }
+                                request.extend_from_slice(&buffer[..n]);
+                            }
+                            requests.fetch_add(1, Ordering::Relaxed);
+                            let body = "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>test</Name><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>";
+                            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("mock S3 listener: {error}"),
+                    }
+                }
+            })),
+        };
+        let conn = test_connection();
+        conn.execute_batch(&format!(
+            "LOAD httpfs; CREATE SECRET (TYPE S3, KEY_ID 'test', SECRET 'test', REGION 'test', ENDPOINT '{address}', USE_SSL false, URL_STYLE 'path')"
+        )).unwrap();
+        let sql = "SELECT file FROM glob('s3://test/parquet/*/*/*.parquet')";
+        let schema = conn.schema_for_query(sql).unwrap();
+        let result = conn.execute_query(sql).unwrap();
+        assert_eq!(schema, result.schema);
+        assert_eq!(result.total_rows, 0);
+        assert_eq!(count.load(Ordering::Relaxed), 3);
     }
 
     #[test]
