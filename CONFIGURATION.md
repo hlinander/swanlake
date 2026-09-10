@@ -124,11 +124,12 @@ rejected on every SQL path in this mode; `DETACH` remains available.
 | `SWANLAKE_SCRATCH_MAX_SIZE` | `max_temp_directory_size` for the scratch directory | `10GB` |
 
 Before an authenticated session's first user statement, SwanLake freezes its DuckDB configuration
-(`lock_configuration`): persistent secrets and extension install/autoload are disabled for every
-session; a session whose token lacks the project write permission additionally loses
-`enable_external_access` and is confined to `allowed_directories` = the data roots of its armed
-attachments plus the scratch directory. Statement admission rejects `COPY` to a file, `EXPORT
-DATABASE`, and `CALL ducklake_*` for such sessions.
+(`lock_configuration`): extension install/autoload is disabled for every session, and
+`secret_directory` — pinned to a per-session path under the scratch directory at connection
+creation — is frozen with it; statement admission rejects persistent `CREATE SECRET` forms. A
+session whose token lacks the project write permission additionally loses `enable_external_access`
+and is confined to `allowed_directories` = the data roots of its armed attachments plus the scratch
+directory; admission also rejects its `COPY` to a file, `EXPORT DATABASE`, and `CALL ducklake_*`.
 
 Notes:
 - Duckvis mode requires native Flight TLS or an actual upstream TLS terminator. Native TLS advertises

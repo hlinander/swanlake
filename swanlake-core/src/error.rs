@@ -31,4 +31,9 @@ pub enum ServerError {
     /// (write-hardening statement admission). Maps to `permission_denied`.
     #[error("{0} requires the project's write permission")]
     WriteNotPermitted(&'static str),
+    /// A `CREATE PERSISTENT SECRET` (or `IN <storage>`) was rejected: a
+    /// duckvis session only holds temporary secrets. Maps to
+    /// `permission_denied`.
+    #[error("persistent secrets are not available in this session")]
+    PersistentSecretNotPermitted,
 }

@@ -308,6 +308,9 @@ impl SwanFlightSqlService {
             ServerError::WriteNotPermitted(what) => Status::permission_denied(format!(
                 "{what} requires the project's write permission"
             )),
+            ServerError::PersistentSecretNotPermitted => Status::permission_denied(
+                "persistent secrets are not available in this session",
+            ),
         }
     }
 

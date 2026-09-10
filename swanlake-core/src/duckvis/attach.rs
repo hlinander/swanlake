@@ -237,6 +237,28 @@ pub fn call_targets_ducklake(statement: &str) -> bool {
     name.rsplit('.').next().is_some_and(|f| f.starts_with("ducklake_"))
 }
 
+/// Whether a `CREATE ... SECRET` statement asks for durable storage: the
+/// `PERSISTENT` modifier, or an `IN <storage>` clause, among the bare tokens
+/// before the option block. Temporary secrets pass.
+pub fn creates_persistent_secret(statement: &str) -> bool {
+    let tokens = tokenize(&strip_comments(statement));
+    if !tokens
+        .first()
+        .is_some_and(|t| t.eq_ignore_ascii_case("CREATE"))
+    {
+        return false;
+    }
+    let head: Vec<&String> = tokens[1..]
+        .iter()
+        .take_while(|t| t.as_str() != "(" && !t.eq_ignore_ascii_case("AS"))
+        .collect();
+    if !head.iter().any(|t| t.eq_ignore_ascii_case("SECRET")) {
+        return false;
+    }
+    head.iter()
+        .any(|t| t.eq_ignore_ascii_case("PERSISTENT") || t.eq_ignore_ascii_case("IN"))
+}
+
 /// Whether a `COPY` statement's sink is a file: the first top-level
 /// `TO`/`FROM` keyword after `COPY` decides — `TO` writes a file, `FROM`
 /// loads into a table. A `COPY` with neither classifies as a file write
@@ -765,6 +787,22 @@ mod tests {
         assert!(call_targets_ducklake("CALL /* c */ ducklake_cleanup_old_files()"));
         assert!(!call_targets_ducklake("CALL pragma_version()"));
         assert!(!call_targets_ducklake("SELECT 1"));
+    }
+
+    #[test]
+    fn secret_classifier_matches_durable_forms_only() {
+        assert!(creates_persistent_secret("CREATE PERSISTENT SECRET s (TYPE s3)"));
+        assert!(creates_persistent_secret(
+            "CREATE OR REPLACE persistent SECRET IF NOT EXISTS s (TYPE s3)"
+        ));
+        assert!(creates_persistent_secret("CREATE SECRET s IN LOCAL_FILE (TYPE s3)"));
+        assert!(!creates_persistent_secret("CREATE SECRET s (TYPE s3)"));
+        assert!(!creates_persistent_secret("CREATE TEMPORARY SECRET s (TYPE s3)"));
+        assert!(!creates_persistent_secret("CREATE TABLE t (a INTEGER)"));
+        assert!(!creates_persistent_secret(
+            "CREATE VIEW v AS SELECT a IN (1, 2) FROM t"
+        ));
+        assert!(!creates_persistent_secret("SELECT 1"));
     }
 
     #[test]

@@ -164,7 +164,13 @@ struct LockdownState {
 /// streaming path re-asserts per query (errors ignored), so the frozen
 /// configuration already carries them. `lock_configuration` is last; a
 /// non-writer additionally loses external access, confined to the armed lake
-/// roots plus the scratch directory.
+/// roots plus the scratch directory. Secret policy is not in the block:
+/// DuckDB rejects secret-manager setting changes once the manager has been
+/// used (an armed attach uses it), and disabling `allow_persistent_secrets`
+/// before arming breaks the attach ("Unknown secret storage found:
+/// 'local_file'"). The registry pins `secret_directory` per session at
+/// connection creation, the lock freezes it, and statement admission rejects
+/// persistent `CREATE SECRET` forms.
 fn lockdown_sql(
     template: &LockdownTemplate,
     writer: bool,
@@ -175,7 +181,6 @@ fn lockdown_sql(
         "SET custom_profiling_settings = \
          '{\"OPERATOR_CPU_TIME\": \"true\", \"CPU_TIME_ACTUAL\": \"true\"}'"
             .to_string(),
-        "SET allow_persistent_secrets = false".to_string(),
         "SET autoinstall_known_extensions = false".to_string(),
         "SET autoload_known_extensions = false".to_string(),
         "SET allow_community_extensions = false".to_string(),
@@ -300,6 +305,11 @@ impl Session {
             };
             if keyword == "ATTACH" {
                 return Err(ServerError::AttachNotPermitted);
+            }
+            if keyword == "CREATE"
+                && crate::duckvis::attach::creates_persistent_secret(&statement)
+            {
+                return Err(ServerError::PersistentSecretNotPermitted);
             }
             if !auth.writer {
                 match keyword.as_str() {
@@ -1109,6 +1119,34 @@ mod guard_tests {
     }
 
     #[test]
+    fn admission_rejects_persistent_secrets_for_every_session() -> Result<()> {
+        for session in [authed_session()?, writer_session()?] {
+            for sql in [
+                "CREATE PERSISTENT SECRET s (TYPE s3)",
+                "CREATE OR REPLACE PERSISTENT SECRET s (TYPE s3)",
+                "CREATE SECRET s IN LOCAL_FILE (TYPE s3)",
+                "SELECT 1; CREATE /* c */ pErSiStEnT SECRET s (TYPE s3)",
+            ] {
+                assert!(
+                    matches!(
+                        session.validate_user_sql(sql),
+                        Err(ServerError::PersistentSecretNotPermitted)
+                    ),
+                    "expected rejection: {sql}"
+                );
+            }
+            assert!(session.validate_user_sql("CREATE SECRET s (TYPE s3)").is_ok());
+            assert!(session
+                .validate_user_sql("CREATE TEMPORARY SECRET s (TYPE s3)")
+                .is_ok());
+            assert!(session
+                .validate_user_sql("CREATE VIEW v AS SELECT a IN (1, 2) FROM t")
+                .is_ok());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn admission_passes_writer() -> Result<()> {
         let s = writer_session()?;
         assert!(s.validate_user_sql("COPY t TO 'out.csv'").is_ok());
@@ -1171,14 +1209,23 @@ mod lockdown_tests {
         std::fs::write(lake.path().join("t.csv"), "a,b\n1,2\n")?;
 
         let conn = test_connection()?;
+        // The registry pins the secret directory at connection creation; the
+        // lock freezes it.
+        raw_batch(
+            &conn,
+            &format!(
+                "SET secret_directory = '{}'",
+                scratch.path().join("secrets").display()
+            ),
+        )?;
         let mut roots = BTreeSet::new();
         roots.insert(lake.path().to_string_lossy().into_owned());
         raw_batch(&conn, &lockdown_sql(&template(scratch.path()), false, &roots))
             .map_err(|e| anyhow!("lockdown block failed: {e}"))?;
 
         assert_eq!(raw_setting(&conn, "enable_external_access")?, "false");
-        assert_eq!(raw_setting(&conn, "allow_persistent_secrets")?, "false");
         assert_eq!(raw_setting(&conn, "lock_configuration")?, "true");
+        assert!(raw_setting(&conn, "secret_directory")?.ends_with("secrets"));
 
         let csv = lake.path().join("t.csv");
         raw_batch(
@@ -1200,6 +1247,7 @@ mod lockdown_tests {
 
         assert!(raw_batch(&conn, "SET enable_external_access = true").is_err());
         assert!(raw_batch(&conn, "SET allowed_directories = ['/']").is_err());
+        assert!(raw_batch(&conn, "SET secret_directory = '/tmp'").is_err());
         assert!(raw_batch(&conn, "SET lock_configuration = false").is_err());
         Ok(())
     }

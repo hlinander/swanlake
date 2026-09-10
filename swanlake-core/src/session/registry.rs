@@ -248,10 +248,27 @@ impl SessionRegistry {
         // (DuckDB connection creation involves I/O: loading extensions, init SQL, etc.)
         let factory = self.factory.clone();
         let sid = session_id.clone();
+        // The secret directory is pinned per session before any statement
+        // uses the secret manager (an armed attach does; DuckDB rejects the
+        // change afterward). The lockdown block later freezes it, so a
+        // persisted secret could never outlive the session's scratch path or
+        // be auto-loaded by another session's instance.
+        let secret_dir_sql = auth.as_ref().map(|_| {
+            let dir = std::path::Path::new(&self.lockdown.scratch_directory)
+                .join("secrets")
+                .join(session_id.to_string());
+            format!(
+                "SET secret_directory = '{}'",
+                super::escape_sql_literal(&dir.to_string_lossy())
+            )
+        });
         let connection = tokio::task::spawn_blocking(move || {
             let t0 = std::time::Instant::now();
             debug!(session_id = %sid, "creating new connection");
             let conn = factory.create_connection()?;
+            if let Some(sql) = secret_dir_sql {
+                conn.execute_statement(&sql)?;
+            }
             info!(
                 session_id = %sid,
                 total_ms = t0.elapsed().as_millis() as u64,
