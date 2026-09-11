@@ -61,8 +61,26 @@ impl DuckDbConnection {
     ///
     /// The returned handle can be used from another thread to interrupt
     /// queries running on this connection.
+    ///
+    /// Recovers a poisoned lock rather than propagating the panic, as every
+    /// other read of `conn` in this file does. The `.expect` this replaces made
+    /// a single interrupted query permanently fatal to the connection: DuckDB's
+    /// Arrow fetch panics on `INTERRUPT Error` instead of returning it, that
+    /// panic poisons the mutex, and then the next caller to ask for a handle —
+    /// every streaming query, which needs one to be cancellable at all —
+    /// panicked here before reaching the engine. The Flight request died with
+    /// it, so the client saw `RST_STREAM` and a cancelled call, and nothing
+    /// short of restarting the process ever served that connection again.
+    ///
+    /// Recovery is sound because an interrupt handle does not depend on the
+    /// state the panicking thread was partway through: it is derived from the
+    /// connection itself, and DuckDB treats an interrupted query as a query
+    /// that ended, leaving the connection able to take the next one.
     pub fn interrupt_handle(&self) -> std::sync::Arc<duckdb::InterruptHandle> {
-        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.interrupt_handle()
     }
 
@@ -633,6 +651,41 @@ mod tests {
     fn test_connection() -> DuckDbConnection {
         let conn = Connection::open_in_memory().expect("failed to open in-memory db");
         DuckDbConnection::new(conn)
+    }
+
+    /// A poisoned connection mutex must not take the next query down with it.
+    ///
+    /// DuckDB's Arrow fetch panics on `INTERRUPT Error` rather than returning
+    /// it, so cancelling a query poisons this mutex. `interrupt_handle` used to
+    /// `.expect` on the lock, and since every streaming query asks for a handle
+    /// before it runs, one cancelled query made the connection permanently
+    /// unusable — each later query panicked here, the Flight request died, and
+    /// the client saw a cancelled call until the server was restarted.
+    #[test]
+    fn an_interrupt_handle_outlives_a_poisoned_mutex() {
+        let conn = test_connection();
+
+        // Poison it exactly as the interrupted fetch does: panic while holding
+        // the guard. `catch_unwind` keeps the harness alive; the poison stays.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = conn.conn.lock().unwrap();
+            panic!("Failed to fetch Arrow record batch: INTERRUPT Error: Interrupted!");
+        }));
+        assert!(poisoned.is_err(), "the panic must have happened");
+        assert!(conn.conn.is_poisoned(), "and must have poisoned the mutex");
+
+        // The line that used to panic. Obtaining a handle is what makes a query
+        // cancellable, so this failing is what made the connection dead.
+        let _handle = conn.interrupt_handle();
+
+        // And the connection still serves queries, which is the whole point of
+        // recovering rather than reporting.
+        conn.execute_statement("CREATE TABLE after_poison (id INTEGER)")
+            .unwrap();
+        conn.execute_statement("INSERT INTO after_poison VALUES (1)")
+            .unwrap();
+        let result = conn.execute_query("SELECT * FROM after_poison").unwrap();
+        assert_eq!(result.total_rows, 1);
     }
 
     #[test]
