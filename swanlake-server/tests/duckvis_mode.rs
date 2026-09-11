@@ -1622,3 +1622,44 @@ async fn disconnected_read_rpcs_release_the_session() {
         .unwrap();
     }
 }
+
+#[tokio::test]
+async fn authenticated_locked_session_reports_cpu_in_flight_metadata() {
+    let h = base_harness().await;
+    let mut cli = client(&h.endpoint).await;
+    let token = format!("Bearer {}", valid_token("cpu-metadata-user"));
+    let headers = project_headers(&token, "cpu-metadata-session", PROJECT);
+    let descriptor = FlightDescriptor::new_cmd(
+        "SELECT sin(i::DOUBLE) + s FROM range(1000000) t(i) CROSS JOIN \
+         (SELECT sum(sin(j::DOUBLE)) AS s FROM range(1000000) t(j))",
+    );
+    let info = cli
+        .get_flight_info(with_headers(descriptor, &headers))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut positive_cpu = false;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        for endpoint in info.endpoint {
+            let mut stream = cli
+                .do_get(with_headers(endpoint.ticket.unwrap(), &headers))
+                .await
+                .unwrap()
+                .into_inner();
+            // Let backpressure hold the result while the CPU sampler ticks.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            while let Some(data) = stream.message().await.unwrap() {
+                if !data.app_metadata.is_empty() {
+                    let metadata: Value = rmp_serde::from_slice(&data.app_metadata).unwrap();
+                    positive_cpu |= metadata["cpu_time_us"].as_u64().unwrap_or(0) > 0;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        positive_cpu,
+        "locked authenticated session omitted CPU telemetry"
+    );
+}
