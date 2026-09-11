@@ -24,6 +24,16 @@ and boolean flags accept `true/false` (case-insensitive).
 | `SWANLAKE_SESSION_TIMEOUT_SECONDS` | Idle timeout before cleanup | `900` (15 min) |
 | `SWANLAKE_SESSION_ID_MODE` | Session identifier source: `peer_addr` (IP:port) or `peer_ip` (IP only) | `peer_addr` |
 | `SWANLAKE_EXTERNAL_KERNEL_EXTENSION` | Absolute path to the Python extension with session telemetry ABI v1 | _(unset)_ |
+| `SWANLAKE_EXECUTION_OWNER_PATH` | Persistent local owner file held under an exclusive lock for the server process lifetime | _(unset)_ |
+
+Guarded feed-write recovery requires `SWANLAKE_EXECUTION_OWNER_PATH`. The file
+retains the server owner identity across restarts; each process receives a new
+execution generation. A replacement holding the same exclusive owner proves
+that the previous process exited. Delayed writes carrying the old generation
+are rejected. Startup fails if the owner file is corrupt or already locked.
+Keep the file on persistent local storage and never replace or unlink it while
+SwanLake runs. Without a persistent owner, clients cannot automatically resolve
+an unknown write outcome after a server restart.
 
 ## Logging
 
