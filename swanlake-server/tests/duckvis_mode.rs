@@ -1498,6 +1498,60 @@ async fn guarded_execution_acknowledges_sql_errors_and_auth_rejections() {
     );
 }
 
+#[tokio::test]
+async fn execution_identity_requires_auth_and_fences_delayed_mutations() {
+    let h = base_harness().await;
+    let mut cli = client(&h.endpoint).await;
+    let action = || Action {
+        r#type: "execution_identity".into(),
+        body: Default::default(),
+    };
+    let denied = cli.do_action(action()).await.unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::Unauthenticated);
+    let token = format!("Bearer {}", valid_token("generation-user"));
+    let headers = project_headers(&token, "generation-session", PROJECT);
+    let response = cli
+        .do_action(with_headers(action(), &headers))
+        .await
+        .unwrap();
+    let first = response.into_inner().message().await.unwrap().unwrap();
+    let identity: Value = serde_json::from_slice(&first.body).unwrap();
+    assert_eq!(identity["version"], 1);
+    let generation = identity["generation"].as_str().unwrap();
+    for (expected, accepted) in [("old-process-generation", false), (generation, true)] {
+        let mut guarded = headers.clone();
+        guarded.push(("x-swanlake-generation", expected));
+        let response = cli
+            .do_action(with_headers(
+                Action {
+                    r#type: "execute_guarded".into(),
+                    body: "CREATE TEMP TABLE generation_write AS SELECT 42 AS n".into(),
+                },
+                &guarded,
+            ))
+            .await
+            .unwrap();
+        let first = response.into_inner().message().await.unwrap().unwrap();
+        let result: Value = serde_json::from_slice(&first.body).unwrap();
+        assert_eq!(result["completed"], true);
+        assert_eq!(result["error"].is_null(), accepted);
+        if !accepted {
+            assert_eq!(
+                result["error"]["code"],
+                tonic::Code::FailedPrecondition as i32
+            );
+            assert!(
+                run_select(&mut cli, &headers, "SELECT * FROM generation_write")
+                    .await
+                    .is_err()
+            );
+        }
+    }
+    run_select(&mut cli, &headers, "SELECT * FROM generation_write")
+        .await
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disconnected_read_rpcs_release_the_session() {
     use arrow_flight::sql::client::FlightSqlServiceClient;

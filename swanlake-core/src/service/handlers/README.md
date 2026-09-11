@@ -56,3 +56,26 @@ from action logs because source setup can carry credentials.
 does not acknowledge completion. A caller that must serialize mutations waits
 for the original completion envelope. A lost envelope leaves the result unknown,
 even when cancellation was requested. Existing `execute` results remain MsgPack.
+
+
+`execution_identity` authenticates the caller and returns `{version: 1, owner,
+generation}`. `SWANLAKE_EXECUTION_OWNER_PATH` enables restart recovery: the
+server exclusively locks this persistent local file before starting execution
+threads and retains the lock until OS process exit. Each start generates a new
+generation UUID. A different generation with the same owner proves that the
+previous process exited. Without this setting, `owner` is null and clients
+cannot infer termination from a restart.
+
+Create the parent directory for the service user. Keep the file outside release
+and temporary directories; never copy, replace, or unlink it while a server is
+running. Losing the owner file changes identity and requires manual recovery of
+old uncertain writes. Use a separate file for each independent server.
+
+Guarded statements carrying `x-swanlake-generation` execute only on that
+generation. A mismatch returns a completed rejection before SQL execution, so a
+delayed old request cannot execute after recovery. Deploy the server before a
+client that requires `execution_identity`.
+
+Live CPU sampling is disabled after a native profiler crash. Flight metadata
+omits `cpu_time_us`; memory sampling and query progress remain available. The
+response retains its query connection for the full lifetime of progress polling.

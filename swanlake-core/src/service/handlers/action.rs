@@ -1159,6 +1159,19 @@ struct AirportExecuteParameters {
     sql: String,
 }
 
+/// Authenticated process identity, independent of session eviction/nonces.
+pub(crate) async fn do_action_execution_identity(
+    service: &SwanFlightSqlService,
+    request: Request<Action>,
+) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
+    service.prepare_request(&request).await?;
+    let body = serde_json::to_vec(&service.execution_identity)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    Ok(Response::new(Box::pin(stream::iter(vec![Ok(
+        arrow_flight::Result { body: body.into() },
+    )]))))
+}
+
 /// Completion acknowledgement for loaders that must distinguish a finished SQL
 /// error from a lost RPC. This envelope is sent only after execution has returned;
 /// cancel_execution acknowledges an interrupt request, not completion.
@@ -1186,6 +1199,13 @@ pub(crate) async fn do_action_execute(
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
     let guarded = request.get_ref().r#type == "execute_guarded";
     let session = service.prepare_request(&request).await?;
+    if let Some(expected) = request.metadata().get("x-swanlake-generation") {
+        if expected.to_str().ok() != Some(service.execution_identity.generation.as_str()) {
+            return Err(Status::failed_precondition(
+                "SwanLake execution generation changed",
+            ));
+        }
+    }
     let cancellation = Arc::new(crate::engine::cancellation::RequestCancellation::default());
     if let Some(id) = request.metadata().get("x-swanlake-request-id") {
         let id = id

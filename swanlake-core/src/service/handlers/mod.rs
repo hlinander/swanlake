@@ -338,6 +338,7 @@ impl FlightSqlService for SwanFlightSqlService {
             "catalog_version" => action::do_action_catalog_version(self, request).await,
             "endpoints" => action::do_action_endpoints(self, request).await,
             "execute" => action::do_action_execute(self, request).await,
+            "execution_identity" => action::do_action_execution_identity(self, request).await,
             "execute_guarded" => action::do_action_execute_guarded(self, request).await,
             "cancel_execution" => action::do_action_cancel_execution(self, request).await,
             "execution_updates" => action::do_action_execution_updates(self, request).await,

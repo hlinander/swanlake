@@ -20,7 +20,16 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let config = ServerConfig::load().context("failed to load configuration")?;
+    let execution_identity = swanlake_core::execution_identity::ExecutionIdentity::for_process(
+        config
+            .execution_owner_path
+            .as_deref()
+            .map(std::path::Path::new),
+    )
+    .context("failed to acquire execution owner")?;
     init_tracing(&config);
+    info!(owner = ?execution_identity.owner, generation = %execution_identity.generation,
+        "execution identity initialized");
     info!("service config:\n{:?}", config);
     let addr = config
         .bind_addr()
@@ -79,7 +88,8 @@ async fn main() -> Result<()> {
         config.session_id_mode.clone(),
         flight_location,
         duckvis,
-    );
+    )
+    .with_execution_identity(execution_identity);
 
     status::spawn_status_server(&config, metrics, registry.clone())?;
 

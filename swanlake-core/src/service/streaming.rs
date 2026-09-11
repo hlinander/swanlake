@@ -160,7 +160,7 @@ impl SwanFlightSqlService {
         .await
         .map_err(Self::status_from_join)??;
         let resource_tracker = match monitoring_connection {
-            Ok(conn) => Arc::new(ResourceTracker::start(conn, interrupt_handle.clone())),
+            Ok(conn) => Arc::new(ResourceTracker::start(conn)),
             Err(e) => {
                 warn!(%e, "failed to clone monitoring connection, resource tracking disabled");
                 Arc::new(ResourceTracker::disabled())
@@ -174,6 +174,7 @@ impl SwanFlightSqlService {
             monitor_cancellation.cancel();
         });
 
+        let query_connection = session.connection.clone();
         let sql_clone = sql.clone();
         tokio::task::spawn_blocking(move || {
             let result = cancellation
@@ -205,6 +206,7 @@ impl SwanFlightSqlService {
             interrupt_handle,
             resource_tracker,
             cancel_on_disconnect,
+            query_connection,
         );
 
         Ok(Response::new(Box::pin(stream)))
@@ -221,6 +223,9 @@ impl SwanFlightSqlService {
 /// being produced.
 struct StreamingBatchToFlightData<S> {
     inner: S,
+    // InterruptHandle does not own its native connection. Progress polling must
+    // retain the connection even after query completion or session eviction.
+    _query_connection: Arc<crate::engine::DuckDbConnection>,
     schema: Option<Arc<Schema>>,
     done: bool,
     /// Interrupt handle used only for progress polling.
@@ -241,6 +246,7 @@ impl<S> StreamingBatchToFlightData<S> {
         interrupt_handle: Arc<InterruptHandle>,
         resource_tracker: Arc<ResourceTracker>,
         cancel_on_disconnect: CancelOnDrop,
+        query_connection: Arc<crate::engine::DuckDbConnection>,
     ) -> Self {
         // First tick after 250ms (not immediately), then every 250ms.
         let mut heartbeat = tokio::time::interval_at(
@@ -250,6 +256,7 @@ impl<S> StreamingBatchToFlightData<S> {
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         Self {
             inner,
+            _query_connection: query_connection,
             schema: None,
             done: false,
             interrupt_handle,
@@ -381,6 +388,22 @@ mod cancellation_tests {
     use crate::engine::EngineFactory;
     use crate::session::{SessionId, registry::SessionRegistry};
 
+    #[test]
+    fn unavailable_cpu_metric_is_omitted_without_hiding_memory() {
+        let bytes = encode_progress(
+            0.5,
+            Some(ResourceSnapshot {
+                peak_memory_bytes: 100,
+                current_memory_bytes: 80,
+                cpu_time_us: 0,
+            }),
+        );
+        let metadata: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(metadata["peak_memory_bytes"], 100);
+        assert_eq!(metadata["current_memory_bytes"], 80);
+        assert!(metadata.get("cpu_time_us").is_none());
+    }
+
     async fn session() -> anyhow::Result<Arc<Session>> {
         let config = ServerConfig::default();
         let registry = SessionRegistry::new(
@@ -390,6 +413,28 @@ mod cancellation_tests {
         Ok(registry
             .get_or_create_by_id(&SessionId::from_string("stream-cancel".into()))
             .await?)
+    }
+
+    #[tokio::test]
+    async fn response_keeps_query_connection_alive_after_execution() -> anyhow::Result<()> {
+        let session = session().await?;
+        let connection = Arc::downgrade(&session.connection);
+        let mut response =
+            SwanFlightSqlService::execute_query_streaming(session.clone(), "SELECT 1".into(), None)
+                .await?
+                .into_inner();
+        drop(session);
+        // Consume execution output but keep the response (and telemetry) alive.
+        use futures::StreamExt;
+        while response.next().await.is_some() {}
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            connection.upgrade().is_some(),
+            "telemetry outlived its query connection"
+        );
+        drop(response);
+        assert!(connection.upgrade().is_none());
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

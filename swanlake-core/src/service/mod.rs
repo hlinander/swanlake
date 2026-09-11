@@ -43,6 +43,7 @@ fn duckvis_project_header<T>(request: &Request<T>) -> Option<String> {
 
 #[derive(Clone)]
 pub struct SwanFlightSqlService {
+    execution_identity: crate::execution_identity::ExecutionIdentity,
     registry: Arc<SessionRegistry>,
     metrics: Arc<Metrics>,
     session_id_mode: SessionIdMode,
@@ -70,6 +71,7 @@ impl SwanFlightSqlService {
         duckvis: Option<Arc<crate::duckvis::DuckvisAuth>>,
     ) -> Self {
         Self {
+            execution_identity: Default::default(),
             registry,
             metrics,
             session_id_mode,
@@ -454,6 +456,14 @@ impl SwanFlightService {
                 duckvis,
             ),
         }
+    }
+
+    pub fn with_execution_identity(
+        mut self,
+        identity: crate::execution_identity::ExecutionIdentity,
+    ) -> Self {
+        self.inner.execution_identity = identity;
+        self
     }
 
     /// Check if the FlightDescriptor cmd field contains raw SQL (not protobuf).
