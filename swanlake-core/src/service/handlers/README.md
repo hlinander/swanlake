@@ -76,6 +76,8 @@ generation. A mismatch returns a completed rejection before SQL execution, so a
 delayed old request cannot execute after recovery. Deploy the server before a
 client that requires `execution_identity`.
 
-Live CPU sampling is disabled after a native profiler crash. Flight metadata
-omits `cpu_time_us`; memory sampling and query progress remain available. The
-response retains its query connection for the full lifetime of progress polling.
+Live CPU sampling retains the actual query connection until the sampler thread
+exits. The response also retains that connection throughout progress polling.
+The CPU reader and profiler updates use DuckDB's profiler mutex. Flight metadata
+includes `cpu_time_us` when profiling data is available; memory and progress
+telemetry continue independently.

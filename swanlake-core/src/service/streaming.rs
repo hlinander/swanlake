@@ -144,7 +144,7 @@ impl SwanFlightSqlService {
         // off the async runtime and reject cancelled requests after acquisition.
         let setup_session = session.clone();
         let setup_cancellation = cancellation.clone();
-        let (interrupt_handle, monitoring_connection) = tokio::task::spawn_blocking(move || {
+        let (interrupt_handle, resource_tracker) = tokio::task::spawn_blocking(move || {
             let conn = setup_session
                 .connection
                 .conn
@@ -155,17 +155,24 @@ impl SwanFlightSqlService {
                 .map_err(Self::status_from_error)?;
             let interrupt = conn.interrupt_handle();
             let monitor = conn.try_clone();
-            Ok::<_, Status>((interrupt, monitor))
+            drop(conn);
+            let resource_tracker = match monitor {
+                Ok(conn) => Arc::new(ResourceTracker::start(
+                    conn,
+                    setup_session.connection.clone(),
+                )),
+                Err(e) => {
+                    warn!(%e, "failed to clone monitoring connection, resource tracking disabled");
+                    Arc::new(ResourceTracker::disabled())
+                }
+            };
+            setup_cancellation
+                .check()
+                .map_err(Self::status_from_error)?;
+            Ok::<_, Status>((interrupt, resource_tracker))
         })
         .await
         .map_err(Self::status_from_join)??;
-        let resource_tracker = match monitoring_connection {
-            Ok(conn) => Arc::new(ResourceTracker::start(conn)),
-            Err(e) => {
-                warn!(%e, "failed to clone monitoring connection, resource tracking disabled");
-                Arc::new(ResourceTracker::disabled())
-            }
-        };
 
         let tx_monitor = tx.clone();
         let monitor_cancellation = cancellation.clone();
@@ -413,6 +420,46 @@ mod cancellation_tests {
         Ok(registry
             .get_or_create_by_id(&SessionId::from_string("stream-cancel".into()))
             .await?)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn executing_query_reports_positive_cpu_before_completion() -> anyhow::Result<()> {
+        use futures::StreamExt;
+        let session = session().await?;
+        let mut response = SwanFlightSqlService::execute_query_streaming(
+            session.clone(),
+            // The aggregate flushes profiling data while the cross-product
+            // continues streaming under client backpressure.
+            "SELECT sin(i::DOUBLE) + s FROM range(1000000) t(i) CROSS JOIN \
+             (SELECT sum(sin(j::DOUBLE)) AS s FROM range(1000000) t(j))"
+                .into(),
+            None,
+        )
+        .await?
+        .into_inner();
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut live_cpu = false;
+            // Leave output buffered long enough for the 100ms sampler tick.
+            let _schema = response.next().await.transpose()?;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            while let Some(batch) = response.next().await {
+                let batch = batch?;
+                if !batch.app_metadata.is_empty() {
+                    let metadata: serde_json::Value = rmp_serde::from_slice(&batch.app_metadata)?;
+                    if metadata["cpu_time_us"].as_u64().unwrap_or(0) > 0
+                        && session.connection.conn.try_lock().is_err()
+                    {
+                        live_cpu = true;
+                    }
+                }
+            }
+            anyhow::ensure!(live_cpu, "no CPU telemetry while the query was executing");
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        drop(response);
+        observed??;
+        Ok(())
     }
 
     #[tokio::test]
