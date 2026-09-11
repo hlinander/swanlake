@@ -13,6 +13,7 @@ pub mod config;
 pub mod duckvis;
 pub mod engine;
 pub mod error;
+pub mod execution_identity;
 pub mod maintenance;
 pub mod metrics;
 pub mod scrub;

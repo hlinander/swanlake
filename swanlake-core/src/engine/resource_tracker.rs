@@ -1,16 +1,14 @@
 //! Resource tracking for running queries.
 //!
-//! Samples DuckDB memory usage and CPU time on a background thread,
+//! Samples DuckDB memory usage on a background thread,
 //! providing metrics that can be streamed to Flight clients alongside
 //! query progress.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use duckdb::InterruptHandle;
-use libduckdb_sys as ffi;
 use tracing::{trace, warn};
 
 /// Snapshot of resource usage at a point in time.
@@ -21,27 +19,17 @@ pub struct ResourceSnapshot {
     pub cpu_time_us: u64,
 }
 
-/// Wrapper to send raw DuckDB connection pointer across threads.
-struct SendConn(ffi::duckdb_connection);
-unsafe impl Send for SendConn {}
-
-/// Mirror of InterruptHandle's internal layout (same as in progress.rs).
-#[repr(C)]
-struct InterruptHandleHack {
-    conn: std::sync::Mutex<ffi::duckdb_connection>,
-}
-
 /// Tracks resource usage of a running DuckDB query by polling on a background thread.
 ///
 /// Memory: uses a separate monitoring connection (via `try_clone()`) to query
 /// `duckdb_memory()` every ~100ms.
 ///
-/// CPU time: calls `duckdb_get_accumulated_cpu_time()` on the query connection,
-/// which acquires the profiler lock internally for thread safety.
+/// Live CPU profiler traversal is disabled: the response can outlive its query
+/// connection. The sampler retains no raw query-connection pointer.
+/// CPU time remains unavailable (omitted from Flight metadata).
 pub struct ResourceTracker {
     peak_memory_bytes: Arc<AtomicU64>,
     current_memory_bytes: Arc<AtomicU64>,
-    cpu_time_us: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     sampler_handle: Option<thread::JoinHandle<()>>,
 }
@@ -50,35 +38,18 @@ impl ResourceTracker {
     /// Start sampling resource usage on a background thread.
     ///
     /// - `monitoring_conn`: separate connection to the same database (for memory queries)
-    /// - `query_interrupt`: interrupt handle of the connection running the query (for CPU time)
-    pub fn start(
-        monitoring_conn: duckdb::Connection,
-        query_interrupt: Arc<InterruptHandle>,
-    ) -> Self {
+    pub fn start(monitoring_conn: duckdb::Connection) -> Self {
         let peak_memory_bytes = Arc::new(AtomicU64::new(0));
         let current_memory_bytes = Arc::new(AtomicU64::new(0));
-        let cpu_time_us = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
 
         let peak = Arc::clone(&peak_memory_bytes);
         let current = Arc::clone(&current_memory_bytes);
-        let cpu = Arc::clone(&cpu_time_us);
         let stop_flag = Arc::clone(&stop);
-
-        // Extract raw query connection pointer for CPU time FFI.
-        let query_conn = SendConn({
-            let hack: &InterruptHandleHack =
-                unsafe { std::mem::transmute(query_interrupt.as_ref()) };
-            *hack.conn.lock().expect("interrupt handle mutex poisoned")
-        });
 
         let sampler_handle = thread::Builder::new()
             .name("resource-sampler".into())
             .spawn(move || {
-                // Keep interrupt handle alive so the connection pointer remains valid.
-                let _interrupt_owner = query_interrupt;
-                // Force capture of entire SendConn (not just .0) for Send impl.
-                let query_conn = query_conn;
                 let mut warned = false;
 
                 while !stop_flag.load(Ordering::Relaxed) {
@@ -106,17 +77,6 @@ impl ResourceTracker {
                         }
                     }
 
-                    // Sample CPU time from query connection's profiler
-                    if !query_conn.0.is_null() {
-                        let cpu_seconds =
-                            unsafe { ffi::duckdb_get_accumulated_cpu_time(query_conn.0) };
-                        if cpu_seconds > 0.0 {
-                            let us = (cpu_seconds * 1_000_000.0) as u64;
-                            cpu.store(us, Ordering::Relaxed);
-                            trace!(cpu_time_us = us, "sampled cpu time");
-                        }
-                    }
-
                     thread::sleep(Duration::from_millis(100));
                 }
             })
@@ -125,7 +85,6 @@ impl ResourceTracker {
         Self {
             peak_memory_bytes,
             current_memory_bytes,
-            cpu_time_us,
             stop,
             sampler_handle: Some(sampler_handle),
         }
@@ -136,7 +95,6 @@ impl ResourceTracker {
         Self {
             peak_memory_bytes: Arc::new(AtomicU64::new(0)),
             current_memory_bytes: Arc::new(AtomicU64::new(0)),
-            cpu_time_us: Arc::new(AtomicU64::new(0)),
             stop: Arc::new(AtomicBool::new(true)),
             sampler_handle: None,
         }
@@ -147,7 +105,7 @@ impl ResourceTracker {
         ResourceSnapshot {
             peak_memory_bytes: self.peak_memory_bytes.load(Ordering::Relaxed),
             current_memory_bytes: self.current_memory_bytes.load(Ordering::Relaxed),
-            cpu_time_us: self.cpu_time_us.load(Ordering::Relaxed),
+            cpu_time_us: 0,
         }
     }
 }
