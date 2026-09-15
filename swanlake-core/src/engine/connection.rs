@@ -213,57 +213,66 @@ impl DuckDbConnection {
         }
 
         // Now execute the full query in true streaming mode
-        self.with_arrow_prepared_cancellable(sql, params, cancellation, |stmt| {
-            let arrow = Self::stream_arrow_with_params(stmt, params)?;
-            let schema = arrow.get_schema();
+        let completed =
+            self.with_arrow_prepared_cancellable(sql, params, cancellation, |stmt| {
+                let arrow = Self::stream_arrow_with_params(stmt, params)?;
+                let schema = arrow.get_schema();
 
-            if tx
-                .blocking_send(StreamingBatch::Schema(schema.as_ref().clone()))
-                .is_err()
-            {
-                debug!("streaming receiver dropped before schema sent");
-                return Ok(());
-            }
-
-            // Stream batches with backpressure
-            let mut total_rows = 0usize;
-            let mut total_bytes = 0usize;
-            let mut batch_count = 0usize;
-            for batch in arrow {
-                // Check if client cancelled before processing batch
-                if tx.is_closed() {
-                    info!(batch_count, total_rows, "streaming receiver closed, interrupting query");
-                    if let Some(ref handle) = interrupt_handle {
-                        handle.interrupt();
-                    }
-                    return Ok(());
+                if tx
+                    .blocking_send(StreamingBatch::Schema(schema.as_ref().clone()))
+                    .is_err()
+                {
+                    debug!("streaming receiver dropped before schema sent");
+                    return Ok(None);
                 }
 
-                batch_count += 1;
-                let batch_rows = batch.num_rows();
-                let batch_bytes = batch.get_array_memory_size();
-                total_rows += batch_rows;
-                total_bytes += batch_bytes;
-
-                debug!(
-                    batch_count,
-                    batch_rows,
-                    batch_bytes,
-                    total_rows,
-                    total_bytes,
-                    "streaming batch"
-                );
-
-                if tx.blocking_send(StreamingBatch::Batch(batch)).is_err() {
-                    info!(batch_count, total_rows, "streaming receiver dropped, interrupting query");
-                    if let Some(ref handle) = interrupt_handle {
-                        handle.interrupt();
+                // Stream batches with backpressure
+                let mut total_rows = 0usize;
+                let mut total_bytes = 0usize;
+                let mut batch_count = 0usize;
+                for batch in arrow {
+                    // Check if client cancelled before processing batch
+                    if tx.is_closed() {
+                        info!(
+                            batch_count,
+                            total_rows, "streaming receiver closed, interrupting query"
+                        );
+                        if let Some(ref handle) = interrupt_handle {
+                            handle.interrupt();
+                        }
+                        return Ok(None);
                     }
-                    return Ok(());
-                }
-            }
 
-            // Send completion message
+                    batch_count += 1;
+                    let batch_rows = batch.num_rows();
+                    let batch_bytes = batch.get_array_memory_size();
+                    total_rows += batch_rows;
+                    total_bytes += batch_bytes;
+
+                    debug!(
+                        batch_count,
+                        batch_rows, batch_bytes, total_rows, total_bytes, "streaming batch"
+                    );
+
+                    if tx.blocking_send(StreamingBatch::Batch(batch)).is_err() {
+                        info!(
+                            batch_count,
+                            total_rows, "streaming receiver dropped, interrupting query"
+                        );
+                        if let Some(ref handle) = interrupt_handle {
+                            handle.interrupt();
+                        }
+                        return Ok(None);
+                    }
+                }
+
+                Ok(Some((batch_count, total_rows, total_bytes)))
+            })?;
+
+        // The receiver closes as soon as it consumes Done. Finish statement
+        // cleanup and the final cancellation check before publishing it, so
+        // normal stream closure cannot turn a completed query into an error.
+        if let Some((batch_count, total_rows, total_bytes)) = completed {
             let _ = tx.blocking_send(StreamingBatch::Done {
                 total_rows,
                 total_bytes,
@@ -272,8 +281,8 @@ impl DuckDbConnection {
                 batch_count,
                 total_rows, total_bytes, "streaming query completed"
             );
-            Ok(())
-        })
+        }
+        Ok(())
     }
 
     /// Execute a query with bound parameters.
@@ -633,6 +642,75 @@ impl DuckDbConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_stream_survives_immediate_receiver_close() -> anyhow::Result<()> {
+        use crate::engine::cancellation::RequestCancellation;
+        use std::sync::Arc;
+
+        let connection = Arc::new(test_connection());
+        for iteration in 0..200 {
+            let cancellation = Arc::new(RequestCancellation::default());
+            let (tx, mut rx) = mpsc::channel(1);
+            let worker_connection = connection.clone();
+            let worker_cancellation = cancellation.clone();
+            let worker = tokio::task::spawn_blocking(move || {
+                worker_connection.stream_query_cancellable(
+                    "SELECT ?::INTEGER AS value",
+                    Some(&[Value::Int(iteration)]),
+                    tx,
+                    &worker_cancellation,
+                )
+            });
+            let mut rows = 0;
+            loop {
+                match rx.recv().await {
+                    Some(StreamingBatch::Batch(batch)) => rows += batch.num_rows(),
+                    Some(StreamingBatch::Done { total_rows, .. }) => {
+                        assert_eq!(rows, 1);
+                        assert_eq!(total_rows, rows);
+                        // Flight closes the response immediately upon Done.
+                        // That closure must not change the worker's result.
+                        rx.close();
+                        cancellation.cancel();
+                        break;
+                    }
+                    Some(StreamingBatch::Schema(_)) => {}
+                    Some(StreamingBatch::Error(error)) => return Err(error.into()),
+                    None => anyhow::bail!("stream ended without completion"),
+                }
+            }
+            worker.await??;
+        }
+        assert_eq!(connection.execute_query("SELECT 42")?.total_rows, 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unfinished_stream_still_cancels_on_receiver_close() -> anyhow::Result<()> {
+        use crate::engine::cancellation::RequestCancellation;
+        use std::sync::Arc;
+
+        let connection = Arc::new(test_connection());
+        let cancellation = Arc::new(RequestCancellation::default());
+        let (tx, mut rx) = mpsc::channel(1);
+        let worker_connection = connection.clone();
+        let worker_cancellation = cancellation.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            worker_connection.stream_query_cancellable(
+                "SELECT i FROM range(100000) t(i)",
+                None,
+                tx,
+                &worker_cancellation,
+            )
+        });
+        assert!(matches!(rx.recv().await, Some(StreamingBatch::Schema(_))));
+        rx.close();
+        cancellation.cancel();
+        assert!(matches!(worker.await?, Err(ServerError::Cancelled)));
+        assert_eq!(connection.execute_query("SELECT 42")?.total_rows, 1);
+        Ok(())
+    }
 
     fn test_connection() -> DuckDbConnection {
         let conn = Connection::open_in_memory().expect("failed to open in-memory db");
