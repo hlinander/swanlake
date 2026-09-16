@@ -4,8 +4,8 @@
 //! providing metrics that can be streamed to Flight clients alongside
 //! query progress.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -25,6 +25,49 @@ pub struct ResourceSnapshot {
 struct SendConn(ffi::duckdb_connection);
 unsafe impl Send for SendConn {}
 
+/// How long the sampler waits between samples.
+const SAMPLE_PERIOD: Duration = Duration::from_millis(100);
+
+/// Stops the sampler without waiting out its current wait. The sampler waits on
+/// the condvar rather than sleeping, so a shutdown costs the sample in flight
+/// instead of the remainder of [`SAMPLE_PERIOD`] — a `DoGet` that outlives its
+/// query by microseconds used to pay that remainder before its response stream
+/// could end.
+#[derive(Default)]
+struct Stop {
+    stopped: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl Stop {
+    /// Wait out one period, or return early once [`Self::signal`] has run.
+    /// Returns whether sampling continues.
+    fn wait(&self) -> bool {
+        let stopped = self.stopped.lock().unwrap_or_else(|p| p.into_inner());
+        if *stopped {
+            return false;
+        }
+        let (stopped, _) = self
+            .wake
+            .wait_timeout(stopped, SAMPLE_PERIOD)
+            .unwrap_or_else(|p| p.into_inner());
+        !*stopped
+    }
+
+    /// A signal nothing waits on, for a tracker with no sampler thread.
+    fn stopped() -> Self {
+        Self {
+            stopped: Mutex::new(true),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn signal(&self) {
+        *self.stopped.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.wake.notify_all();
+    }
+}
+
 /// Mirror of InterruptHandle's internal layout (same as in progress.rs).
 #[repr(C)]
 struct InterruptHandleHack {
@@ -42,7 +85,7 @@ pub struct ResourceTracker {
     peak_memory_bytes: Arc<AtomicU64>,
     current_memory_bytes: Arc<AtomicU64>,
     cpu_time_us: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
+    stop: Arc<Stop>,
     sampler_handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -61,12 +104,12 @@ impl ResourceTracker {
         let peak_memory_bytes = Arc::new(AtomicU64::new(0));
         let current_memory_bytes = Arc::new(AtomicU64::new(0));
         let cpu_time_us = Arc::new(AtomicU64::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(Stop::default());
 
         let peak = Arc::clone(&peak_memory_bytes);
         let current = Arc::clone(&current_memory_bytes);
         let cpu = Arc::clone(&cpu_time_us);
-        let stop_flag = Arc::clone(&stop);
+        let stop_signal = Arc::clone(&stop);
 
         // Derive the pointer from the same connection the thread will retain.
         // InterruptHandle alone does not keep a native connection alive.
@@ -88,7 +131,7 @@ impl ResourceTracker {
                 let query_conn = query_conn;
                 let mut warned = false;
 
-                while !stop_flag.load(Ordering::Relaxed) {
+                loop {
                     // Sample memory via monitoring connection
                     match monitoring_conn.query_row(
                         "SELECT sum(memory_usage_bytes) FROM duckdb_memory()",
@@ -124,7 +167,10 @@ impl ResourceTracker {
                         }
                     }
 
-                    thread::sleep(Duration::from_millis(100));
+                    // Outside the lock: a shutdown never queues behind a sample.
+                    if !stop_signal.wait() {
+                        break;
+                    }
                 }
             })
             .expect("failed to spawn resource sampler thread");
@@ -144,7 +190,7 @@ impl ResourceTracker {
             peak_memory_bytes: Arc::new(AtomicU64::new(0)),
             current_memory_bytes: Arc::new(AtomicU64::new(0)),
             cpu_time_us: Arc::new(AtomicU64::new(0)),
-            stop: Arc::new(AtomicBool::new(true)),
+            stop: Arc::new(Stop::stopped()),
             sampler_handle: None,
         }
     }
@@ -161,7 +207,7 @@ impl ResourceTracker {
 
 impl Drop for ResourceTracker {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.signal();
         if let Some(handle) = self.sampler_handle.take() {
             let _ = handle.join();
         }
@@ -171,6 +217,28 @@ impl Drop for ResourceTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_costs_a_sample_rather_than_a_sampling_period() {
+        let native = duckdb::Connection::open_in_memory().unwrap();
+        let monitoring = native.try_clone().unwrap();
+        let connection = Arc::new(DuckDbConnection::new(native));
+        let tracker = ResourceTracker::start(monitoring, connection);
+        // Put the sampler inside its wait, which is the state a DoGet drops it
+        // in: one sample costs a fraction of a millisecond, so this grace is
+        // three orders of magnitude clear of it and well short of one period.
+        thread::sleep(Duration::from_millis(20));
+        let start = std::time::Instant::now();
+        drop(tracker);
+        let elapsed = start.elapsed();
+        // An absolute bound, not a fraction of SAMPLE_PERIOD: a sample that
+        // blocked on the profiler lock would otherwise pass unnoticed.
+        assert!(
+            elapsed < Duration::from_millis(10),
+            "dropping a tracker took {elapsed:?}; a DoGet pays this before its \
+             response stream can end"
+        );
+    }
 
     #[test]
     fn sampler_retains_connection_through_query_turnover_and_owner_drop() {
