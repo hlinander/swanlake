@@ -179,13 +179,23 @@ impl SessionRegistry {
     /// Any in-flight request keeps its `Arc<Session>` alive until that request
     /// completes, while future requests with the same id create a fresh
     /// session incarnation and therefore receive a new nonce.
-    pub fn remove(&self, session_id: &SessionId) -> bool {
-        self.inner
+    pub fn remove(&self, session_id: &SessionId, nonce: &str) -> bool {
+        let mut inner = self
+            .inner
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Authentication may have observed the old incarnation before another
+        // close/recreate. Remove only the incarnation the caller checked.
+        if inner
             .sessions
-            .remove(session_id)
-            .is_some()
+            .get(session_id)
+            .is_some_and(|entry| entry.session.nonce() == nonce)
+        {
+            inner.sessions.remove(session_id);
+            true
+        } else {
+            false
+        }
     }
 
     /// Get or create session by session ID.
@@ -424,18 +434,36 @@ mod tests {
         let first = SessionId::from_string("peer:first".to_string());
         let second = SessionId::from_string("peer:second".to_string());
 
-        registry
+        let nonce = registry
             .get_or_create_by_id(&first)
             .await
-            .map_err(|e| anyhow!(e.to_string()))?;
-        assert!(registry.remove(&first));
-        assert!(!registry.remove(&first));
+            .map_err(|e| anyhow!(e.to_string()))?
+            .nonce()
+            .to_string();
+        assert!(registry.remove(&first, &nonce));
+        assert!(!registry.remove(&first, &nonce));
         registry
             .get_or_create_by_id(&second)
             .await
             .map_err(|e| anyhow!(e.to_string()))?;
 
         assert_eq!(registry.snapshot().total_sessions, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delayed_close_preserves_a_recreated_session() -> Result<()> {
+        let (registry, _) = build_registry(1, 60)?;
+        let id = SessionId::from_string("peer:recreated".to_string());
+        let nonce = registry.get_or_create_by_id(&id).await?.nonce().to_string();
+        assert!(registry.remove(&id, &nonce));
+        let replacement = registry.get_or_create_by_id(&id).await?;
+        assert_ne!(replacement.nonce(), nonce);
+        assert!(!registry.remove(&id, &nonce));
+        assert_eq!(
+            registry.get_by_id(&id).unwrap().nonce(),
+            replacement.nonce()
+        );
         Ok(())
     }
 

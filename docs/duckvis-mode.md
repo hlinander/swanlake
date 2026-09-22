@@ -22,8 +22,21 @@ the given bind id; on allow it normalizes the returned statement to
 executes it on the session's DuckDB connection via a privileged path (bypassing the C6 guard).
 The resolved statement must never appear in logs, traces, or error messages.
 
+After a viewer session applies its DuckDB lockdown, an approved attachment whose catalog is
+absent returns `failed_precondition` with `session recreation required: new attachment after
+lockdown`, before executing the attachment. An already-attached catalog can be re-armed on the
+same session. The catalog check, attachment, and data-root collection serialize with lockdown;
+writer sessions retain their existing attachment behavior.
+
 Client invocation (duckvis app, via the DuckDB Airport extension — same pattern as `session_info`):
 `airport_action('<grpc endpoint>', 'duckvis_attach', '{"bind_id":"…"}', headers := MAP{…})`.
+
+On the recreation refusal, Analyze calls C7 with the current authentication, project, session id,
+and `x-expected-session-nonce`. It consumes the close acknowledgement before clearing local
+session state and re-arming all desired attachments. The allocation and session id stay unchanged;
+the next attachment creates a new server session with a new nonce. Recovery allows one close until
+the attachment batch succeeds or an explicit retry resets the attempt. Other attachment failures
+do not initiate a close, and a failed close is reported to the user.
 
 `DETACH <name>` stays native SQL and remains allowed.
 
@@ -100,6 +113,24 @@ Long-running clients that mint distinct `airport-client-session-id` values call 
 the ordinary session headers. In Duckvis mode, the bearer subject, project binding, and optional
 nonce are verified before the session is removed and its capacity permit is released. Idle cleanup
 remains the fallback for clients that disconnect without closing.
+
+Removal atomically compares the registry entry's nonce with the verified session's nonce. A close
+that races with replacement leaves the replacement intact. Recovery clients always supply the
+expected nonce and wait for the action's response before resetting locally.
+
+## Attachment lifecycle regression
+
+`swanlake-server/tests/duckvis_mode.rs` covers late-attachment refusal, explicit close and recreation
+under the same session id, post-lockdown re-arming, stale close protection, and viewer restrictions.
+The PostgreSQL-backed DuckLake case also requires the patched loadables used by the deployment:
+set `DUCKVIS_TEST_POSTGRES_ATTACH` to an attachment statement for a disposable lake, and
+`DUCKVIS_TEST_EXTENSION_INIT_SQL` to the SQL that loads those extensions. The test creates
+`feed.late_attachment_regression`; use a fresh scratch metadata database and data directory.
+
+```sh
+cargo test --release -p swanlake-server --test duckvis_mode \
+  postgres_lake_rearm_and_late_attachment -- --ignored --exact
+```
 
 ## Swanlake configuration (env, `SWANLAKE_` prefix)
 

@@ -341,6 +341,9 @@ impl SwanFlightSqlService {
                     "ATTACH is managed by duckvis; use the duckvis_attach action",
                 )
             }
+            ServerError::AttachmentRequiresSessionRecreation => Status::failed_precondition(
+                "session recreation required: new attachment after lockdown",
+            ),
             ServerError::WriteNotPermitted(what) => Status::permission_denied(format!(
                 "{what} requires the project's write permission"
             )),

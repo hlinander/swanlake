@@ -352,7 +352,17 @@ async fn spawn_server_with_extension(
     mock: Arc<MockState>,
     extension: Option<String>,
 ) -> Harness {
+    spawn_server_with_init(api_url, mock, extension, None).await
+}
+
+async fn spawn_server_with_init(
+    api_url: &str,
+    mock: Arc<MockState>,
+    extension: Option<String>,
+    init_sql: Option<String>,
+) -> Harness {
     let config = ServerConfig {
+        ducklake_init_sql: init_sql,
         external_kernel_extension: extension,
         duckvis_enabled: true,
         duckvis_api_url: Some(api_url.to_string()),
@@ -791,6 +801,204 @@ async fn explicit_close_releases_only_the_callers_session() {
 }
 
 #[tokio::test]
+async fn late_viewer_attachment_recovers_after_explicit_close() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("late.duckdb");
+    duckdb::Connection::open(&path)
+        .expect("catalog")
+        .execute_batch("CREATE TABLE t AS SELECT 7 AS id")
+        .expect("seed");
+    let h = base_harness().await;
+    *h.mock.secret_config.lock().unwrap() = format!("ATTACH '{}' AS ignored", path.display());
+    let token = format!("Bearer {}", valid_token("user-1"));
+    let headers = project_headers(&token, SESSION, PROJECT);
+    let mut cli = client(&h.endpoint).await;
+    run_select(&mut cli, &headers, "SELECT 1")
+        .await
+        .expect("lock session");
+    let id = swanlake_core::session::SessionId::from_string(SESSION.to_string());
+    let nonce = h
+        .registry
+        .get_by_id(&id)
+        .expect("session")
+        .nonce()
+        .to_string();
+
+    let error = duckvis_attach(&mut cli, &headers, BIND_ID)
+        .await
+        .expect_err("late attach");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        error.message(),
+        "session recreation required: new attachment after lockdown"
+    );
+    run_select(&mut cli, &headers,
+        "SELECT CASE WHEN EXISTS (SELECT 1 FROM duckdb_databases() WHERE database_name='attname') THEN error('refusal attached catalog') ELSE 1 END")
+        .await.expect("refusal leaves catalogs unchanged");
+    run_select(&mut cli, &headers, "SELECT 1")
+        .await
+        .expect("refusal preserves session");
+
+    let mut close_headers = headers.clone();
+    close_headers.push(("x-expected-session-nonce", &nonce));
+    close_session(&mut cli, &close_headers)
+        .await
+        .expect("close old incarnation");
+    let attached = duckvis_attach(&mut cli, &headers, BIND_ID)
+        .await
+        .expect("fresh attach");
+    assert_ne!(attached["nonce"].as_str(), Some(nonce.as_str()));
+    run_select(&mut cli, &headers, "SELECT * FROM attname.t")
+        .await
+        .expect("new source reads");
+    assert!(
+        execute_sql_action(&mut cli, &headers, "SET enable_external_access=true")
+            .await
+            .is_err()
+    );
+    assert!(
+        execute_sql_action(&mut cli, &headers, "SET lock_configuration=false")
+            .await
+            .is_err()
+    );
+    assert!(
+        close_session(&mut cli, &close_headers).await.is_err(),
+        "stale close must fail"
+    );
+    run_select(&mut cli, &headers, "SELECT * FROM attname.t")
+        .await
+        .expect("stale close preserves new session");
+}
+
+#[tokio::test]
+async fn attached_catalog_can_rearm_after_viewer_lockdown() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("existing.duckdb");
+    duckdb::Connection::open(&path)
+        .expect("catalog")
+        .execute_batch("CREATE TABLE t AS SELECT 7 AS id")
+        .expect("seed");
+    let h = base_harness().await;
+    *h.mock.secret_config.lock().unwrap() = format!("ATTACH '{}' AS ignored", path.display());
+    let token = format!("Bearer {}", valid_token("user-1"));
+    let headers = project_headers(&token, SESSION, PROJECT);
+    let mut cli = client(&h.endpoint).await;
+    let first = duckvis_attach(&mut cli, &headers, BIND_ID)
+        .await
+        .expect("initial attach");
+    run_select(&mut cli, &headers, "SELECT * FROM attname.t")
+        .await
+        .expect("lock session");
+    let again = duckvis_attach(&mut cli, &headers, BIND_ID)
+        .await
+        .expect("existing catalog re-arms");
+    assert_eq!(first["nonce"], again["nonce"]);
+    run_select(&mut cli, &headers, "SELECT * FROM attname.t")
+        .await
+        .expect("re-armed catalog reads");
+}
+
+#[tokio::test]
+#[ignore = "requires a scratch DUCKVIS_TEST_POSTGRES_ATTACH and patched DUCKVIS_TEST_EXTENSION_INIT_SQL"]
+async fn postgres_lake_rearm_and_late_attachment() {
+    let mock = Arc::new(MockState::new());
+    *mock.secret_config.lock().unwrap() =
+        std::env::var("DUCKVIS_TEST_POSTGRES_ATTACH").expect("scratch lake ATTACH");
+    *mock.attachment_name.lock().unwrap() = "feed".to_string();
+    mock.mutate_allow.store(true, Ordering::SeqCst);
+    let api_url = spawn_mock_api(mock.clone()).await;
+    let h = spawn_server_with_init(
+        &api_url,
+        mock,
+        None,
+        Some(std::env::var("DUCKVIS_TEST_EXTENSION_INIT_SQL").expect("patched extension loads")),
+    )
+    .await;
+    let mut cli = client(&h.endpoint).await;
+    let token = format!("Bearer {}", valid_token("user-1"));
+    let headers = project_headers(&token, SESSION, PROJECT);
+    let attach_body = json!({"bind_id": BIND_ID, "add_to_search_path": true})
+        .to_string()
+        .into_bytes();
+    duckvis_attach_raw(&mut cli, &headers, &attach_body)
+        .await
+        .expect("seed attach");
+    execute_sql_action(
+        &mut cli,
+        &headers,
+        "CREATE TABLE feed.late_attachment_regression AS SELECT 7 AS id",
+    )
+    .await
+    .expect("seed data");
+    close_session(&mut cli, &headers)
+        .await
+        .expect("close writer");
+    h.mock.mutate_allow.store(false, Ordering::SeqCst);
+
+    let first = duckvis_attach_raw(&mut cli, &headers, &attach_body)
+        .await
+        .expect("viewer attach before lockdown");
+    run_select(
+        &mut cli,
+        &headers,
+        "SELECT * FROM feed.late_attachment_regression",
+    )
+    .await
+    .expect("read parquet under lockdown");
+    let rearmed = duckvis_attach_raw(&mut cli, &headers, &attach_body)
+        .await
+        .expect("postgres metadata re-arm after lockdown");
+    assert_eq!(first["nonce"], rearmed["nonce"]);
+    run_select(
+        &mut cli,
+        &headers,
+        "SELECT * FROM feed.late_attachment_regression",
+    )
+    .await
+    .expect("read after re-arm");
+    close_session(&mut cli, &headers)
+        .await
+        .expect("close armed viewer");
+
+    run_select(&mut cli, &headers, "SELECT 1")
+        .await
+        .expect("lock before binding appears");
+    let error = duckvis_attach_raw(&mut cli, &headers, &attach_body)
+        .await
+        .expect_err("new catalog requires recreation");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        error.message(),
+        "session recreation required: new attachment after lockdown"
+    );
+    close_session(&mut cli, &headers)
+        .await
+        .expect("close locked viewer");
+    duckvis_attach_raw(&mut cli, &headers, &attach_body)
+        .await
+        .expect("fresh viewer attaches");
+    run_select(
+        &mut cli,
+        &headers,
+        "SELECT * FROM feed.late_attachment_regression",
+    )
+    .await
+    .expect("recovered read");
+    assert!(
+        execute_sql_action(&mut cli, &headers, "SET enable_external_access=true")
+            .await
+            .is_err()
+    );
+    assert!(execute_sql_action(
+        &mut cli,
+        &headers,
+        "INSERT INTO feed.late_attachment_regression VALUES (8)"
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test]
 async fn happy_path_attach_select_detach() {
     // Create a real temp duckdb file for the ATTACH to target.
     let dir = tempfile::tempdir().expect("tempdir");
@@ -869,6 +1077,8 @@ async fn project_writer_can_mutate_attachment() {
     let token = format!("Bearer {}", valid_token("writer-1"));
     let headers = project_headers(&token, SESSION, PROJECT);
     session_info(&mut cli, &headers).await.expect("session_info");
+    run_select(&mut cli, &headers, "SELECT 1")
+        .await.expect("writer can attach after its first query");
     duckvis_attach(&mut cli, &headers, BIND_ID)
         .await
         .expect("attach ok");

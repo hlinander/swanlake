@@ -354,10 +354,60 @@ impl Session {
         Ok(())
     }
 
+    /// Execute a server-authorized attachment and collect its roots before the
+    /// first user statement can freeze the allowed set. A confined session can
+    /// re-arm an existing catalog; adding a catalog requires a fresh instance.
+    pub fn attach_catalog(
+        &self,
+        catalog: &str,
+        sql: &str,
+        search_path_sql: Option<&str>,
+    ) -> Result<(), ServerError> {
+        let mut state = self
+            .lockdown_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let confined =
+            self.auth.as_ref().is_some_and(|auth| !auth.writer) && self.lockdown.is_some();
+        if confined && state.applied {
+            let conn = self
+                .connection
+                .conn
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let attached: bool = conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM duckdb_databases() WHERE lower(database_name) = lower(?))",
+                [catalog],
+                |row| row.get(0),
+            )?;
+            if !attached {
+                return Err(ServerError::AttachmentRequiresSessionRecreation);
+            }
+        }
+
+        self.execute_statement_privileged(sql)?;
+        if confined && !state.applied {
+            if let Some(root) = crate::duckvis::attach::attach_data_path(sql) {
+                state.roots.insert(root);
+            }
+            // Existing DuckLakes store their authoritative roots in metadata;
+            // ordinary catalogs do not provide ducklake_options.
+            match self.ducklake_data_roots(catalog) {
+                Ok(roots) => state.roots.extend(roots),
+                Err(error) => debug!("no DuckLake data roots for armed catalog: {error}"),
+            }
+        }
+        if let Some(sql) = search_path_sql {
+            self.execute_statement_privileged(sql)?;
+        }
+        Ok(())
+    }
+
     /// Record an armed lake's data root into the lockdown's allowed set.
     /// After the lockdown ran the set is frozen; a late root is dropped and
     /// the engine refuses the out-of-set path — fail closed.
-    pub fn register_armed_root(&self, root: &str) {
+    #[cfg(test)]
+    fn register_armed_root(&self, root: &str) {
         let mut state = self
             .lockdown_state
             .lock()
