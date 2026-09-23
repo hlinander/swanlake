@@ -267,11 +267,16 @@ impl SwanFlightSqlService {
 
         // Fix the writer capability for this session's lifetime. A deny is
         // normal and makes attachments read-only; an unavailable authorization
-        // service fails the session bind closed.
-        let writer = duckvis
-            .check_project_mutate_data(&claims.sub, &project_id)
-            .await
-            .map_err(|e| e.into_status())?;
+        // service fails the session bind closed. An instance configured
+        // read-only never asks: every session it serves is a non-writer.
+        let writer = if duckvis.read_only() {
+            false
+        } else {
+            duckvis
+                .check_project_mutate_data(&claims.sub, &project_id)
+                .await
+                .map_err(|e| e.into_status())?
+        };
 
         let new_auth = SessionAuth {
             subject: claims.sub.clone(),

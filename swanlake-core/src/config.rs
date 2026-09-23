@@ -123,6 +123,13 @@ pub struct ServerConfig {
     /// Fallback max-age (seconds) for the JWKS cache when the response omits
     /// `Cache-Control: max-age`. Defaults to 300 when unset.
     pub duckvis_jwks_max_age_secs: Option<u64>,
+    /// Arm every session's attachments `READ_ONLY` inside DuckDB, whatever
+    /// the subject's `Project.mutate_data` grant says
+    /// (`SWANLAKE_DUCKVIS_READ_ONLY`). For an instance that serves lakes it
+    /// does not own: read-only mounts stop the data files, but a DuckLake
+    /// catalogue write travels over Postgres and has to be refused in the
+    /// engine. Defaults to false.
+    pub duckvis_read_only: bool,
     /// PEM certificate chain for native Flight TLS
     /// (`SWANLAKE_TLS_CERT_PATH`). Requires [`Self::tls_key_path`].
     pub tls_cert_path: Option<String>,
@@ -168,6 +175,7 @@ impl Default for ServerConfig {
             duckvis_client_id: None,
             duckvis_private_key: None,
             duckvis_jwks_max_age_secs: None,
+            duckvis_read_only: false,
             tls_cert_path: None,
             tls_key_path: None,
             tls_terminated_upstream: false,
@@ -298,6 +306,14 @@ mod duckvis_config_tests {
     #[test]
     fn valid_duckvis_config_passes() {
         assert!(enabled_config().validate().is_ok());
+    }
+
+    #[test]
+    fn duckvis_read_only_is_off_by_default_and_needs_no_other_setting() {
+        assert!(!ServerConfig::default().duckvis_read_only);
+        let mut config = enabled_config();
+        config.duckvis_read_only = true;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

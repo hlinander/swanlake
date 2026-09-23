@@ -130,6 +130,7 @@ rejected on every SQL path in this mode; `DETACH` remains available.
 | `SWANLAKE_DUCKVIS_CLIENT_ID` | Service-account client id for the client-credentials token flow: the resource-server service account (SSA) name (e.g. `swanlake-wrx80`) | _(unset)_ |
 | `SWANLAKE_DUCKVIS_PRIVATE_KEY` | Service-account signing key: base64 (standard alphabet) of the raw 32-byte Ed25519 seed, used to sign the RFC 7523 client assertion presented to the token endpoint | _(unset)_ |
 | `SWANLAKE_DUCKVIS_JWKS_MAX_AGE_SECS` | Fallback JWKS cache max-age (seconds) when the response omits `Cache-Control: max-age` | `300` |
+| `SWANLAKE_DUCKVIS_READ_ONLY` | Arm every session's attachments `READ_ONLY` inside DuckDB, whatever the subject's `Project.mutate_data` grant says. For an instance that serves lakes it does not own: read-only mounts stop the data files, but a DuckLake catalogue write travels over Postgres and has to be refused in the engine | `false` |
 | `SWANLAKE_SCRATCH_DIRECTORY` | Directory for session spill files (`temp_directory`); a session without the project write permission may also `COPY` into it | `swanlake-scratch` under the OS temp directory |
 | `SWANLAKE_SCRATCH_MAX_SIZE` | `max_temp_directory_size` for the scratch directory | `10GB` |
 

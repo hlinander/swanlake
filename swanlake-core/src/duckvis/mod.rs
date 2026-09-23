@@ -123,6 +123,9 @@ pub struct DuckvisAuth {
     pub(crate) client: reqwest::Client,
     pub(crate) sa_token: tokio::sync::Mutex<Option<sa::SaToken>>,
     pub(crate) jwks: tokio::sync::RwLock<jwks::JwksCache>,
+    /// Every session on this instance is a non-writer, whatever the subject's
+    /// `Project.mutate_data` grant says (`SWANLAKE_DUCKVIS_READ_ONLY`).
+    pub(crate) read_only: bool,
 }
 
 impl DuckvisAuth {
@@ -168,7 +171,14 @@ impl DuckvisAuth {
             client,
             sa_token: tokio::sync::Mutex::new(None),
             jwks: tokio::sync::RwLock::new(jwks::JwksCache::new(max_age)),
+            read_only: config.duckvis_read_only,
         })))
+    }
+
+    /// Whether this instance arms every session's attachments `READ_ONLY`
+    /// regardless of the subject's `Project.mutate_data` grant.
+    pub fn read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Current unix time in seconds.
