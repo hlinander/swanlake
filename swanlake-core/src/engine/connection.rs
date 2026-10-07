@@ -60,6 +60,20 @@ impl DuckDbConnection {
         }
     }
 
+    /// Locked sessions preset CPU profiling before freezing configuration.
+    /// A denied SET or RESET would abort an explicit transaction.
+    fn update_profiling(conn: &Connection, sql: &str) -> Result<(), ServerError> {
+        let locked = conn.query_row(
+            "SELECT current_setting('lock_configuration')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !locked {
+            conn.execute_batch(sql)?;
+        }
+        Ok(())
+    }
+
     /// Get an interrupt handle for cancelling long-running queries.
     ///
     /// The returned handle can be used from another thread to interrupt
@@ -206,10 +220,11 @@ impl DuckDbConnection {
             if let Some(cancellation) = cancellation {
                 cancellation.check()?;
             }
-            let _ = conn.execute_batch(
+            Self::update_profiling(
+                &conn,
                 "SET enable_profiling = 'no_output'; \
                  SET custom_profiling_settings = '{\"OPERATOR_CPU_TIME\": \"true\", \"CPU_TIME_ACTUAL\": \"true\"}';"
-            );
+            )?;
         }
 
         // Now execute the full query in true streaming mode
@@ -328,19 +343,14 @@ impl DuckDbConnection {
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Unlocked connections clear profiling before executing DDL/DML.
+        Self::update_profiling(&conn, "RESET enable_profiling")?;
         let active = cancellation
             .map(|c| c.activate(conn.interrupt_handle()))
             .transpose()?;
         if let Some(telemetry) = &self.kernel_telemetry {
             telemetry.set(&conn, execution)?;
         }
-        // The streaming path enables profiling on this shared session connection
-        // for CPU sampling and never resets it. With profiling on, a
-        // `CREATE TABLE AS SELECT` run through the arrow C-API returns a null
-        // result ("out is null"). Clear it first so DDL/DML (including CTAS)
-        // from the execute action run cleanly. Ignored result: RESET is a no-op
-        // when profiling is already at its default.
-        let _ = conn.execute_batch("RESET enable_profiling");
         let result = cancellation
             .map_or(Ok(()), |c| c.check())
             .and_then(|()| conn.execute_batch(sql).map_err(ServerError::from));
@@ -372,7 +382,7 @@ impl DuckDbConnection {
                 .conn
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let _ = conn.execute_batch("RESET enable_profiling");
+            Self::update_profiling(&conn, "RESET enable_profiling")?;
         }
         self.with_prepared(sql, |stmt| {
             let affected = Self::execute_with_params(stmt, params)?;
