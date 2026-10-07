@@ -1358,6 +1358,19 @@ mod lockdown_tests {
     }
 
     #[test]
+    fn locked_transaction_rolls_back_after_execution_error() -> Result<()> {
+        for writer in [false, true] {
+            let scratch = tempfile::tempdir()?;
+            let session = locked_session(writer, scratch.path())?;
+            session.execute_statement("BEGIN TRANSACTION")?;
+            assert!(session.execute_query("SELECT sum(CAST(CASE WHEN i=199999 THEN 'invalid' ELSE '1' END AS BIGINT)) FROM range(200000) t(i)").is_err());
+            session.execute_statement("ROLLBACK")?;
+            assert_eq!(session.execute_query("SELECT 43")?.total_rows, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn locked_transaction_executes_and_finishes() -> Result<()> {
         for writer in [false, true] {
             let scratch = tempfile::tempdir()?;
