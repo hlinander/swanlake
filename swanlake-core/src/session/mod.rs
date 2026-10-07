@@ -347,6 +347,7 @@ impl Session {
         })?;
         let sql = lockdown_sql(template, auth.writer, &state.roots);
         self.connection.execute_batch(&sql)?;
+        self.connection.record_configuration_lock();
         state.applied = true;
         info!(session_id = %self.id, writer = auth.writer, "session write-hardening lockdown applied");
         Ok(())
@@ -1304,7 +1305,7 @@ mod lockdown_tests {
             }),
             Some(template(scratch)),
         );
-        session.execute_statement("CREATE TEMP TABLE transaction_rows (value INTEGER)")?;
+        session.ensure_lockdown()?;
         Ok(session)
     }
 
@@ -1349,7 +1350,7 @@ mod lockdown_tests {
                 .is_err());
             if !writer {
                 assert!(matches!(
-                    session.execute_statement("COPY transaction_rows TO '/tmp/denied.csv'"),
+                    session.execute_statement("COPY (SELECT 1) TO '/tmp/denied.csv'"),
                     Err(ServerError::WriteNotPermitted(_))
                 ));
             }
@@ -1362,7 +1363,9 @@ mod lockdown_tests {
         for writer in [false, true] {
             let scratch = tempfile::tempdir()?;
             let session = locked_session(writer, scratch.path())?;
-            session.execute_statement("BEGIN TRANSACTION")?;
+            // The transaction action begins through the batch path, before a
+            // stream or execute statement can observe the configuration lock.
+            session.begin_transaction()?;
             assert!(session.execute_query("SELECT sum(CAST(CASE WHEN i=199999 THEN 'invalid' ELSE '1' END AS BIGINT)) FROM range(200000) t(i)").is_err());
             session.execute_statement("ROLLBACK")?;
             assert_eq!(session.execute_query("SELECT 43")?.total_rows, 1);
@@ -1375,6 +1378,7 @@ mod lockdown_tests {
         for writer in [false, true] {
             let scratch = tempfile::tempdir()?;
             let session = locked_session(writer, scratch.path())?;
+            session.execute_statement("CREATE TEMP TABLE transaction_rows (value INTEGER)")?;
             for finish in ["COMMIT", "ROLLBACK"] {
                 session.execute_statement("BEGIN TRANSACTION")?;
                 session.execute_statement("INSERT INTO transaction_rows VALUES (42)")?;
@@ -1395,6 +1399,7 @@ mod lockdown_tests {
         for writer in [false, true] {
             let scratch = tempfile::tempdir()?;
             let session = locked_session(writer, scratch.path())?;
+            session.execute_statement("CREATE TEMP TABLE transaction_rows (value INTEGER)")?;
             for finish in ["COMMIT", "ROLLBACK"] {
                 session.execute_statement("BEGIN TRANSACTION")?;
                 assert_eq!(

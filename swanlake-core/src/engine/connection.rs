@@ -63,6 +63,11 @@ impl DuckDbConnection {
         }
     }
 
+    /// Record a successful session lockdown before any user statement runs.
+    pub(crate) fn record_configuration_lock(&self) {
+        self.profiling_locked.store(true, Ordering::Relaxed);
+    }
+
     /// Locked sessions preset CPU profiling before freezing configuration.
     /// A denied SET or RESET would abort an explicit transaction.
     fn update_profiling(&self, conn: &Connection, sql: &str) -> Result<(), ServerError> {
