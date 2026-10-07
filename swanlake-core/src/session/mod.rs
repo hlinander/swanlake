@@ -160,10 +160,8 @@ struct LockdownState {
     roots: std::collections::BTreeSet<String>,
 }
 
-/// The §4 lockdown block. The profiling mode is pre-set to the values the
-/// streaming path re-asserts per query (errors ignored), so the frozen
-/// configuration already carries them. `lock_configuration` is last; a
-/// non-writer additionally loses external access, confined to the armed lake
+/// The §4 lockdown block presets CPU profiling before freezing configuration.
+/// `lock_configuration` is last; a non-writer loses external access, confined to the armed lake
 /// roots plus the scratch directory. Secret policy is not in the block:
 /// DuckDB rejects secret-manager setting changes once the manager has been
 /// used (an armed attach uses it), and disabling `allow_persistent_secrets`
@@ -1293,6 +1291,116 @@ mod lockdown_tests {
         factory
             .create_connection()
             .map_err(|e| anyhow!("failed to create test connection: {e}"))
+    }
+
+    fn locked_session(writer: bool, scratch: &std::path::Path) -> Result<Session> {
+        let session = Session::new_with_id_and_auth(
+            SessionId::from_string(format!("transaction-{writer}")),
+            Arc::new(test_connection()?),
+            Some(SessionAuth {
+                subject: "sub-1".to_string(),
+                project_id: "project-1".to_string(),
+                writer,
+            }),
+            Some(template(scratch)),
+        );
+        session.execute_statement("CREATE TEMP TABLE transaction_rows (value INTEGER)")?;
+        Ok(session)
+    }
+
+    #[test]
+    fn locked_transaction_streams_and_finishes() -> Result<()> {
+        for writer in [false, true] {
+            let scratch = tempfile::tempdir()?;
+            let session = locked_session(writer, scratch.path())?;
+            for finish in ["COMMIT", "ROLLBACK"] {
+                session.execute_statement("BEGIN TRANSACTION")?;
+                session.schema_for_query("SELECT 42 AS value")?;
+                let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+                session
+                    .connection
+                    .execute_query_streaming("SELECT 42 AS value", tx, None)?;
+                let mut rows = 0;
+                while let Some(message) = rx.blocking_recv() {
+                    match message {
+                        crate::engine::connection::StreamingBatch::Batch(batch) => {
+                            rows += batch.num_rows()
+                        }
+                        crate::engine::connection::StreamingBatch::Error(error) => {
+                            return Err(error.into())
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(rows, 1);
+                session.execute_statement(finish)?;
+                assert_eq!(session.execute_query("SELECT 43")?.total_rows, 1);
+            }
+            assert_eq!(
+                raw_setting(&session.connection, "lock_configuration")?,
+                "true"
+            );
+            assert_eq!(
+                raw_setting(&session.connection, "enable_external_access")?,
+                writer.to_string()
+            );
+            assert!(session
+                .execute_statement("SET lock_configuration = false")
+                .is_err());
+            if !writer {
+                assert!(matches!(
+                    session.execute_statement("COPY transaction_rows TO '/tmp/denied.csv'"),
+                    Err(ServerError::WriteNotPermitted(_))
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn locked_transaction_executes_and_finishes() -> Result<()> {
+        for writer in [false, true] {
+            let scratch = tempfile::tempdir()?;
+            let session = locked_session(writer, scratch.path())?;
+            for finish in ["COMMIT", "ROLLBACK"] {
+                session.execute_statement("BEGIN TRANSACTION")?;
+                session.execute_statement("INSERT INTO transaction_rows VALUES (42)")?;
+                session.execute_statement(finish)?;
+            }
+            assert_eq!(
+                session
+                    .execute_query("SELECT * FROM transaction_rows")?
+                    .total_rows,
+                1
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn locked_transaction_executes_parameters_and_finishes() -> Result<()> {
+        for writer in [false, true] {
+            let scratch = tempfile::tempdir()?;
+            let session = locked_session(writer, scratch.path())?;
+            for finish in ["COMMIT", "ROLLBACK"] {
+                session.execute_statement("BEGIN TRANSACTION")?;
+                assert_eq!(
+                    session.execute_statement_with_params(
+                        "INSERT INTO transaction_rows VALUES (?)",
+                        &[Value::Int(42)]
+                    )?,
+                    1
+                );
+                session.execute_statement(finish)?;
+            }
+            assert_eq!(
+                session
+                    .execute_query("SELECT * FROM transaction_rows")?
+                    .total_rows,
+                1
+            );
+        }
+        Ok(())
     }
 
     #[test]

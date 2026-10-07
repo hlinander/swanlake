@@ -1834,6 +1834,69 @@ async fn disconnected_read_rpcs_release_the_session() {
 }
 
 #[tokio::test]
+async fn locked_transactions_span_flight_requests() {
+    for writer in [false, true] {
+        let h = base_harness().await;
+        h.mock.mutate_allow.store(writer, Ordering::SeqCst);
+        let mut cli = client(&h.endpoint).await;
+        let token = format!("Bearer {}", valid_token("transaction-user"));
+        let headers = project_headers(&token, "transaction-session", PROJECT);
+        run_select(&mut cli, &headers, "SELECT 1")
+            .await
+            .expect("apply lockdown");
+
+        for finish in ["COMMIT", "ROLLBACK"] {
+            execute_sql_action(&mut cli, &headers, "BEGIN TRANSACTION")
+                .await
+                .expect("begin");
+            assert!(
+                run_select(&mut cli, &headers, "SELECT 42 AS value")
+                    .await
+                    .expect("stream in transaction")
+                    > 0
+            );
+            execute_sql_action(
+                &mut cli,
+                &headers,
+                "CREATE TEMP TABLE transaction_rows AS SELECT 42 AS value",
+            )
+            .await
+            .expect("execute in transaction");
+            run_select(&mut cli, &headers, "SELECT CASE WHEN count(*)=1 AND min(value)=42 THEN 1 ELSE error('transaction rows differ') END FROM transaction_rows").await.expect("read transaction changes");
+            execute_sql_action(&mut cli, &headers, finish)
+                .await
+                .expect("finish transaction");
+            if finish == "COMMIT" {
+                execute_sql_action(&mut cli, &headers, "DROP TABLE transaction_rows")
+                    .await
+                    .expect("committed table persists");
+            } else {
+                run_select(&mut cli, &headers, "SELECT CASE WHEN EXISTS(SELECT 1 FROM duckdb_tables() WHERE table_name='transaction_rows') THEN error('rollback retained table') ELSE 1 END").await.expect("rollback discards table");
+            }
+        }
+        run_select(&mut cli, &headers, "SELECT CASE WHEN current_setting('lock_configuration') AND current_setting('enable_profiling')='no_output' THEN 1 ELSE error('locked profiling changed') END").await.expect("configuration retained");
+        assert!(
+            execute_sql_action(&mut cli, &headers, "SET lock_configuration=false")
+                .await
+                .is_err()
+        );
+        if !writer {
+            assert!(
+                execute_sql_action(&mut cli, &headers, "COPY (SELECT 1) TO '/tmp/denied.csv'")
+                    .await
+                    .is_err()
+            );
+        }
+        run_select(&mut cli, &headers, "SELECT 43")
+            .await
+            .expect("session reuse");
+        close_session(&mut cli, &headers)
+            .await
+            .expect("close session");
+    }
+}
+
+#[tokio::test]
 async fn authenticated_locked_session_reports_cpu_in_flight_metadata() {
     let h = base_harness().await;
     let mut cli = client(&h.endpoint).await;
