@@ -241,6 +241,55 @@ mod tests {
     }
 
     #[test]
+    fn sampler_survives_autocommit_errors_and_explicit_rollbacks() {
+        let native = duckdb::Connection::open_in_memory().unwrap();
+        native.execute_batch("SET threads=2; SET enable_profiling='no_output'; \
+            SET custom_profiling_settings='{\"OPERATOR_CPU_TIME\":\"true\",\"CPU_TIME_ACTUAL\":\"true\"}'").unwrap();
+        let monitoring = native.try_clone().unwrap();
+        let connection = Arc::new(DuckDbConnection::new(native));
+        let weak = Arc::downgrade(&connection);
+        let tracker = ResourceTracker::start(monitoring, connection.clone());
+        let worker = thread::spawn(move || {
+            let native = connection.conn.lock().unwrap();
+            for _ in 0..150 {
+                // Fail during execution, after the profiler builds its tree.
+                let error = native.query_row::<i64, _, _>(
+                    "SELECT sum(CAST(CASE WHEN i=199999 THEN 'invalid' ELSE '1' END AS BIGINT)) \
+                     FROM range(200000) t(i)",
+                    [],
+                    |row| row.get(0),
+                );
+                assert!(error.is_err());
+                native.execute_batch("BEGIN TRANSACTION").unwrap();
+                let _: f64 = native
+                    .query_row(
+                        "SELECT sum(sin(i::DOUBLE)) FROM range(200000) t(i)",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                native.execute_batch("ROLLBACK").unwrap();
+            }
+            let _: f64 = native
+                .query_row(
+                    "SELECT sum(sin(i::DOUBLE)) FROM range(200000) t(i)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        });
+        worker.join().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while tracker.snapshot().cpu_time_us == 0 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(tracker.snapshot().cpu_time_us > 0);
+        assert!(weak.upgrade().is_some());
+        drop(tracker);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
     fn sampler_retains_connection_through_query_turnover_and_owner_drop() {
         let native = duckdb::Connection::open_in_memory().unwrap();
         native.execute_batch("SET threads=2; SET enable_profiling='no_output'; \
