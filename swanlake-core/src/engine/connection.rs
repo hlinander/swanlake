@@ -3,6 +3,7 @@
 //! Each connection is owned by a Session and maintains persistent state
 //! (ATTACH, temp tables, etc.).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use arrow_array::RecordBatch;
@@ -49,6 +50,7 @@ pub struct QueryResult {
 pub struct DuckDbConnection {
     pub conn: Mutex<Connection>,
     pub kernel_telemetry: Option<super::kernel_telemetry::KernelTelemetry>,
+    profiling_locked: AtomicBool,
 }
 
 impl DuckDbConnection {
@@ -57,18 +59,26 @@ impl DuckDbConnection {
         Self {
             conn: Mutex::new(conn),
             kernel_telemetry: None,
+            profiling_locked: AtomicBool::new(false),
         }
     }
 
     /// Locked sessions preset CPU profiling before freezing configuration.
     /// A denied SET or RESET would abort an explicit transaction.
-    fn update_profiling(conn: &Connection, sql: &str) -> Result<(), ServerError> {
+    fn update_profiling(&self, conn: &Connection, sql: &str) -> Result<(), ServerError> {
+        // The configuration lock cannot be undone. Remember it so an aborted
+        // transaction can reach ROLLBACK without another SQL setting lookup.
+        if self.profiling_locked.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let locked = conn.query_row(
             "SELECT current_setting('lock_configuration')",
             [],
             |row| row.get::<_, bool>(0),
         )?;
-        if !locked {
+        if locked {
+            self.profiling_locked.store(true, Ordering::Relaxed);
+        } else {
             conn.execute_batch(sql)?;
         }
         Ok(())
@@ -220,7 +230,7 @@ impl DuckDbConnection {
             if let Some(cancellation) = cancellation {
                 cancellation.check()?;
             }
-            Self::update_profiling(
+            self.update_profiling(
                 &conn,
                 "SET enable_profiling = 'no_output'; \
                  SET custom_profiling_settings = '{\"OPERATOR_CPU_TIME\": \"true\", \"CPU_TIME_ACTUAL\": \"true\"}';"
@@ -344,7 +354,7 @@ impl DuckDbConnection {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Unlocked connections clear profiling before executing DDL/DML.
-        Self::update_profiling(&conn, "RESET enable_profiling")?;
+        self.update_profiling(&conn, "RESET enable_profiling")?;
         let active = cancellation
             .map(|c| c.activate(conn.interrupt_handle()))
             .transpose()?;
@@ -382,7 +392,7 @@ impl DuckDbConnection {
                 .conn
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Self::update_profiling(&conn, "RESET enable_profiling")?;
+            self.update_profiling(&conn, "RESET enable_profiling")?;
         }
         self.with_prepared(sql, |stmt| {
             let affected = Self::execute_with_params(stmt, params)?;

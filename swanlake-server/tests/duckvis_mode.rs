@@ -1874,6 +1874,10 @@ async fn locked_transactions_span_flight_requests() {
                 run_select(&mut cli, &headers, "SELECT CASE WHEN EXISTS(SELECT 1 FROM duckdb_tables() WHERE table_name='transaction_rows') THEN error('rollback retained table') ELSE 1 END").await.expect("rollback discards table");
             }
         }
+        execute_sql_action(&mut cli, &headers, "BEGIN TRANSACTION").await.expect("begin failing transaction");
+        let error = run_select(&mut cli, &headers, "SELECT sum(CAST(CASE WHEN i=199999 THEN 'invalid' ELSE '1' END AS BIGINT)) FROM range(200000) t(i)").await.expect_err("execution failure");
+        assert!(error.message().contains("Conversion Error"));
+        execute_sql_action(&mut cli, &headers, "ROLLBACK").await.expect("rollback aborted transaction");
         run_select(&mut cli, &headers, "SELECT CASE WHEN current_setting('lock_configuration') AND current_setting('enable_profiling')='no_output' THEN 1 ELSE error('locked profiling changed') END").await.expect("configuration retained");
         assert!(
             execute_sql_action(&mut cli, &headers, "SET lock_configuration=false")
