@@ -161,6 +161,8 @@ struct LockdownState {
 }
 
 /// The §4 lockdown block presets CPU profiling before freezing configuration.
+/// Execution leaves these settings unchanged. `no_output` collects CPU metrics
+/// without DuckDB 1.5.5's JSON rendering, which aborts after an attached-catalog stream.
 /// `lock_configuration` is last; a non-writer loses external access, confined to the armed lake
 /// roots plus the scratch directory. Secret policy is not in the block:
 /// DuckDB rejects secret-manager setting changes once the manager has been
@@ -347,7 +349,6 @@ impl Session {
         })?;
         let sql = lockdown_sql(template, auth.writer, &state.roots);
         self.connection.execute_batch(&sql)?;
-        self.connection.record_configuration_lock();
         state.applied = true;
         info!(session_id = %self.id, writer = auth.writer, "session write-hardening lockdown applied");
         Ok(())
@@ -1363,8 +1364,8 @@ mod lockdown_tests {
         for writer in [false, true] {
             let scratch = tempfile::tempdir()?;
             let session = locked_session(writer, scratch.path())?;
-            // The transaction action begins through the batch path, before a
-            // stream or execute statement can observe the configuration lock.
+            // Exercise the transaction action followed by an execution error
+            // and explicit SQL rollback.
             session.begin_transaction()?;
             assert!(session.execute_query("SELECT sum(CAST(CASE WHEN i=199999 THEN 'invalid' ELSE '1' END AS BIGINT)) FROM range(200000) t(i)").is_err());
             session.execute_statement("ROLLBACK")?;
