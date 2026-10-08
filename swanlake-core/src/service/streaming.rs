@@ -393,7 +393,7 @@ mod cancellation_tests {
     use super::*;
     use crate::config::ServerConfig;
     use crate::engine::EngineFactory;
-    use crate::session::{SessionId, registry::SessionRegistry};
+    use crate::session::{SessionAuth, SessionId, registry::SessionRegistry};
 
     #[test]
     fn unavailable_cpu_metric_is_omitted_without_hiding_memory() {
@@ -418,7 +418,14 @@ mod cancellation_tests {
             Arc::new(EngineFactory::new_without_extension_bootstrap(&config)),
         )?;
         Ok(registry
-            .get_or_create_by_id(&SessionId::from_string("stream-cancel".into()))
+            .get_or_create_by_id_with_auth(
+                &SessionId::from_string("stream-cancel".into()),
+                Some(SessionAuth {
+                    subject: "stream-test".into(),
+                    project_id: "project-test".into(),
+                    writer: false,
+                }),
+            )
             .await?)
     }
 

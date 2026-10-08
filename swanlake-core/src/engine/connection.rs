@@ -3,7 +3,6 @@
 //! Each connection is owned by a Session and maintains persistent state
 //! (ATTACH, temp tables, etc.).
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use arrow_array::RecordBatch;
@@ -50,7 +49,6 @@ pub struct QueryResult {
 pub struct DuckDbConnection {
     pub conn: Mutex<Connection>,
     pub kernel_telemetry: Option<super::kernel_telemetry::KernelTelemetry>,
-    profiling_locked: AtomicBool,
 }
 
 impl DuckDbConnection {
@@ -59,34 +57,7 @@ impl DuckDbConnection {
         Self {
             conn: Mutex::new(conn),
             kernel_telemetry: None,
-            profiling_locked: AtomicBool::new(false),
         }
-    }
-
-    /// Record a successful session lockdown before any user statement runs.
-    pub(crate) fn record_configuration_lock(&self) {
-        self.profiling_locked.store(true, Ordering::Relaxed);
-    }
-
-    /// Locked sessions preset CPU profiling before freezing configuration.
-    /// A denied SET or RESET would abort an explicit transaction.
-    fn update_profiling(&self, conn: &Connection, sql: &str) -> Result<(), ServerError> {
-        // The configuration lock cannot be undone. Remember it so an aborted
-        // transaction can reach ROLLBACK without another SQL setting lookup.
-        if self.profiling_locked.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let locked = conn.query_row(
-            "SELECT current_setting('lock_configuration')",
-            [],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if locked {
-            self.profiling_locked.store(true, Ordering::Relaxed);
-        } else {
-            conn.execute_batch(sql)?;
-        }
-        Ok(())
     }
 
     /// Get an interrupt handle for cancelling long-running queries.
@@ -228,18 +199,8 @@ impl DuckDbConnection {
         interrupt_handle: Option<std::sync::Arc<duckdb::InterruptHandle>>,
         cancellation: Option<&super::cancellation::RequestCancellation>,
     ) -> Result<(), ServerError> {
-        // `no_output` collects CPU metrics without taking DuckDB 1.5.5's JSON
-        // rendering path, which aborts after an attached-catalog stream ends.
-        {
-            let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(cancellation) = cancellation {
-                cancellation.check()?;
-            }
-            self.update_profiling(
-                &conn,
-                "SET enable_profiling = 'no_output'; \
-                 SET custom_profiling_settings = '{\"OPERATOR_CPU_TIME\": \"true\", \"CPU_TIME_ACTUAL\": \"true\"}';"
-            )?;
+        if let Some(cancellation) = cancellation {
+            cancellation.check()?;
         }
 
         // Now execute the full query in true streaming mode
@@ -358,8 +319,6 @@ impl DuckDbConnection {
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Unlocked connections clear profiling before executing DDL/DML.
-        self.update_profiling(&conn, "RESET enable_profiling")?;
         let active = cancellation
             .map(|c| c.activate(conn.interrupt_handle()))
             .transpose()?;
@@ -390,15 +349,6 @@ impl DuckDbConnection {
         sql: &str,
         params: &[Value],
     ) -> Result<usize, ServerError> {
-        // Clear any leaked profiling state before running a (possibly
-        // query-materializing) statement; see `execute_statement`.
-        {
-            let conn = self
-                .conn
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.update_profiling(&conn, "RESET enable_profiling")?;
-        }
         self.with_prepared(sql, |stmt| {
             let affected = Self::execute_with_params(stmt, params)?;
             debug!(affected, "executed statement with parameters");
@@ -1128,21 +1078,47 @@ mod tests {
         conn.execute_statement("DETACH wh").unwrap();
     }
 
-    /// The streaming path enables profiling on the shared session connection and
-    /// never resets it. With profiling on, a `CREATE TABLE AS SELECT` executed
-    /// through the arrow C-API returns a null result, surfaced by duckdb-rs as the
-    /// opaque "out is null". Execute-statement paths must clear profiling first
-    /// so DDL/DML (including CTAS) run cleanly.
+    /// Execution preserves profiling configured during session setup. The
+    /// supported `no_output` mode also permits CTAS without JSON rendering.
     #[test]
-    fn execute_statement_succeeds_after_profiling_enabled() {
+    fn execution_preserves_preset_profiling() {
         let conn = test_connection();
-        // Simulate the streaming path leaving profiling enabled on the session.
-        conn.execute_batch("SET enable_profiling = 'json'").unwrap();
-        // Pre-fix: this returns Err("out is null").
-        conn.execute_statement("CREATE TABLE t AS SELECT 1 AS a").unwrap();
+        conn.execute_batch("SET enable_profiling = 'no_output'")
+            .unwrap();
+        let assert_profiling = || {
+            let raw = conn.conn.lock().unwrap();
+            let profiling: Option<String> = raw
+                .query_row("SELECT current_setting('enable_profiling')", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(profiling.as_deref(), Some("no_output"));
+        };
+
+        conn.execute_statement("CREATE TABLE t AS SELECT 1 AS a")
+            .unwrap();
+        assert_profiling();
+        conn.execute_statement_with_params("INSERT INTO t VALUES (?)", &[Value::Int(2)])
+            .unwrap();
+        assert_profiling();
+
+        let (tx, mut rx) = mpsc::channel(4);
+        conn.execute_query_streaming("SELECT * FROM t", tx, None)
+            .unwrap();
+        let mut total_rows = None;
+        while let Some(message) = rx.blocking_recv() {
+            if let StreamingBatch::Done {
+                total_rows: rows, ..
+            } = message
+            {
+                total_rows = Some(rows);
+            }
+        }
+        assert_eq!(total_rows, Some(2));
+        assert_profiling();
         assert_eq!(
-            conn.execute_query("SELECT count(*) FROM t").unwrap().total_rows,
-            1
+            conn.execute_query("SELECT * FROM t").unwrap().total_rows,
+            2
         );
     }
 }
