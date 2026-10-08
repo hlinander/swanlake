@@ -21,12 +21,34 @@ pub(super) fn for_query(
     let Some(columns) = describe_columns(conn, body, params)? else {
         return Ok(None);
     };
+    Ok(project_columns(body, &columns))
+}
+
+/// Bind once for both the executable projection and its early stream schema.
+pub(super) fn for_streaming_query(
+    conn: &Connection,
+    sql: &str,
+    params: Option<&[Value]>,
+) -> Result<Option<(String, String)>, ServerError> {
+    let Some(body) = query_body(sql) else {
+        return Ok(None);
+    };
+    let Some(columns) = describe_columns(conn, body, params)? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        project_columns(body, &columns).unwrap_or_else(|| body.to_string()),
+        empty_schema_query(&columns),
+    )))
+}
+
+fn project_columns(body: &str, columns: &[(String, String)]) -> Option<String> {
     let variants = columns
         .iter()
         .map(|(_, ty)| contains_variant(ty))
         .collect::<Vec<_>>();
     if !variants.iter().any(|variant| *variant) {
-        return Ok(None);
+        return None;
     }
 
     // Assign internal names by position so duplicate output names remain distinct.
@@ -51,10 +73,10 @@ pub(super) fn for_query(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    Ok(Some(format!(
+    Some(format!(
         "SELECT {projection} FROM (\n{body}\n) AS \"__swanlake_result\"({})",
         names.join(", ")
-    )))
+    ))
 }
 
 /// Build a local, empty result with the bound query's exported types. Binding
@@ -66,6 +88,10 @@ pub(super) fn schema_query(conn: &Connection, sql: &str) -> Result<Option<String
     let Some(columns) = describe_columns(conn, body, None)? else {
         return Ok(None);
     };
+    Ok(Some(empty_schema_query(&columns)))
+}
+
+fn empty_schema_query(columns: &[(String, String)]) -> String {
     let projection = columns
         .iter()
         .map(|(name, ty)| {
@@ -81,7 +107,7 @@ pub(super) fn schema_query(conn: &Connection, sql: &str) -> Result<Option<String
         })
         .collect::<Vec<_>>()
         .join(", ");
-    Ok(Some(format!("SELECT {projection} WHERE false")))
+    format!("SELECT {projection} WHERE false")
 }
 
 fn describe_columns(

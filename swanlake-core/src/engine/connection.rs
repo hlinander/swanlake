@@ -204,17 +204,44 @@ impl DuckDbConnection {
         }
 
         // Now execute the full query in true streaming mode
-        let completed =
-            self.with_arrow_prepared_cancellable(sql, params, cancellation, |stmt| {
-                let arrow = Self::stream_arrow_with_params(stmt, params)?;
-                let schema = arrow.get_schema();
-
-                if tx
-                    .blocking_send(StreamingBatch::Schema(schema.as_ref().clone()))
-                    .is_err()
-                {
-                    debug!("streaming receiver dropped before schema sent");
+        let completed = self.with_arrow_prepared_cancellable(
+            sql,
+            params,
+            cancellation,
+            true,
+            |stmt, schema| {
+                if let Some(schema) = &schema {
+                    if tx
+                        .blocking_send(StreamingBatch::Schema(schema.clone()))
+                        .is_err()
+                    {
+                        return Ok(None);
+                    }
+                }
+                if let Some(cancellation) = cancellation {
+                    cancellation.check()?;
+                }
+                if tx.is_closed() {
                     return Ok(None);
+                }
+                let arrow = Self::stream_arrow_with_params(stmt, params)?;
+                let executed_schema = arrow.get_schema();
+                match schema {
+                    Some(schema) if &schema != executed_schema.as_ref() => {
+                        return Err(ServerError::Internal(
+                            "query result schema changed after planning".to_string(),
+                        ));
+                    }
+                    // Commands that cannot be described retain execution-time schema delivery.
+                    None => {
+                        if tx
+                            .blocking_send(StreamingBatch::Schema(executed_schema.as_ref().clone()))
+                            .is_err()
+                        {
+                            return Ok(None);
+                        }
+                    }
+                    Some(_) => {}
                 }
 
                 // Stream batches with backpressure
@@ -258,7 +285,8 @@ impl DuckDbConnection {
                 }
 
                 Ok(Some((batch_count, total_rows, total_bytes)))
-            })?;
+            },
+        )?;
 
         // The receiver closes as soon as it consumes Done. Finish statement
         // cleanup and the final cancellation check before publishing it, so
@@ -506,7 +534,7 @@ impl DuckDbConnection {
     where
         F: FnOnce(&mut Statement) -> Result<T, ServerError>,
     {
-        self.with_arrow_prepared_cancellable(sql, params, None, f)
+        self.with_arrow_prepared_cancellable(sql, params, None, false, |stmt, _| f(stmt))
     }
 
     fn with_arrow_prepared_cancellable<T, F>(
@@ -514,10 +542,11 @@ impl DuckDbConnection {
         sql: &str,
         params: Option<&[Value]>,
         cancellation: Option<&super::cancellation::RequestCancellation>,
+        early_schema: bool,
         f: F,
     ) -> Result<T, ServerError>
     where
-        F: FnOnce(&mut Statement) -> Result<T, ServerError>,
+        F: FnOnce(&mut Statement, Option<Schema>) -> Result<T, ServerError>,
     {
         Self::validate_sql(sql)?;
         let conn = self
@@ -528,13 +557,30 @@ impl DuckDbConnection {
             .map(|c| c.activate(conn.interrupt_handle()))
             .transpose()?;
         let result = (|| {
-            let query = result_projection::for_query(&conn, sql, params)?
-                .unwrap_or_else(|| sql.to_string());
+            let (query, schema) = if early_schema {
+                match result_projection::for_streaming_query(&conn, sql, params)? {
+                    Some((query, schema_query)) => {
+                        let mut schema_stmt = conn.prepare(&schema_query)?;
+                        let schema = Self::stream_arrow_with_params(&mut schema_stmt, None)?
+                            .get_schema()
+                            .as_ref()
+                            .clone();
+                        (query, Some(schema))
+                    }
+                    None => (sql.to_string(), None),
+                }
+            } else {
+                (
+                    result_projection::for_query(&conn, sql, params)?
+                        .unwrap_or_else(|| sql.to_string()),
+                    None,
+                )
+            };
             if let Some(cancellation) = cancellation {
                 cancellation.check()?;
             }
             let mut stmt = conn.prepare(&query)?;
-            f(&mut stmt)
+            f(&mut stmt, schema)
         })();
         drop(active);
         if let Some(cancellation) = cancellation {
@@ -617,6 +663,114 @@ impl DuckDbConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_schema_precedes_execution_error() -> anyhow::Result<()> {
+        let connection = test_connection();
+        for params in [None, Some(vec![Value::Int(2)])] {
+            let sql = if params.is_some() {
+                "SELECT sum(CAST('invalid' || i::VARCHAR AS BIGINT)) AS total FROM range(?) t(i)"
+            } else {
+                "SELECT sum(CAST('invalid' || i::VARCHAR AS BIGINT)) AS total FROM range(2) t(i)"
+            };
+            let (tx, mut rx) = mpsc::channel(4);
+            let result = connection.stream_query(sql, params.as_deref(), tx, None, None);
+            assert!(result.unwrap_err().to_string().contains("Conversion Error"));
+            assert!(
+                matches!(rx.blocking_recv(), Some(StreamingBatch::Schema(_))),
+                "execution fails only after the result schema is published"
+            );
+            assert!(rx.blocking_recv().is_none());
+            assert_eq!(connection.execute_query("SELECT 42")?.total_rows, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_schema_matches_bound_parameters_and_exported_types() -> anyhow::Result<()> {
+        let connection = test_connection();
+        connection.execute_batch(
+            "SET arrow_lossless_conversion=true; CREATE SEQUENCE early_schema_rows",
+        )?;
+        for (sql, params) in [
+            ("SELECT ? AS value, ? AS label", Some(vec![Value::Int(42), Value::Text("text".into())])),
+            ("SELECT 1::DECIMAL(30,4) AS d, [1,2] AS a, {'x': 1} AS s, 'a'::ENUM('a','b') AS e", None),
+            ("SELECT NULL AS n, 1::UBIGINT AS u, now() AS t, uuid() AS id, INTERVAL '1 day' AS i, 'a'::JSON AS j WHERE false", None),
+            ("SELECT 1 AS dup, 'x' AS dup, 2 AS \"quoted\"\"name\"", None),
+            ("SELECT nextval('early_schema_rows')::VARIANT AS v FROM range(3)", None),
+            ("SELECT {'x': 1::VARIANT} AS nested, [2::VARIANT] AS items", None),
+        ] {
+            let (tx, mut rx) = mpsc::channel(4);
+            connection.stream_query(sql, params.as_deref(), tx, None, None)?;
+            let Some(StreamingBatch::Schema(schema)) = rx.blocking_recv() else {
+                anyhow::bail!("missing schema for {sql}");
+            };
+            let mut rows = 0;
+            while let Some(message) = rx.blocking_recv() {
+                match message {
+                    StreamingBatch::Batch(batch) => {
+                        assert_eq!(batch.schema().as_ref(), &schema, "{sql}");
+                        rows += batch.num_rows();
+                        if sql.starts_with("SELECT ?") {
+                            assert_eq!(batch.column(0).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap().value(0), 42);
+                        }
+                    }
+                    StreamingBatch::Done { total_rows, .. } => assert_eq!(rows, total_rows),
+                    _ => anyhow::bail!("unexpected stream message for {sql}"),
+                }
+            }
+        }
+        let result = connection.execute_query("SELECT currval('early_schema_rows')")?;
+        assert_eq!(
+            result.batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap()
+                .value(0),
+            3
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_schema_precedes_blocking_aggregation_and_allows_cancellation(
+    ) -> anyhow::Result<()> {
+        use crate::engine::cancellation::RequestCancellation;
+        use std::{sync::Arc, time::Duration};
+
+        let connection = Arc::new(test_connection());
+        for parameterized in [false, true] {
+            let cancellation = Arc::new(RequestCancellation::default());
+            let (tx, mut rx) = mpsc::channel(1);
+            let worker_connection = connection.clone();
+            let worker_cancellation = cancellation.clone();
+            let worker = tokio::task::spawn_blocking(move || {
+                let params = [Value::BigInt(1_000_000_000_000)];
+                worker_connection.stream_query_cancellable(
+                    if parameterized {
+                        "SELECT sum(sin(i::DOUBLE)) AS total FROM range(?) t(i)"
+                    } else {
+                        "SELECT sum(sin(i::DOUBLE)) AS total FROM range(1000000000000) t(i)"
+                    },
+                    parameterized.then_some(params.as_slice()),
+                    tx,
+                    &worker_cancellation,
+                )
+            });
+            let first = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+            let still_running = !worker.is_finished();
+            rx.close();
+            cancellation.cancel();
+            // Always cancel and join, including when the schema regression fails.
+            let result = tokio::time::timeout(Duration::from_secs(2), worker).await??;
+            assert!(matches!(result, Err(ServerError::Cancelled)));
+            assert!(matches!(first, Ok(Some(StreamingBatch::Schema(_)))));
+            assert!(still_running, "aggregation finished before cancellation");
+            assert_eq!(connection.execute_query("SELECT 42")?.total_rows, 1);
+        }
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn completed_stream_survives_immediate_receiver_close() -> anyhow::Result<()> {

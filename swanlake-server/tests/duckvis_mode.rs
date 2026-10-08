@@ -1900,6 +1900,58 @@ async fn locked_transactions_span_flight_requests() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_read_sends_schema_before_rows_and_cancels() {
+    use arrow_flight::sql::client::FlightSqlServiceClient;
+    use std::time::Duration;
+
+    let h = base_harness().await;
+    let token = format!("Bearer {}", valid_token("early-schema"));
+    for raw in [false, true] {
+        let headers = project_headers(
+            &token,
+            if raw { "early-raw" } else { "early-typed" },
+            PROJECT,
+        );
+        let mut cli = client(&h.endpoint).await;
+        let sql = "SELECT sum(sin(i::DOUBLE)) AS total FROM range(1000000000000) t(i)";
+        let info = if raw {
+            cli.get_flight_info(with_headers(FlightDescriptor::new_cmd(sql), &headers))
+                .await
+                .unwrap()
+                .into_inner()
+        } else {
+            let mut sql_cli = FlightSqlServiceClient::new_from_inner(cli.clone());
+            for (key, value) in &headers {
+                sql_cli.set_header(*key, *value);
+            }
+            sql_cli.execute(sql.into(), None).await.unwrap()
+        };
+        let expected = duckdb::arrow::datatypes::Schema::try_from(info.clone()).unwrap();
+        let ticket = info.endpoint.into_iter().next().unwrap().ticket.unwrap();
+        let mut stream = cli
+            .do_get(with_headers(ticket, &headers))
+            .await
+            .unwrap()
+            .into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(2), stream.message()).await;
+        // Release the RPC before asserting, including against the failing baseline.
+        drop(stream);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run_select(&mut cli, &headers, "SELECT 42"),
+        )
+        .await
+        .expect("cancelled aggregation retained the session")
+        .unwrap();
+        let schema = first
+            .expect("schema waited for aggregation")
+            .unwrap()
+            .expect("stream ended before schema");
+        assert_eq!(duckdb::arrow::datatypes::Schema::try_from(&schema).unwrap(), expected);
+    }
+}
+
 #[tokio::test]
 async fn authenticated_locked_session_reports_cpu_in_flight_metadata() {
     let h = base_harness().await;
