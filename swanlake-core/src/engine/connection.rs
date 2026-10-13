@@ -452,7 +452,7 @@ impl DuckDbConnection {
         let conn = self
             .conn
             .lock()
-            .map_err(|_| ServerError::Internal("connection mutex poisoned".to_string()))?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // Use DESC to get table schema without preparing parameters
         let desc_query = format!("DESC SELECT * FROM {table_name}");
@@ -504,7 +504,7 @@ impl DuckDbConnection {
         let conn = self
             .conn
             .lock()
-            .map_err(|_| ServerError::Internal("connection mutex poisoned".to_string()))?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut stmt = conn
             .prepare("SELECT current_database()")
             .map_err(ServerError::DuckDb)?;

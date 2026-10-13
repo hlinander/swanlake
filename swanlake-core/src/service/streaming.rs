@@ -149,7 +149,7 @@ impl SwanFlightSqlService {
                 .connection
                 .conn
                 .lock()
-                .map_err(|_| Status::internal("connection mutex poisoned"))?;
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             setup_cancellation
                 .check()
                 .map_err(Self::status_from_error)?;
@@ -488,6 +488,34 @@ mod cancellation_tests {
         );
         drop(response);
         assert!(connection.upgrade().is_none());
+        Ok(())
+    }
+
+    /// An interrupted Arrow fetch panics while holding the connection guard;
+    /// the next streaming query on that session still runs.
+    #[tokio::test]
+    async fn streaming_query_runs_after_a_poisoned_connection() -> anyhow::Result<()> {
+        use futures::StreamExt;
+        let session = session().await?;
+        let connection = session.connection.clone();
+        let poisoned = std::thread::spawn(move || {
+            let _guard = connection.conn.lock().unwrap();
+            panic!("Failed to fetch Arrow record batch: INTERRUPT Error: Interrupted!");
+        })
+        .join();
+        assert!(poisoned.is_err());
+        assert!(session.connection.conn.is_poisoned());
+
+        let mut response =
+            SwanFlightSqlService::execute_query_streaming(session, "SELECT 42".into(), None)
+                .await?
+                .into_inner();
+        let mut messages = 0;
+        while let Some(message) = response.next().await {
+            message?;
+            messages += 1;
+        }
+        assert!(messages > 0, "the stream carried no data");
         Ok(())
     }
 
