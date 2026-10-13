@@ -114,6 +114,8 @@ struct MockState {
     resolve_allow: AtomicBool,
     /// The secret_config to serve from resolve-attachment.
     secret_config: Mutex<String>,
+    /// The `secrets` array to serve beside it; `Null` omits the field.
+    secrets: Mutex<Value>,
     /// The attachment name/id served.
     attachment_name: Mutex<String>,
     attachment_id: Mutex<String>,
@@ -304,17 +306,18 @@ async fn spawn_mock_api(state: Arc<MockState>) -> String {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        (
-            StatusCode::OK,
-            Json(json!({
-                "allow": true,
-                "attachment_id": id,
-                "name": name,
-                "kind": "connection",
-                "secret_config": secret,
-            })),
-        )
-            .into_response()
+        let mut body = json!({
+            "allow": true,
+            "attachment_id": id,
+            "name": name,
+            "kind": "connection",
+            "secret_config": secret,
+        });
+        let secrets = state.secrets.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if !secrets.is_null() {
+            body["secrets"] = secrets;
+        }
+        (StatusCode::OK, Json(body)).into_response()
     }
 
     let app = axum::Router::new()
@@ -1991,4 +1994,61 @@ async fn authenticated_locked_session_reports_cpu_in_flight_metadata() {
         positive_cpu,
         "locked authenticated session omitted CPU telemetry"
     );
+}
+
+/// A resolve response's `secrets` become session secrets before the ATTACH; a
+/// malformed element refuses the arming, and user SQL cannot name the
+/// reserved prefix.
+#[tokio::test]
+async fn attach_creates_beside_secrets_and_reserves_their_names() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("sec.duckdb");
+    duckdb::Connection::open(&db_path)
+        .and_then(|c| c.execute_batch("CREATE TABLE t(id INTEGER)"))
+        .expect("seed temp db");
+    let secret = "__duckvis_0123456789abcdef0123456789abcdef";
+
+    let mock = Arc::new(MockState::new());
+    *mock.secret_config.lock().unwrap() =
+        format!("ATTACH '{}' AS ignored", db_path.to_string_lossy().replace('\\', "/"));
+    *mock.secrets.lock().unwrap() = json!([{
+        "name": "__duckvis_not-hex",
+        "type": "postgres",
+        "fields": { "PASSWORD": "pw" },
+    }]);
+    let api_url = spawn_mock_api(mock.clone()).await;
+    let h = spawn_server(&api_url, mock).await;
+    let mut cli = client(&h.endpoint).await;
+    let token = format!("Bearer {}", valid_token("user-1"));
+    let headers = project_headers(&token, SESSION, PROJECT);
+
+    let err = duckvis_attach(&mut cli, &headers, BIND_ID)
+        .await
+        .expect_err("a malformed secret name refuses the arming");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    *h.mock.secrets.lock().unwrap() = json!([{
+        "name": secret,
+        "type": "postgres",
+        "fields": { "PASSWORD": "pw-not-shown" },
+    }]);
+    duckvis_attach(&mut cli, &headers, BIND_ID)
+        .await
+        .expect("attach with a beside-secret");
+    // `error()` fails the query unless exactly one redacted beside-secret is listed.
+    run_select(
+        &mut cli,
+        &headers,
+        "SELECT CASE WHEN count(*) = 1 THEN 1 ELSE error('beside-secret missing or exposed') END \
+         FROM duckdb_secrets() WHERE name LIKE '%0123456789abcdef0123456789abcdef' \
+         AND secret_string LIKE '%password=redacted%' \
+         AND secret_string NOT LIKE '%pw-not-shown%'",
+    )
+    .await
+    .expect("the beside-secret exists with its value redacted");
+
+    let err = execute_sql_action(&mut cli, &headers, &format!("DROP SECRET {secret}"))
+        .await
+        .expect_err("user SQL may not name the reserved prefix");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
 }

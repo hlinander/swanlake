@@ -593,6 +593,15 @@ mod tests {
     use crate::engine::DuckDbConnection;
     use crate::session::{Session, SessionId};
 
+    /// The listing SQL names the lake metadata schemas only inside string
+    /// literals, so non-writer statement admission passes it.
+    #[test]
+    fn listing_sql_passes_non_writer_admission() {
+        for sql in [SCHEMAS_SQL, TABLES_SQL] {
+            assert_eq!(crate::duckvis::attach::refused_construct(sql, false), None);
+        }
+    }
+
     fn test_session() -> Result<Arc<Session>> {
         let conn = Connection::open_in_memory().context("failed to open in-memory duckdb")?;
         let session = Session::new_with_id(

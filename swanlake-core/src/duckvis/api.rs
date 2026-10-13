@@ -11,13 +11,37 @@ use tracing::warn;
 use super::{sa, DuckvisAuth, DuckvisError};
 
 /// A resolved project attachment (contract C3 allow path). `secret_config` is
-/// the full ATTACH statement and must never be logged.
+/// the full ATTACH statement and `secrets` the credentials it references by
+/// name; neither may be logged.
 #[derive(Debug, Clone)]
 pub struct ResolvedAttachment {
     pub attachment_id: String,
     pub name: String,
     pub kind: String,
     pub secret_config: String,
+    pub secrets: Vec<AttachSecret>,
+}
+
+/// One resolve-attachment `secrets[]` element: a memory-only session secret
+/// the arming creates before its ATTACH (resolve_contract.md §Beside-secrets).
+#[derive(Clone, Deserialize)]
+pub struct AttachSecret {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub fields: std::collections::BTreeMap<String, String>,
+}
+
+/// Field values are credentials: only the name, type, and field keys print.
+impl std::fmt::Debug for AttachSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachSecret")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("fields", &self.fields.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 #[derive(Serialize)]
@@ -54,6 +78,8 @@ struct ResolveResponse {
     name: Option<String>,
     kind: Option<String>,
     secret_config: Option<String>,
+    #[serde(default)]
+    secrets: Option<Vec<AttachSecret>>,
 }
 
 impl DuckvisAuth {
@@ -118,6 +144,7 @@ impl DuckvisAuth {
                     name,
                     kind: resp.kind.unwrap_or_else(|| "connection".to_string()),
                     secret_config,
+                    secrets: resp.secrets.unwrap_or_default(),
                 }))
             }
             _ => {

@@ -355,6 +355,9 @@ impl SwanFlightSqlService {
             ServerError::PersistentSecretNotPermitted => Status::permission_denied(
                 "persistent secrets are not available in this session",
             ),
+            ServerError::ReservedNameNotPermitted => Status::permission_denied(
+                "names starting with __duckvis_ are reserved for attachment secrets",
+            ),
         }
     }
 

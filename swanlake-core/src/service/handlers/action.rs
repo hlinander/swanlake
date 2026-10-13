@@ -1452,8 +1452,10 @@ struct DuckvisAttachResult {
 /// Handle the `duckvis_attach` action (contract C1).
 ///
 /// Resolves a project attachment by bind id via duckvis-api, normalizes the
-/// returned ATTACH statement to `ATTACH OR REPLACE … AS "<name>" …`, and executes
-/// it on the session connection through the privileged (guard-bypassing) path.
+/// returned ATTACH statement to `ATTACH OR REPLACE … AS "<name>" …`, creates the
+/// response's beside-secrets as temporary session secrets, and executes the
+/// statement on the session connection through the privileged (guard-bypassing)
+/// path.
 ///
 /// Secret hygiene: only the bind id and attachment name are ever logged; the
 /// resolved/normalized SQL statement never appears in logs, traces, or errors.
@@ -1504,6 +1506,16 @@ pub(crate) async fn do_action_duckvis_attach(
     )
     .map_err(|e| e.into_status())?;
 
+    // NOTE: the secret statements carry credentials and must never be logged.
+    let secrets_sql = resolved
+        .secrets
+        .iter()
+        .map(|secret| {
+            crate::duckvis::attach::secret_statement(&secret.name, &secret.kind, &secret.fields)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.into_status())?;
+
     let attachment_name = resolved.name.clone();
     let attachment_id = resolved.attachment_id.clone();
     let search_path_sql = parsed
@@ -1520,7 +1532,12 @@ pub(crate) async fn do_action_duckvis_attach(
     let normalized_for_exec = normalized;
     let catalog = attachment_name.clone();
     tokio::task::spawn_blocking(move || {
-        session_clone.attach_catalog(&catalog, &normalized_for_exec, search_path_sql.as_deref())
+        session_clone.attach_catalog(
+            &catalog,
+            &secrets_sql,
+            &normalized_for_exec,
+            search_path_sql.as_deref(),
+        )
     })
     .await
     .map_err(SwanFlightSqlService::status_from_join)?

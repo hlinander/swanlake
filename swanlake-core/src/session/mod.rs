@@ -295,6 +295,11 @@ impl Session {
     /// non-writer additionally loses the file-write verbs the engine cannot
     /// distinguish inside its allowed roots: `COPY` with a file sink (`COPY …
     /// FROM` stays), `EXPORT DATABASE`, and `CALL ducklake_*` maintenance.
+    /// [`crate::duckvis::attach::refused_construct`] then refuses the reserved
+    /// attachment-secret names for every session, and for a non-writer the
+    /// lake metadata catalogs, connection-opening and SQL-text table
+    /// functions, `ducklake_*` file listing and maintenance, and macro or
+    /// function definitions.
     pub fn validate_user_sql(&self, sql: &str) -> Result<(), ServerError> {
         let Some(auth) = self.auth.as_ref() else {
             return Ok(());
@@ -322,6 +327,15 @@ impl Session {
                     }
                     _ => {}
                 }
+            }
+            match crate::duckvis::attach::refused_construct(&statement, auth.writer) {
+                Some(crate::duckvis::attach::Refusal::ReservedName) => {
+                    return Err(ServerError::ReservedNameNotPermitted);
+                }
+                Some(crate::duckvis::attach::Refusal::NonWriter(what)) => {
+                    return Err(ServerError::WriteNotPermitted(what));
+                }
+                None => {}
             }
         }
         Ok(())
@@ -360,6 +374,7 @@ impl Session {
     pub fn attach_catalog(
         &self,
         catalog: &str,
+        secrets_sql: &[String],
         sql: &str,
         search_path_sql: Option<&str>,
     ) -> Result<(), ServerError> {
@@ -385,6 +400,14 @@ impl Session {
             }
         }
 
+        // The statement references these secrets by name, so they exist first.
+        // Engine text for a failed secret is not relayed: it can echo the
+        // statement, which carries the credential.
+        for secret_sql in secrets_sql {
+            self.execute_statement_privileged(secret_sql).map_err(|_| {
+                ServerError::Internal("failed to create the attachment's session secret".into())
+            })?;
+        }
         self.execute_statement_privileged(sql)?;
         if confined && !state.applied {
             if let Some(root) = crate::duckvis::attach::attach_data_path(sql) {
@@ -1241,6 +1264,29 @@ mod guard_tests {
     }
 
     #[test]
+    fn admission_maps_construct_refusals_to_errors() -> Result<()> {
+        let s = authed_session()?;
+        assert!(matches!(
+            s.validate_user_sql("SELECT * FROM postgres_scan('dbname=x', 'public', 't')"),
+            Err(ServerError::WriteNotPermitted("postgres_scan"))
+        ));
+        assert!(matches!(
+            s.validate_user_sql("SELECT 1; CREATE MACRO m() AS 1"),
+            Err(ServerError::WriteNotPermitted("CREATE MACRO"))
+        ));
+        for session in [authed_session()?, writer_session()?] {
+            assert!(matches!(
+                session.validate_user_sql("DROP SECRET __duckvis_0123456789abcdef0123456789abcdef"),
+                Err(ServerError::ReservedNameNotPermitted)
+            ));
+        }
+        assert!(writer_session()?
+            .validate_user_sql("SELECT * FROM postgres_scan('dbname=x', 'public', 't')")
+            .is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn admission_passes_writer() -> Result<()> {
         let s = writer_session()?;
         assert!(s.validate_user_sql("COPY t TO 'out.csv'").is_ok());
@@ -1308,6 +1354,83 @@ mod lockdown_tests {
         );
         session.ensure_lockdown()?;
         Ok(session)
+    }
+
+    /// A lake armed through a beside-secret, then locked as a non-writer:
+    /// the catalog row carries no password, the secret listing redacts it,
+    /// and admission refuses the paths that read the catalog directly. Needs a
+    /// reachable DuckLake catalog: `SWANLAKE_LIVE_LAKE_DSN` (libpq DSN with
+    /// `user=`, no password), `SWANLAKE_LIVE_LAKE_PASSWORD`,
+    /// `SWANLAKE_LIVE_LAKE_SCHEMA`, `SWANLAKE_LIVE_LAKE_DATA_PATH`, and the
+    /// ducklake and postgres extensions in the local extension cache.
+    #[test]
+    #[ignore = "requires a DuckLake Postgres catalog (SWANLAKE_LIVE_LAKE_*)"]
+    fn secret_armed_lake_hides_its_credential() -> Result<()> {
+        let env = |name: &str| std::env::var(name).map_err(|_| anyhow!("{name} is not set"));
+        let (dsn, password) = (env("SWANLAKE_LIVE_LAKE_DSN")?, env("SWANLAKE_LIVE_LAKE_PASSWORD")?);
+        let (schema, data_path) = (
+            env("SWANLAKE_LIVE_LAKE_SCHEMA")?,
+            env("SWANLAKE_LIVE_LAKE_DATA_PATH")?,
+        );
+        let scratch = tempfile::tempdir()?;
+        let session = Session::new_with_id_and_auth(
+            SessionId::from_string("secret-armed".to_string()),
+            Arc::new(test_connection()?),
+            Some(SessionAuth {
+                subject: "sub-1".to_string(),
+                project_id: "project-1".to_string(),
+                writer: false,
+            }),
+            Some(template(scratch.path())),
+        );
+        raw_batch(&session.connection, "LOAD ducklake; LOAD postgres")?;
+
+        let name = "__duckvis_0123456789abcdef0123456789abcdef";
+        let secret = crate::duckvis::attach::secret_statement(
+            name,
+            "postgres",
+            &std::collections::BTreeMap::from([("PASSWORD".to_string(), password.clone())]),
+        )?;
+        let attach = crate::duckvis::attach::normalize_attach(
+            &format!(
+                "ATTACH 'ducklake:postgres:{dsn}' AS x (DATA_PATH '{data_path}', \
+                 METADATA_SCHEMA '{schema}', ENCRYPTED, METADATA_PARAMETERS MAP {{'SECRET': '{name}'}})"
+            ),
+            "lk",
+            true,
+        )?;
+        session.attach_catalog("lk", &[secret], &attach, None)?;
+        session.ensure_lockdown()?;
+
+        let raw_text = |sql: &str| -> Result<String> {
+            let raw = session.connection.conn.lock().unwrap_or_else(|p| p.into_inner());
+            Ok(raw.query_row(sql, [], |row| row.get::<_, String>(0))?)
+        };
+        let path = raw_text("SELECT path FROM duckdb_databases() WHERE database_name = 'lk'")?;
+        assert!(!path.contains(&password), "catalog path exposes the password");
+        let listed = raw_text("SELECT secret_string FROM duckdb_secrets()")?;
+        assert!(!listed.contains(&password) && listed.contains("password=redacted"));
+
+        for sql in [
+            format!("SELECT * FROM postgres_scan('{dsn}', '{schema}', 'ducklake_snapshot')"),
+            "SELECT * FROM __ducklake_metadata_lk.ducklake_snapshot".to_string(),
+            "FROM query('SELECT * FROM postgres_' || 'scan(1)')".to_string(),
+            "SELECT * FROM ducklake_list_files('lk', 'any')".to_string(),
+        ] {
+            assert!(
+                matches!(session.execute_query(&sql), Err(ServerError::WriteNotPermitted(_))),
+                "expected refusal: {sql}"
+            );
+        }
+        // Past admission, the session still holds no credential a fresh
+        // libpq connection can use.
+        let raw = session.connection.conn.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(raw
+            .execute_batch(&format!(
+                "SELECT * FROM postgres_scan('{dsn}', '{schema}', 'ducklake_snapshot')"
+            ))
+            .is_err());
+        Ok(())
     }
 
     #[test]

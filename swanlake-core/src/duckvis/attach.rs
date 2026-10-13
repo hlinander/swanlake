@@ -287,6 +287,214 @@ pub fn copy_writes_file(statement: &str) -> bool {
     true
 }
 
+/// Name prefix of the session secrets resolve-attachment delivers beside its
+/// ATTACH statement. Only the arming path creates or references them; user SQL
+/// naming the prefix is refused, so no session can read, drop, or replace one.
+pub const RESERVED_SECRET_PREFIX: &str = "__duckvis_";
+
+/// DuckDB secret types an attachment may deliver.
+const ATTACH_SECRET_TYPES: &[&str] = &["postgres"];
+
+/// Build the `CREATE OR REPLACE TEMPORARY SECRET` statement for one
+/// resolve-attachment `secrets[]` element. The name must be the reserved
+/// prefix plus 32 lowercase hex digits, the type one of
+/// [`ATTACH_SECRET_TYPES`], and each field key a bare option name; values are
+/// SQL string literals. Anything else is `AttachInvalid`. The statement
+/// carries the credential and must never be logged.
+pub fn secret_statement(
+    name: &str,
+    kind: &str,
+    fields: &std::collections::BTreeMap<String, String>,
+) -> Result<String, DuckvisError> {
+    let hex = name
+        .strip_prefix(RESERVED_SECRET_PREFIX)
+        .ok_or(DuckvisError::AttachInvalid)?;
+    if hex.len() != 32 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(DuckvisError::AttachInvalid);
+    }
+    let kind = kind.to_ascii_lowercase();
+    if !ATTACH_SECRET_TYPES.contains(&kind.as_str()) {
+        return Err(DuckvisError::AttachInvalid);
+    }
+    let mut options = vec![format!("TYPE {kind}")];
+    for (key, value) in fields {
+        let mut chars = key.chars();
+        if !matches!(chars.next(), Some('a'..='z' | 'A'..='Z' | '_'))
+            || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            || key.eq_ignore_ascii_case("TYPE")
+        {
+            return Err(DuckvisError::AttachInvalid);
+        }
+        options.push(format!("{key} '{}'", value.replace('\'', "''")));
+    }
+    Ok(format!(
+        "CREATE OR REPLACE TEMPORARY SECRET {name} ({})",
+        options.join(", ")
+    ))
+}
+
+/// Table functions a non-writer session may not call: each opens its own
+/// connection from a DSN argument, or runs SQL text built at runtime past
+/// statement admission.
+const NON_WRITER_FUNCTIONS: &[&str] = &[
+    "postgres_scan",
+    "postgres_scan_pushdown",
+    "postgres_query",
+    "postgres_execute",
+    "postgres_attach",
+    "query",
+    "query_table",
+    "json_execute_serialized_sql",
+];
+
+/// The `ducklake_*` functions a non-writer session may call: catalog and
+/// snapshot information only. Every other `ducklake_*` function is refused —
+/// maintenance writes, and `ducklake_list_files`, which returns each data
+/// file's encryption key.
+const NON_WRITER_DUCKLAKE_FUNCTIONS: &[&str] = &[
+    "ducklake_current_snapshot",
+    "ducklake_last_committed_snapshot",
+    "ducklake_options",
+    "ducklake_settings",
+    "ducklake_snapshots",
+    "ducklake_table_info",
+    "ducklake_table_changes",
+    "ducklake_table_insertions",
+    "ducklake_table_deletions",
+];
+
+/// A word that precedes a name followed by `(` without making it a call:
+/// `CREATE TABLE query (a INT)`, `INSERT INTO query (a) …`.
+const NON_CALL_PREDECESSORS: &[&str] = &["table", "into", "view", "exists"];
+
+/// Why statement admission refuses `statement` beyond its leading keyword:
+/// for every session, any identifier or string literal naming
+/// [`RESERVED_SECRET_PREFIX`]; for a non-writer, a `__ducklake_metadata*`
+/// catalog reference, a call of a [`NON_WRITER_FUNCTIONS`] entry or of a
+/// `ducklake_*` function outside [`NON_WRITER_DUCKLAKE_FUNCTIONS`], and
+/// `CREATE MACRO`/`CREATE FUNCTION`, which can wrap any of them. Comments are
+/// ignored; names match case-insensitively, quoted or bare, under any
+/// qualification.
+pub fn refused_construct(statement: &str, writer: bool) -> Option<Refusal> {
+    let tokens = scan(&strip_comments(statement));
+    for token in &tokens {
+        let (Scanned::Word(text, _) | Scanned::Literal(text)) = token else {
+            continue;
+        };
+        if text.to_ascii_lowercase().contains(RESERVED_SECRET_PREFIX) {
+            return Some(Refusal::ReservedName);
+        }
+    }
+    if writer {
+        return None;
+    }
+    let words: Vec<Option<String>> = tokens
+        .iter()
+        .map(|t| match t {
+            Scanned::Word(text, _) => Some(text.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+    if words.first().cloned().flatten().as_deref() == Some("create") {
+        let kind = words[1..]
+            .iter()
+            .flatten()
+            .find(|w| !matches!(w.as_str(), "or" | "replace" | "temp" | "temporary"));
+        match kind.map(String::as_str) {
+            Some("macro") => return Some(Refusal::NonWriter("CREATE MACRO")),
+            Some("function") => return Some(Refusal::NonWriter("CREATE FUNCTION")),
+            _ => {}
+        }
+    }
+    for (idx, word) in words.iter().enumerate() {
+        let Some(word) = word else { continue };
+        if word.starts_with("__ducklake_metadata") {
+            return Some(Refusal::NonWriter("__ducklake_metadata catalogs"));
+        }
+        if !matches!(tokens.get(idx + 1), Some(Scanned::Punct('('))) {
+            continue;
+        }
+        let after_definer = idx > 0
+            && words[idx - 1]
+                .as_deref()
+                .is_some_and(|prev| NON_CALL_PREDECESSORS.contains(&prev));
+        if after_definer {
+            continue;
+        }
+        if let Some(name) = NON_WRITER_FUNCTIONS.iter().find(|f| **f == word) {
+            return Some(Refusal::NonWriter(name));
+        }
+        if word.starts_with("ducklake_")
+            && !NON_WRITER_DUCKLAKE_FUNCTIONS.contains(&word.as_str())
+        {
+            return Some(Refusal::NonWriter("ducklake_* maintenance and file listing"));
+        }
+    }
+    None
+}
+
+/// The construct [`refused_construct`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// A reference to [`RESERVED_SECRET_PREFIX`], refused for every session.
+    ReservedName,
+    /// A construct only a writer session may use.
+    NonWriter(&'static str),
+}
+
+/// A lexical token of [`scan`]: a word (bare, or double-quoted with `true`),
+/// a single-quoted literal (contents only), or one punctuation character.
+enum Scanned {
+    Word(String, bool),
+    Literal(String),
+    Punct(char),
+}
+
+/// Split comment-free SQL into words, quoted identifiers, string literals, and
+/// punctuation. Doubled quotes inside a quoted token are escapes.
+fn scan(sql: &str) -> Vec<Scanned> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch.is_whitespace() {
+            i += 1;
+        } else if ch == '\'' || ch == '"' {
+            let mut text = String::new();
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == ch {
+                    if chars.get(i + 1) == Some(&ch) {
+                        text.push(ch);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                text.push(chars[i]);
+                i += 1;
+            }
+            tokens.push(if ch == '"' {
+                Scanned::Word(text, true)
+            } else {
+                Scanned::Literal(text)
+            });
+        } else if ch.is_alphanumeric() || ch == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '$') {
+                i += 1;
+            }
+            tokens.push(Scanned::Word(chars[start..i].iter().collect(), false));
+        } else {
+            tokens.push(Scanned::Punct(ch));
+            i += 1;
+        }
+    }
+    tokens
+}
+
 /// Strip one level of matching outer quotes and collapse doubled inner quotes.
 fn unquote(token: &str) -> String {
     let bytes = token.as_bytes();
@@ -826,5 +1034,117 @@ mod tests {
         );
         assert_eq!(leading_keyword("select 1").as_deref(), Some("SELECT"));
         assert_eq!(leading_keyword("   \n  ").as_deref(), None);
+    }
+
+    const SECRET: &str = "__duckvis_0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn non_writer_keeps_secret_references_when_adding_read_only() {
+        let managed = format!(
+            "ATTACH 'ducklake:postgres:dbname=lakes host=127.0.0.1 user=lake_ab' AS lake_ab \
+             (DATA_PATH '/l/', METADATA_SCHEMA 'lake_ab', ENCRYPTED, \
+             METADATA_PARAMETERS MAP {{'SECRET': '{SECRET}'}});"
+        );
+        assert_eq!(
+            normalize_attach(&managed, "lk", true).unwrap(),
+            format!(
+                "ATTACH OR REPLACE 'ducklake:postgres:dbname=lakes host=127.0.0.1 user=lake_ab' \
+                 AS \"lk\" (DATA_PATH '/l/', METADATA_SCHEMA 'lake_ab', ENCRYPTED, \
+                 METADATA_PARAMETERS MAP {{ 'SECRET' : '{SECRET}' }}, READ_ONLY)"
+            )
+        );
+        let plain = format!("ATTACH 'host=h dbname=d user=u' (TYPE POSTGRES, SECRET {SECRET})");
+        assert_eq!(
+            normalize_attach(&plain, "pg", true).unwrap(),
+            format!(
+                "ATTACH OR REPLACE 'host=h dbname=d user=u' AS \"pg\" \
+                 (TYPE POSTGRES, SECRET {SECRET}, READ_ONLY)"
+            )
+        );
+    }
+
+    #[test]
+    fn secret_statement_quotes_values_and_validates_shape() {
+        let fields = std::collections::BTreeMap::from([(
+            "PASSWORD".to_string(),
+            "it's".to_string(),
+        )]);
+        assert_eq!(
+            secret_statement(SECRET, "postgres", &fields).unwrap(),
+            format!("CREATE OR REPLACE TEMPORARY SECRET {SECRET} (TYPE postgres, PASSWORD 'it''s')")
+        );
+        for name in [
+            "__duckvis_0123",
+            "__duckvis_0123456789ABCDEF0123456789abcdef",
+            "lk_0123456789abcdef0123456789abcdef",
+            "__duckvis_0123456789abcdef0123456789abcdef; DROP",
+        ] {
+            assert!(secret_statement(name, "postgres", &fields).is_err(), "{name}");
+        }
+        assert!(secret_statement(SECRET, "s3", &fields).is_err());
+        for key in ["TYPE", "PASS WORD", "1X", "X'"] {
+            let bad = std::collections::BTreeMap::from([(key.to_string(), "v".to_string())]);
+            assert!(secret_statement(SECRET, "postgres", &bad).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn reserved_prefix_is_refused_for_every_session() {
+        for writer in [false, true] {
+            for sql in [
+                format!("DROP SECRET {SECRET}"),
+                format!("CREATE TEMPORARY SECRET \"{SECRET}\" (TYPE postgres)"),
+                "SELECT * FROM duckdb_secrets() WHERE name LIKE '__DUCKVIS_%'".to_string(),
+            ] {
+                assert_eq!(refused_construct(&sql, writer), Some(Refusal::ReservedName), "{sql}");
+            }
+            assert_eq!(refused_construct("SELECT 1 -- __duckvis_x", writer), None);
+        }
+    }
+
+    #[test]
+    fn non_writer_refusals() {
+        for (sql, what) in [
+            ("SELECT * FROM __ducklake_metadata_lk.lake_x.ducklake_data_file", "__ducklake_metadata catalogs"),
+            ("SELECT * FROM \"__DuckLake_Metadata_lk\".t", "__ducklake_metadata catalogs"),
+            ("SELECT * FROM postgres_scan('dbname=x', 'public', 't')", "postgres_scan"),
+            ("SELECT * FROM POSTGRES_SCAN ('dbname=x', 'public', 't')", "postgres_scan"),
+            ("SELECT * FROM system.main.\"postgres_query\"('db', 'SELECT 1')", "postgres_query"),
+            ("CALL postgres_execute('db', 'DROP TABLE t')", "postgres_execute"),
+            ("SELECT * FROM postgres_scan_pushdown('d', 's', 't')", "postgres_scan_pushdown"),
+            ("FROM query('SELECT * FROM postgres_' || 'scan(1)')", "query"),
+            ("FROM query_table('t')", "query_table"),
+            ("SELECT * FROM json_execute_serialized_sql(x)", "json_execute_serialized_sql"),
+            ("CREATE MACRO m(x) AS x", "CREATE MACRO"),
+            ("create or replace temp macro m() as table select 1", "CREATE MACRO"),
+            ("CREATE TEMPORARY FUNCTION f(x) AS x + 1", "CREATE FUNCTION"),
+            ("SELECT * FROM ducklake_list_files('lk', 't')", "ducklake_* maintenance and file listing"),
+            ("SELECT * FROM ducklake_expire_snapshots('lk', dry_run => true)", "ducklake_* maintenance and file listing"),
+        ] {
+            assert_eq!(refused_construct(sql, false), Some(Refusal::NonWriter(what)), "{sql}");
+            assert_eq!(refused_construct(sql, true), None, "writer: {sql}");
+        }
+    }
+
+    #[test]
+    fn non_writer_near_misses_pass() {
+        for sql in [
+            "SELECT query, query_table FROM t",
+            "SELECT 'postgres_scan(' AS s",
+            "SELECT 1 /* postgres_scan('x') */",
+            "SELECT my_query(1), postgres_scanner_version FROM t",
+            "CREATE TABLE query (a INT)",
+            "INSERT INTO query (a) VALUES (1)",
+            "CREATE TABLE IF NOT EXISTS query_table (a INT)",
+            "SELECT * FROM ducklake_snapshots('lk')",
+            "SELECT * FROM ducklake_table_info('lk')",
+            "SELECT * FROM lk.snapshots()",
+            "SELECT schema_name FROM information_schema.schemata \
+             WHERE schema_name NOT LIKE '\\_\\_ducklake_metadata%' ESCAPE '\\'",
+            "CREATE VIEW v AS SELECT 1",
+            "CREATE TEMP TABLE t AS SELECT 1",
+        ] {
+            assert_eq!(refused_construct(sql, false), None, "{sql}");
+        }
     }
 }

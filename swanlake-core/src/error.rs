@@ -38,4 +38,8 @@ pub enum ServerError {
     /// `permission_denied`.
     #[error("persistent secrets are not available in this session")]
     PersistentSecretNotPermitted,
+    /// User SQL named the reserved `__duckvis_` prefix of the attachment
+    /// secrets. Maps to `permission_denied`.
+    #[error("names starting with __duckvis_ are reserved for attachment secrets")]
+    ReservedNameNotPermitted,
 }
