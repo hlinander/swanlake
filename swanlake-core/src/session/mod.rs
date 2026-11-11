@@ -228,7 +228,6 @@ pub struct Session {
     /// The shared DuckDB connection (pub(crate) for streaming access)
     pub(crate) connection: std::sync::Arc<DuckDbConnection>,
     transactions: Mutex<HashSet<TransactionId>>,
-    aborted_transactions: Mutex<HashSet<TransactionId>>,
     prepared_statements: Mutex<HashMap<StatementHandle, PreparedStatementState>>,
     last_prepared_statement_handle: Mutex<Option<StatementHandle>>,
     transaction_id_gen: TransactionIdGenerator,
@@ -265,7 +264,6 @@ impl Session {
             nonce: uuid::Uuid::new_v4().to_string(),
             connection,
             transactions: Mutex::new(HashSet::new()),
-            aborted_transactions: Mutex::new(HashSet::new()),
             prepared_statements: Mutex::new(HashMap::new()),
             last_prepared_statement_handle: Mutex::new(None),
             transaction_id_gen: TransactionIdGenerator::new(),
@@ -491,108 +489,13 @@ impl Session {
         *last = Instant::now();
     }
 
-    /// Run an operation and automatically roll back if DuckDB reports an aborted transaction.
-    /// After rollback, retry the operation once.
-    fn with_transaction_recovery<T, F>(
-        &self,
-        mut op: F,
-        retry_on_abort: bool,
-    ) -> Result<T, ServerError>
-    where
-        F: FnMut() -> Result<T, ServerError>,
-    {
-        match op() {
-            Ok(value) => Ok(value),
-            Err(err) => {
-                if Self::is_transaction_abort_error(&err) {
-                    self.recover_from_transaction_abort(&err);
-                    if retry_on_abort {
-                        // Retry once after rollback
-                        op()
-                    } else {
-                        Err(err)
-                    }
-                } else {
-                    Err(err)
-                }
-            }
-        }
-    }
-
-    /// Detect the "transaction aborted" state and roll back so the session can be reused.
-    fn recover_from_transaction_abort(&self, err: &ServerError) {
-        if !Self::is_transaction_abort_error(err) {
-            return;
-        }
-
-        warn!(error = %err, "transaction aborted; rolling back session state");
-
-        match self.connection.execute_batch("ROLLBACK") {
-            Ok(()) => {
-                let (cleared, cleared_ids) = {
-                    let mut txs = self
-                        .transactions
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let cleared = txs.len();
-                    let ids = txs.iter().copied().collect::<Vec<_>>();
-                    txs.clear();
-                    (cleared, ids)
-                };
-                if !cleared_ids.is_empty() {
-                    let mut aborted = self
-                        .aborted_transactions
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    for id in cleared_ids {
-                        aborted.insert(id);
-                    }
-                }
-                info!(
-                    cleared_transactions = cleared,
-                    "auto-rolled back aborted transaction"
-                );
-            }
-            Err(rollback_err) => {
-                warn!(error = %rollback_err, "failed to rollback aborted transaction");
-            }
-        }
-    }
-
-    fn is_transaction_abort_error(err: &ServerError) -> bool {
-        match err {
-            ServerError::DuckDb(duck_err) => {
-                let msg = duck_err.to_string();
-                msg.contains("Current transaction is aborted")
-                    || msg.contains("TransactionContext Error")
-            }
-            _ => false,
-        }
-    }
-
-    fn transaction_absent(&self, transaction_id: TransactionId) -> Result<(), ServerError> {
-        let mut aborted = self
-            .aborted_transactions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if aborted.remove(&transaction_id) {
-            return Err(ServerError::TransactionAborted);
-        }
-
-        debug!(
-            transaction_id = %transaction_id,
-            "transaction not found; treating as no-op"
-        );
-        Ok(())
-    }
-
     /// Execute a SELECT query
     #[instrument(skip(self), fields(session_id = %self.id, sql = %sql))]
     pub fn execute_query(&self, sql: &str) -> Result<QueryResult, ServerError> {
         self.validate_user_sql(sql)?;
         self.ensure_lockdown()?;
         self.touch();
-        self.with_transaction_recovery(|| self.connection.execute_query(sql), true)
+        self.connection.execute_query(sql)
     }
 
     /// Execute a query with parameters
@@ -605,10 +508,7 @@ impl Session {
         self.validate_user_sql(sql)?;
         self.ensure_lockdown()?;
         self.touch();
-        self.with_transaction_recovery(
-            || self.connection.execute_query_with_params(sql, params),
-            true,
-        )
+        self.connection.execute_query_with_params(sql, params)
     }
 
     /// Return the number of parameters expected by a statement.
@@ -617,7 +517,7 @@ impl Session {
         // lockdown precedes it.
         self.ensure_lockdown()?;
         self.touch();
-        self.with_transaction_recovery(|| self.connection.parameter_count(sql), true)
+        self.connection.parameter_count(sql)
     }
 
     /// Execute a statement (DDL/DML)
@@ -647,13 +547,9 @@ impl Session {
         self.validate_user_sql(sql)?;
         self.ensure_lockdown()?;
         self.touch();
-        let result = self.with_transaction_recovery(
-            || {
-                self.connection
-                    .execute_statement_with_telemetry(sql, execution, Some(cancellation))
-            },
-            true,
-        );
+        let result =
+            self.connection
+                .execute_statement_with_telemetry(sql, execution, Some(cancellation));
         if result.is_ok() && Self::should_invalidate_schema_cache(sql) {
             self.clear_schema_cache();
         }
@@ -700,8 +596,7 @@ impl Session {
 
     fn execute_statement_inner(&self, sql: &str) -> Result<i64, ServerError> {
         self.touch();
-        let result =
-            self.with_transaction_recovery(|| self.connection.execute_statement(sql), true);
+        let result = self.connection.execute_statement(sql);
         if result.is_ok() && Self::should_invalidate_schema_cache(sql) {
             self.clear_schema_cache();
         }
@@ -724,10 +619,7 @@ impl Session {
         self.validate_user_sql(sql)?;
         self.ensure_lockdown()?;
         self.touch();
-        let result = self.with_transaction_recovery(
-            || self.connection.execute_statement_with_params(sql, params),
-            true,
-        );
+        let result = self.connection.execute_statement_with_params(sql, params);
         if result.is_ok() && Self::should_invalidate_schema_cache(sql) {
             self.clear_schema_cache();
         }
@@ -764,13 +656,9 @@ impl Session {
             }
         }
 
-        let schema = self.with_transaction_recovery(
-            || {
-                self.connection
-                    .schema_for_query_cancellable(sql, cancellation)
-            },
-            true,
-        )?;
+        let schema = self
+            .connection
+            .schema_for_query_cancellable(sql, cancellation)?;
 
         if !cache_key.is_empty() {
             self.schema_cache
@@ -795,23 +683,18 @@ impl Session {
     ) -> Result<usize, ServerError> {
         self.ensure_lockdown()?;
         self.touch();
-        self.with_transaction_recovery(
-            || {
-                self.connection
-                    .insert_with_appender(catalog_name, table_name, batches.clone())
-            },
-            false,
-        )
+        self.connection
+            .insert_with_appender(catalog_name, table_name, batches)
     }
 
     /// Get the schema of a table
     pub fn table_schema(&self, table_name: &str) -> Result<arrow_schema::Schema, ServerError> {
-        self.with_transaction_recovery(|| self.connection.table_schema(table_name), true)
+        self.connection.table_schema(table_name)
     }
 
     /// Return the current catalog selected for this session.
     pub fn current_catalog(&self) -> Result<String, ServerError> {
-        self.with_transaction_recovery(|| self.connection.current_catalog(), true)
+        self.connection.current_catalog()
     }
 
     fn schema_cache_key(sql: &str) -> String {
@@ -996,10 +879,7 @@ impl Session {
         self.touch();
 
         // Execute BEGIN TRANSACTION on the connection
-        self.with_transaction_recovery(
-            || self.connection.execute_batch("BEGIN TRANSACTION"),
-            true,
-        )?;
+        self.connection.execute_batch("BEGIN TRANSACTION")?;
 
         let tx_id = self.transaction_id_gen.next();
         let mut transactions = self
@@ -1039,23 +919,22 @@ impl Session {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if !transactions.contains(&transaction_id) {
-                return self.transaction_absent(transaction_id);
+                debug!(
+                    transaction_id = %transaction_id,
+                    "transaction not found; treating as no-op"
+                );
+                return Ok(());
             }
         }
 
-        // Execute COMMIT/ROLLBACK on the connection
-        self.with_transaction_recovery(|| self.connection.execute_batch(sql), true)?;
-
-        let mut transactions = self
-            .transactions
+        // DuckDB ends the transaction whether COMMIT or ROLLBACK succeeds or
+        // fails, so the id is released before the result is returned.
+        let result = self.connection.execute_batch(sql);
+        self.transactions
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        transactions.remove(&transaction_id);
-        let mut aborted = self
-            .aborted_transactions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        aborted.remove(&transaction_id);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&transaction_id);
+        result?;
         debug!(
             transaction_id = %transaction_id,
             operation = op_name,

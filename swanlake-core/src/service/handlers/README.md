@@ -40,7 +40,7 @@ CommandStatementUpdate / CommandPreparedStatementUpdate
 - Serves static SQL capability metadata via Flight's SqlInfo endpoints.
 
 ### Transaction Handlers (`transaction.rs`)
-- Starts and completes transactions (commit/rollback) for a session, tolerating autocommit no-ops.
+- Starts and completes transactions (commit/rollback) for a session. The session passes DuckDB errors through: it neither rolls a transaction back nor runs a statement a second time.
 
 ## Guarded loader execution
 

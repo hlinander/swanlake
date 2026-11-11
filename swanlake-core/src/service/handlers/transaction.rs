@@ -54,7 +54,7 @@ pub(crate) async fn do_action_end_transaction(
     let session_clone = session.clone();
     let txn_id_clone = transaction_id;
 
-    let commit_result = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         if action == 1 {
             session_clone.commit_transaction(txn_id_clone)
         } else {
@@ -63,34 +63,7 @@ pub(crate) async fn do_action_end_transaction(
     })
     .await
     .map_err(SwanFlightSqlService::status_from_join)?
-    .map_err(SwanFlightSqlService::status_from_error);
-
-    match commit_result {
-        Ok(()) => {}
-        Err(status) => {
-            if action == 1
-                && status
-                    .message()
-                    .contains("Cannot commit when autocommit is enabled")
-            {
-                info!(
-                    transaction_id = %transaction_id,
-                    "commit requested while autocommit enabled; treated as no-op"
-                );
-            } else if action != 1
-                && status
-                    .message()
-                    .contains("cannot rollback when autocommit is enabled")
-            {
-                info!(
-                    transaction_id = %transaction_id,
-                    "rollback requested while autocommit enabled; treated as no-op"
-                );
-            } else {
-                return Err(status);
-            }
-        }
-    }
+    .map_err(SwanFlightSqlService::status_from_error)?;
 
     let op = if action == 1 {
         "committed"

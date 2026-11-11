@@ -444,12 +444,6 @@ pub(crate) async fn do_action_list_schemas(
     Ok(Response::new(output_stream))
 }
 
-/// Airport's transaction identifier result
-#[derive(Debug, Serialize, Deserialize)]
-struct GetTransactionIdentifierResult {
-    identifier: Option<String>,
-}
-
 /// Airport's endpoint parameters
 #[derive(Debug, Deserialize, Default)]
 struct AirportEndpointParameters {
@@ -742,40 +736,6 @@ struct AirportGetFlightEndpointsRequest {
     /// Endpoint parameters
     #[serde(default)]
     parameters: AirportEndpointParameters,
-}
-
-/// Handle the "create_transaction" custom action from DuckDB Airport extension
-pub(crate) async fn do_action_create_transaction(
-    service: &SwanFlightSqlService,
-    request: Request<Action>,
-) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
-    let session = service.prepare_request(&request).await?;
-
-    info!("handling create_transaction action");
-
-    // Start a transaction in the session
-    let session_clone = session.clone();
-    let transaction_id = tokio::task::spawn_blocking(move || session_clone.begin_transaction())
-        .await
-        .map_err(SwanFlightSqlService::status_from_join)?
-        .map_err(SwanFlightSqlService::status_from_error)?;
-
-    info!(transaction_id = %transaction_id, "transaction started for Airport");
-
-    // Return the transaction identifier
-    let result_struct = GetTransactionIdentifierResult {
-        identifier: Some(transaction_id.to_string()),
-    };
-
-    let result_body = rmp_serde::to_vec_named(&result_struct)
-        .map_err(|e| Status::internal(format!("Failed to serialize transaction result: {}", e)))?;
-
-    let result = arrow_flight::Result {
-        body: result_body.into(),
-    };
-
-    let output_stream = Box::pin(stream::iter(vec![Ok(result)]));
-    Ok(Response::new(output_stream))
 }
 
 /// Handle the "catalog_version" action from DuckDB Airport extension

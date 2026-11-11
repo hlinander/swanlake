@@ -6,7 +6,7 @@ pub mod execute_query_commands;
 pub mod metadata_discovery;
 pub mod parameter_types;
 pub mod prepared_statements;
-pub mod transaction_recovery;
+pub mod transaction_abort;
 
 pub fn run_all(args: &CliArgs) -> Result<()> {
     parameter_types::run_parameter_types(args)?;
@@ -14,6 +14,6 @@ pub fn run_all(args: &CliArgs) -> Result<()> {
     prepared_statements::run_prepared_statements(args)?;
     appender_insert::run(args)?;
     metadata_discovery::run_metadata_discovery(args)?;
-    transaction_recovery::run_transaction_recovery(args)?;
+    transaction_abort::run_transaction_abort(args)?;
     Ok(())
 }

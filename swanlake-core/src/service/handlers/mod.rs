@@ -334,7 +334,6 @@ impl FlightSqlService for SwanFlightSqlService {
             "list_schemas" => action::do_action_list_schemas(self, request).await,
             "create_schema" => action::do_action_create_schema(self, request).await,
             "create_table" => action::do_action_create_table(self, request).await,
-            "create_transaction" => action::do_action_create_transaction(self, request).await,
             "catalog_version" => action::do_action_catalog_version(self, request).await,
             "endpoints" => action::do_action_endpoints(self, request).await,
             "execute" => action::do_action_execute(self, request).await,
