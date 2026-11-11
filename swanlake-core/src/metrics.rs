@@ -26,6 +26,9 @@ struct MetricsInner {
     total_slow_queries: AtomicU64,
     in_flight_queries: AtomicU64,
     in_flight_updates: AtomicU64,
+    usage_records_dropped_queue_full: AtomicU64,
+    usage_records_dropped_oversized: AtomicU64,
+    usage_records_dropped_refused: AtomicU64,
     query_latencies: RwLock<VecDeque<u64>>,
     update_latencies: RwLock<VecDeque<u64>>,
     slow_queries: RwLock<VecDeque<SlowQuery>>,
@@ -74,6 +77,25 @@ pub struct MetricsSnapshot {
     pub slow_query_groups: Vec<SlowQueryGroup>,
     pub recent_errors: Vec<ErrorEvent>,
     pub history_size: usize,
+    pub usage_records_dropped: UsageRecordsDroppedSnapshot,
+}
+
+/// Why a request's usage record was dropped before the duckvis API accepted it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsageRecordDrop {
+    /// The delivery queue could not hold the record within its byte bound.
+    QueueFull,
+    /// The serialized record passed its size bound without its breakdowns.
+    Oversized,
+    /// The duckvis API answered 400, 413, or 422.
+    Refused,
+}
+
+#[derive(Clone, Serialize)]
+pub struct UsageRecordsDroppedSnapshot {
+    pub queue_full: u64,
+    pub oversized: u64,
+    pub refused: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -156,6 +178,9 @@ impl Metrics {
                 total_slow_queries: AtomicU64::new(0),
                 in_flight_queries: AtomicU64::new(0),
                 in_flight_updates: AtomicU64::new(0),
+                usage_records_dropped_queue_full: AtomicU64::new(0),
+                usage_records_dropped_oversized: AtomicU64::new(0),
+                usage_records_dropped_refused: AtomicU64::new(0),
                 query_latencies: RwLock::new(VecDeque::with_capacity(history_size)),
                 update_latencies: RwLock::new(VecDeque::with_capacity(history_size)),
                 slow_queries: RwLock::new(VecDeque::with_capacity(history_size)),
@@ -196,6 +221,15 @@ impl Metrics {
 
     pub fn record_update_error(&self, sql: &str, duration: Duration, message: String) {
         self.record_update_result(sql, duration, None, Some(message));
+    }
+
+    pub fn record_usage_record_dropped(&self, reason: UsageRecordDrop) {
+        let counter = match reason {
+            UsageRecordDrop::QueueFull => &self.inner.usage_records_dropped_queue_full,
+            UsageRecordDrop::Oversized => &self.inner.usage_records_dropped_oversized,
+            UsageRecordDrop::Refused => &self.inner.usage_records_dropped_refused,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -262,6 +296,20 @@ impl Metrics {
             slow_query_groups,
             recent_errors,
             history_size: self.inner.history_size,
+            usage_records_dropped: UsageRecordsDroppedSnapshot {
+                queue_full: self
+                    .inner
+                    .usage_records_dropped_queue_full
+                    .load(Ordering::Relaxed),
+                oversized: self
+                    .inner
+                    .usage_records_dropped_oversized
+                    .load(Ordering::Relaxed),
+                refused: self
+                    .inner
+                    .usage_records_dropped_refused
+                    .load(Ordering::Relaxed),
+            },
         }
     }
 
@@ -621,6 +669,19 @@ mod tests {
         assert_eq!(snapshot.recent_errors.len(), 2);
         assert_eq!(snapshot.slow_queries.len(), 2);
         assert!(snapshot.slow_query_groups.len() <= 2);
+    }
+
+    #[test]
+    fn usage_record_drops_count_by_reason() {
+        let metrics = Metrics::new(100, 8);
+        metrics.record_usage_record_dropped(UsageRecordDrop::QueueFull);
+        metrics.record_usage_record_dropped(UsageRecordDrop::Refused);
+        metrics.record_usage_record_dropped(UsageRecordDrop::Refused);
+
+        let dropped = metrics.snapshot().usage_records_dropped;
+        assert_eq!(dropped.queue_full, 1);
+        assert_eq!(dropped.oversized, 0);
+        assert_eq!(dropped.refused, 2);
     }
 
     #[test]
