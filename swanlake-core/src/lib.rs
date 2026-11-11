@@ -21,3 +21,4 @@ pub mod service;
 pub mod session;
 pub mod sql;
 pub mod types;
+pub mod usage;
