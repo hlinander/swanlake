@@ -51,6 +51,8 @@ pub struct SwanFlightSqlService {
     flight_location: String,
     /// Duckvis-mode auth. `Some` enables the per-request auth gate.
     duckvis: Option<Arc<crate::duckvis::DuckvisAuth>>,
+    /// The process's usage-record queue. `Some` in duckvis mode.
+    usage_queue: Option<crate::usage::UsageQueue>,
 }
 
 impl SwanFlightSqlService {
@@ -77,7 +79,13 @@ impl SwanFlightSqlService {
             session_id_mode,
             flight_location,
             duckvis,
+            usage_queue: None,
         }
+    }
+
+    /// The queue a request's accounting pushes its record onto, if one is set.
+    pub fn usage_queue(&self) -> Option<&crate::usage::UsageQueue> {
+        self.usage_queue.as_ref()
     }
 
     /// The duckvis auth handle, if duckvis mode is enabled.
@@ -468,6 +476,12 @@ impl SwanFlightService {
         identity: crate::execution_identity::ExecutionIdentity,
     ) -> Self {
         self.inner.execution_identity = identity;
+        self
+    }
+
+    /// Sets the queue that request accountings push their records onto.
+    pub fn with_usage_queue(mut self, queue: Option<crate::usage::UsageQueue>) -> Self {
+        self.inner.usage_queue = queue;
         self
     }
 
