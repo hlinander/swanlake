@@ -212,6 +212,66 @@ impl DuckvisAuth {
         })
     }
 
+    /// `POST {api}/v1/usage/requests` with one serialized usage record as the
+    /// body, and return the response's status whatever it is. The body is
+    /// sent as given, so a resend carries identical bytes.
+    ///
+    /// Shares the SA token cache of [`Self::post_json_with_retry`]: a 401
+    /// re-mints the token once and sends again, and the second response's
+    /// status is the result. `Err(Unavailable)` is a failure to mint the
+    /// token or to send the request.
+    pub async fn post_usage_record(
+        &self,
+        record: bytes::Bytes,
+    ) -> Result<reqwest::StatusCode, DuckvisError> {
+        let url = format!("{}/v1/usage/requests", self.api_url.trim_end_matches('/'));
+        let token = sa::get_token(
+            &self.sa_token,
+            &self.client,
+            &self.api_url,
+            &self.client_id,
+            &self.issuer,
+            &self.signing_key,
+        )
+        .await?;
+
+        let status = self.send_usage_record(&url, record.clone(), &token).await?;
+        if status != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(status);
+        }
+
+        let fresh = sa::force_refresh(
+            &self.sa_token,
+            &self.client,
+            &self.api_url,
+            &self.client_id,
+            &self.issuer,
+            &self.signing_key,
+        )
+        .await?;
+        self.send_usage_record(&url, record, &fresh).await
+    }
+
+    async fn send_usage_record(
+        &self,
+        url: &str,
+        record: bytes::Bytes,
+        token: &str,
+    ) -> Result<reqwest::StatusCode, DuckvisError> {
+        self.client
+            .post(url)
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(record)
+            .send()
+            .await
+            .map(|resp| resp.status())
+            .map_err(|e| {
+                warn!(error = %e, "usage record send failed");
+                DuckvisError::Unavailable
+            })
+    }
+
     async fn send_json<B: Serialize>(
         &self,
         url: &str,
