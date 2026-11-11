@@ -84,6 +84,11 @@ async fn main() -> Result<()> {
         info!("duckvis mode enabled: authenticating all Flight requests");
     }
 
+    // Spawn usage-record delivery to the duckvis API
+    let usage_queue = duckvis
+        .as_ref()
+        .map(|auth| swanlake_core::usage::spawn_delivery(auth.clone(), &metrics));
+
     let flight_scheme = if config.tls_enabled() {
         "grpc+tls"
     } else {
@@ -100,7 +105,8 @@ async fn main() -> Result<()> {
         flight_location,
         duckvis,
     )
-    .with_execution_identity(execution_identity);
+    .with_execution_identity(execution_identity)
+    .with_usage_queue(usage_queue);
 
     status::spawn_status_server(&config, metrics, registry.clone())?;
 
