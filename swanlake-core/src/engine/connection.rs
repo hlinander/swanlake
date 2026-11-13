@@ -1238,7 +1238,14 @@ mod tests {
     }
 
     fn test_connection() -> DuckDbConnection {
-        let conn = Connection::open_in_memory().expect("failed to open in-memory db");
+        // As `EngineFactory` opens a connection: an extension set built
+        // from this engine's source carries no signature.
+        let config = duckdb::Config::default()
+            .enable_autoload_extension(true)
+            .and_then(|config| config.allow_unsigned_extensions())
+            .expect("connection config");
+        let conn =
+            Connection::open_in_memory_with_flags(config).expect("failed to open in-memory db");
         DuckDbConnection::new(conn)
     }
 
