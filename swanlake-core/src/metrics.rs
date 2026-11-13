@@ -29,6 +29,10 @@ struct MetricsInner {
     usage_records_dropped_queue_full: AtomicU64,
     usage_records_dropped_oversized: AtomicU64,
     usage_records_dropped_refused: AtomicU64,
+    usage_queue_bytes: AtomicU64,
+    /// Unix milliseconds at which the head record was queued; 0 when the
+    /// queue is empty.
+    usage_queue_head_queued_at_ms: AtomicU64,
     query_latencies: RwLock<VecDeque<u64>>,
     update_latencies: RwLock<VecDeque<u64>>,
     slow_queries: RwLock<VecDeque<SlowQuery>>,
@@ -78,6 +82,16 @@ pub struct MetricsSnapshot {
     pub recent_errors: Vec<ErrorEvent>,
     pub history_size: usize,
     pub usage_records_dropped: UsageRecordsDroppedSnapshot,
+    pub usage_queue: UsageQueueSnapshot,
+}
+
+/// The state of the usage-record delivery queue.
+#[derive(Clone, Serialize)]
+pub struct UsageQueueSnapshot {
+    /// Serialized record bytes the queue holds, the record being sent included.
+    pub bytes: u64,
+    /// Milliseconds since the head record was queued; 0 when the queue is empty.
+    pub head_age_ms: u64,
 }
 
 /// Why a request's usage record was dropped before the duckvis API accepted it.
@@ -87,7 +101,8 @@ pub enum UsageRecordDrop {
     QueueFull,
     /// The serialized record passed its size bound without its breakdowns.
     Oversized,
-    /// The duckvis API answered 400, 413, or 422.
+    /// The duckvis API answered 400, 413, or 422, or answered the record's
+    /// fifth 401 after a token re-mint or 403.
     Refused,
 }
 
@@ -181,6 +196,8 @@ impl Metrics {
                 usage_records_dropped_queue_full: AtomicU64::new(0),
                 usage_records_dropped_oversized: AtomicU64::new(0),
                 usage_records_dropped_refused: AtomicU64::new(0),
+                usage_queue_bytes: AtomicU64::new(0),
+                usage_queue_head_queued_at_ms: AtomicU64::new(0),
                 query_latencies: RwLock::new(VecDeque::with_capacity(history_size)),
                 update_latencies: RwLock::new(VecDeque::with_capacity(history_size)),
                 slow_queries: RwLock::new(VecDeque::with_capacity(history_size)),
@@ -230,6 +247,15 @@ impl Metrics {
             UsageRecordDrop::Refused => &self.inner.usage_records_dropped_refused,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records the usage-record queue's size and the Unix milliseconds at
+    /// which its head record was queued, `None` for an empty queue.
+    pub fn set_usage_queue(&self, bytes: u64, head_queued_at_ms: Option<u64>) {
+        self.inner.usage_queue_bytes.store(bytes, Ordering::Relaxed);
+        self.inner
+            .usage_queue_head_queued_at_ms
+            .store(head_queued_at_ms.unwrap_or(0), Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -309,6 +335,17 @@ impl Metrics {
                     .inner
                     .usage_records_dropped_refused
                     .load(Ordering::Relaxed),
+            },
+            usage_queue: UsageQueueSnapshot {
+                bytes: self.inner.usage_queue_bytes.load(Ordering::Relaxed),
+                head_age_ms: match self
+                    .inner
+                    .usage_queue_head_queued_at_ms
+                    .load(Ordering::Relaxed)
+                {
+                    0 => 0,
+                    queued_at_ms => now_millis().saturating_sub(queued_at_ms),
+                },
             },
         }
     }
@@ -585,7 +622,7 @@ fn infer_reasons(
     reasons
 }
 
-fn now_millis() -> u64 {
+pub(crate) fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
@@ -682,6 +719,26 @@ mod tests {
         assert_eq!(dropped.queue_full, 1);
         assert_eq!(dropped.oversized, 0);
         assert_eq!(dropped.refused, 2);
+    }
+
+    #[test]
+    fn usage_queue_snapshot_reports_bytes_and_head_age() {
+        let metrics = Metrics::new(100, 8);
+        let empty = metrics.snapshot().usage_queue;
+        assert_eq!((empty.bytes, empty.head_age_ms), (0, 0));
+
+        metrics.set_usage_queue(4_096, Some(now_millis() - 5_000));
+        let held = metrics.snapshot().usage_queue;
+        assert_eq!(held.bytes, 4_096);
+        assert!((5_000..60_000).contains(&held.head_age_ms));
+
+        // A head queued at a later clock reading than now reports no age.
+        metrics.set_usage_queue(1, Some(now_millis() + 60_000));
+        assert_eq!(metrics.snapshot().usage_queue.head_age_ms, 0);
+
+        metrics.set_usage_queue(0, None);
+        let drained = metrics.snapshot().usage_queue;
+        assert_eq!((drained.bytes, drained.head_age_ms), (0, 0));
     }
 
     #[test]
