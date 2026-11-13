@@ -189,8 +189,13 @@ fn lockdown_sql(
 ) -> String {
     let mut block = vec![
         "SET enable_profiling = 'no_output'".to_string(),
+        // The engine keeps a statement's profiling tree only where a plan
+        // node requires profiling, which is every node under this coverage.
+        "SET profiling_coverage = 'all'".to_string(),
         "SET custom_profiling_settings = \
-         '{\"OPERATOR_CPU_TIME\": \"true\", \"CPU_TIME_ACTUAL\": \"true\"}'"
+         '{\"OPERATOR_CPU_TIME\": \"true\", \"CPU_TIME_ACTUAL\": \"true\", \
+         \"OPERATOR_TIMING\": \"true\", \"OPERATOR_CARDINALITY\": \"true\", \
+         \"OPERATOR_BYTES_READ\": \"true\", \"OPERATOR_BYTES_WRITTEN\": \"true\"}'"
             .to_string(),
         "SET autoinstall_known_extensions = false".to_string(),
         "SET autoload_known_extensions = false".to_string(),
@@ -1740,6 +1745,70 @@ mod lockdown_tests {
         let record = record.expect("a record");
         assert_eq!(attempts(&record).len(), 1, "the existence probe alone");
         assert_eq!(record["entries"][0]["provenance"], "SWANLAKE");
+        Ok(())
+    }
+
+    /// The members C11 gives a breakdown node, checked on `node` and on
+    /// every node below it. Returns the number of nodes that name an
+    /// operator and the largest cardinality among them.
+    fn check_breakdown(node: &serde_json::Value) -> (usize, u64) {
+        assert!(node["operator_type"].is_string(), "{node}");
+        assert!(node["operator_name"].is_string(), "{node}");
+        assert!(node["operator_cpu_time"].as_f64().is_some_and(|v| v >= 0.0), "{node}");
+        assert!(node["operator_timing"].as_f64().is_some_and(|v| v >= 0.0), "{node}");
+        let cardinality = node["operator_cardinality"].as_u64().expect("cardinality");
+        assert!(node["operator_bytes_read"].is_u64(), "{node}");
+        assert!(node["operator_bytes_written"].is_u64(), "{node}");
+        let named = !node["operator_type"].as_str().unwrap_or_default().is_empty();
+        let mut operators = usize::from(named);
+        let mut largest = if named { cardinality } else { 0 };
+        for child in node["children"].as_array().expect("children") {
+            let (below, cardinality) = check_breakdown(child);
+            operators += below;
+            largest = largest.max(cardinality);
+        }
+        (operators, largest)
+    }
+
+    /// The lockdown block makes the engine keep the tree of every
+    /// statement and enables the operator metrics, so the breakdown of a
+    /// locked session's client statement holds its operators.
+    #[test]
+    fn a_locked_session_reports_operator_nodes() -> Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let session = locked_session(false, scratch.path())?;
+        assert_eq!(raw_setting(&session.connection, "profiling_coverage")?.to_lowercase(), "all");
+
+        let (result, record) = record_of(|accounting| {
+            session.execute_query(
+                "SELECT sum(sin(i::DOUBLE)) AS total FROM range(200000) t(i)",
+                Some(accounting),
+            )
+        });
+        result.map_err(|e| anyhow!("{e}"))?;
+        let record = record.expect("a record");
+        let entry = record["entries"]
+            .as_array()
+            .and_then(|entries| entries.last())
+            .ok_or_else(|| anyhow!("no entry"))?;
+        assert_eq!(entry["provenance"], "CLIENT");
+        let (operators, largest) = check_breakdown(&entry["breakdown"]);
+        assert!(operators >= 2, "the tree names its operators: {entry}");
+        assert_eq!(largest, 200_000, "the range scan's cardinality: {entry}");
+
+        // A statement outside the default coverage keeps its tree as well.
+        let (result, record) = record_of(|accounting| {
+            session.execute_statement(
+                "CREATE TABLE covered AS SELECT i FROM range(1000) t(i)",
+                Some(accounting),
+            )
+        });
+        result.map_err(|e| anyhow!("{e}"))?;
+        let record = record.expect("a record");
+        let entry = &record["entries"][0];
+        assert_eq!(entry["provenance"], "CLIENT");
+        let (operators, _) = check_breakdown(&entry["breakdown"]);
+        assert!(operators >= 1, "a CREATE TABLE AS keeps its tree: {entry}");
         Ok(())
     }
 }
