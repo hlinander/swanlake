@@ -422,15 +422,9 @@ impl DuckDbConnection {
         self.execute_statement_with_telemetry(sql, None, None, accounting)
     }
 
-    /// Runs a client block through `duckdb_query`.
-    ///
-    /// NOT MEASURED (duckvis#815, C7): the plan runs this route under label 1
-    /// through `measure_block`, whose step 4 prepares the block's last
-    /// statement and passes it to the closure, and it also has the closure
-    /// run that statement through the execute-and-discard call, which takes
-    /// an index that preparing has already consumed. The two cannot both
-    /// hold, so the block runs under the guard as before, in no bracket, and
-    /// produces no entry.
+    /// Runs a client block whose every result is discarded, under label 1
+    /// with one attempt for each statement. A block that holds no statement
+    /// succeeds.
     pub fn execute_statement_with_telemetry(
         &self,
         sql: &str,
@@ -438,8 +432,8 @@ impl DuckDbConnection {
         cancellation: Option<&RequestCancellation>,
         accounting: Option<&RequestAccounting>,
     ) -> Result<i64, ServerError> {
-        self.run_block(sql, execution, cancellation, accounting, |conn, _| {
-            conn.execute_batch(sql).map_err(ServerError::from)
+        self.run_block(sql, execution, cancellation, accounting, |_, bracket| {
+            bracket.measure_batch(sql)
         })
     }
 
@@ -901,6 +895,28 @@ impl<'a> Bracket<'a> {
         // open on it are released before the closing read.
         let mut stmt = statements.prepare(last)?;
         f(&mut stmt)
+    }
+
+    /// Runs the block `sql` under label 1 and discards every result, one
+    /// attempt for each statement, each with its breakdown.
+    ///
+    /// No statement is prepared, so none passes through the VARIANT
+    /// result-column checks. Extraction parses the whole block before any
+    /// statement runs and belongs to the first attempt. A statement that
+    /// fails ends the block with its error. A block that holds no statement
+    /// makes one attempt and succeeds.
+    pub(crate) fn measure_batch(&self, sql: &str) -> Result<(), ServerError> {
+        let mut attempt = self.open(ExecutionLabel::Client, true);
+        let mut statements = self.conn.extract(sql)?;
+        let Some(last) = statements.len().checked_sub(1) else {
+            return Ok(());
+        };
+        for index in 0..last {
+            statements.execute_and_discard(index)?;
+            attempt.next();
+        }
+        statements.execute_and_discard(last)?;
+        Ok(())
     }
 
     /// Disarms the request's cancellation ahead of the guard's release.
@@ -1853,6 +1869,138 @@ mod tests {
             assert_eq!(error.to_string(), expected.to_string(), "{sql:?}");
             assert_eq!(attempts(&record.unwrap()), [client(false)], "{sql:?}");
         }
+    }
+
+    // The route that discards every result (`measure_batch`).
+
+    fn run_batch(
+        conn: &DuckDbConnection,
+        sql: &str,
+        accounting: &RequestAccounting,
+    ) -> Result<i64, ServerError> {
+        conn.execute_statement_with_telemetry(sql, None, None, Some(accounting))
+    }
+
+    /// A block on the discarding route makes one label-1 attempt for each
+    /// statement, each with its breakdown, and no probe.
+    #[test]
+    fn a_batch_records_one_entry_for_each_statement() {
+        let conn = test_connection();
+        conn.execute_batch(
+            "SET enable_profiling = 'no_output'",
+            ExecutionLabel::SwanLake,
+            None,
+        )
+        .unwrap();
+        let (result, record) = record_of(|accounting| {
+            run_batch(
+                &conn,
+                "CREATE TABLE batch (i INTEGER); INSERT INTO batch VALUES (1), (2); \
+                 INSERT INTO batch SELECT i FROM range(10) t(i)",
+                accounting,
+            )
+        });
+        result.unwrap();
+        let record = record.unwrap();
+        assert_eq!(
+            attempts(&record),
+            [client(false), client(false), client(false)]
+        );
+        assert_eq!(row_count(&conn, "batch"), 12, "each statement ran once");
+        let last = &record["entries"][2];
+        assert!(
+            last["breakdown"].is_object(),
+            "an attempt of the batch carries its tree: {last}"
+        );
+
+        let (result, record) =
+            record_of(|accounting| run_batch(&conn, "DROP TABLE batch", accounting));
+        result.unwrap();
+        assert_eq!(attempts(&record.unwrap()), [client(false)]);
+    }
+
+    /// The discarding route prepares no statement, so a statement with a
+    /// VARIANT result column succeeds there, last in the block or not, as it
+    /// does through `duckdb_query`.
+    #[test]
+    fn a_batch_runs_a_variant_result_statement() {
+        let conn = test_connection();
+        for sql in [
+            "SELECT 42::VARIANT AS v",
+            "SELECT 42::VARIANT AS v; SELECT 'x'::VARIANT AS w",
+        ] {
+            conn.with_raw(|raw| raw.execute_batch(sql))
+                .expect("duckdb_query accepts the block");
+            let (result, record) = record_of(|accounting| run_batch(&conn, sql, accounting));
+            result.unwrap_or_else(|error| panic!("{sql:?} failed: {error}"));
+            let record = record.unwrap();
+            assert!(
+                attempts(&record).iter().all(|attempt| *attempt == client(false)),
+                "{sql:?}: {record}"
+            );
+        }
+    }
+
+    /// A parse error in a later statement of a batch keeps the first from
+    /// running, and the one attempt covers the parse.
+    #[test]
+    fn a_batch_parse_error_runs_no_statement() {
+        let conn = test_connection();
+        let (result, record) = record_of(|accounting| {
+            run_batch(&conn, "CREATE TABLE unparsed_batch (i INTEGER); SELEC 1", accounting)
+        });
+        let Err(ServerError::DuckDb(duckdb::Error::DuckDBFailure(failure, _))) = result else {
+            panic!("expected the parse failure, got {result:?}");
+        };
+        assert_eq!(failure.error_type, ffi::duckdb_error_type_DUCKDB_ERROR_PARSER);
+        assert_eq!(attempts(&record.unwrap()), [client(false)]);
+        assert_eq!(
+            row_count(&conn, "unparsed_batch"),
+            usize::MAX,
+            "the first statement did not run"
+        );
+    }
+
+    /// A block that holds no statement succeeds on the discarding route, as
+    /// `duckdb_query` does, and makes one attempt.
+    #[test]
+    fn an_empty_batch_succeeds() {
+        let conn = test_connection();
+        for sql in ["", "   ", ";", "-- a comment"] {
+            conn.with_raw(|raw| raw.execute_batch(sql))
+                .expect("duckdb_query accepts an empty block");
+            let (result, record) = record_of(|accounting| run_batch(&conn, sql, accounting));
+            assert_eq!(result.unwrap(), 0, "{sql:?}");
+            assert_eq!(attempts(&record.unwrap()), [client(false)], "{sql:?}");
+        }
+    }
+
+    /// A statement that fails ends a batch: its attempt is the last entry,
+    /// no later statement runs, and the failure carries the engine's type.
+    #[test]
+    fn a_failing_batch_statement_records_its_entry_and_ends_the_block() {
+        let conn = test_connection();
+        let (result, record) = record_of(|accounting| {
+            run_batch(
+                &conn,
+                "CREATE TABLE failing_batch (i INTEGER PRIMARY KEY); \
+                 INSERT INTO failing_batch VALUES (1); INSERT INTO failing_batch VALUES (1); \
+                 INSERT INTO failing_batch VALUES (2)",
+                accounting,
+            )
+        });
+        let Err(ServerError::DuckDb(duckdb::Error::DuckDBFailure(failure, _))) = result else {
+            panic!("expected the constraint failure, got {result:?}");
+        };
+        assert_eq!(
+            failure.error_type,
+            ffi::duckdb_error_type_DUCKDB_ERROR_CONSTRAINT
+        );
+        assert_eq!(
+            attempts(&record.unwrap()),
+            [client(false), client(false), client(false)]
+        );
+        assert_eq!(row_count(&conn, "failing_batch"), 1);
     }
 
     /// A stream the consumer leaves unread leaves its execution open, and
