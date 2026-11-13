@@ -50,14 +50,24 @@ pub enum ExecutionLabel {
 pub struct BreakdownNode {
     pub operator_type: String,
     pub operator_name: String,
-    /// `OPERATOR_CPU_TIME`, in seconds.
+    /// `OPERATOR_CPU_TIME`, in seconds. A time that is not finite
+    /// serializes as 0.
+    #[serde(serialize_with = "finite_or_zero")]
     pub operator_cpu_time: f64,
-    /// `OPERATOR_TIMING`, in seconds.
+    /// `OPERATOR_TIMING`, in seconds. A time that is not finite serializes
+    /// as 0.
+    #[serde(serialize_with = "finite_or_zero")]
     pub operator_timing: f64,
     pub operator_cardinality: u64,
     pub operator_bytes_read: u64,
     pub operator_bytes_written: u64,
     pub children: Vec<BreakdownNode>,
+}
+
+/// Serializes a breakdown time, with 0 in place of a NaN or an infinity,
+/// which JSON cannot carry as a number.
+fn finite_or_zero<S: serde::Serializer>(seconds: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_f64(if seconds.is_finite() { *seconds } else { 0.0 })
 }
 
 /// The figures of one attempt.
