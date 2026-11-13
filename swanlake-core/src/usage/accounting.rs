@@ -64,6 +64,21 @@ pub struct BreakdownNode {
     pub children: Vec<BreakdownNode>,
 }
 
+impl BreakdownNode {
+    /// Whether the tree has more than `levels` levels, its root being the
+    /// first.
+    fn is_deeper_than(&self, levels: usize) -> bool {
+        let mut unvisited = vec![(self, 1_usize)];
+        while let Some((node, level)) = unvisited.pop() {
+            if level > levels {
+                return true;
+            }
+            unvisited.extend(node.children.iter().map(|child| (child, level + 1)));
+        }
+        false
+    }
+}
+
 /// Serializes a breakdown time, with 0 in place of a NaN or an infinity,
 /// which JSON cannot carry as a number.
 fn finite_or_zero<S: serde::Serializer>(seconds: &f64, serializer: S) -> Result<S::Ok, S::Error> {
@@ -190,10 +205,40 @@ struct Destination {
     queue: UsageQueue,
 }
 
+/// The bounds on what a request's accounting stores while the request runs.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    /// Most levels a stored breakdown has.
+    breakdown_levels: usize,
+    /// Largest size of the stored entries at which an entry keeps its
+    /// breakdown.
+    entries_bytes_with_breakdown: usize,
+    /// Largest size of the stored entries.
+    entries_bytes: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            breakdown_levels: record::MAX_BREAKDOWN_LEVELS,
+            entries_bytes_with_breakdown: record::MAX_ENTRIES_BYTES_WITH_BREAKDOWN,
+            entries_bytes: record::MAX_ENTRIES_BYTES,
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     next_attempt_id: u64,
     entries: Vec<Entry>,
+    /// The serialized size of `entries`, as an estimate: each entry's JSON
+    /// and one separator.
+    entries_bytes: usize,
+    /// Set when an entry was stored without the breakdown its attempt had.
+    breakdown_omitted: bool,
+    /// Set when an entry would have taken `entries` past its bound. No entry
+    /// is stored from then on, and the request produces no record.
+    overflowed: bool,
     sql: Option<SqlText>,
     error_type: Option<&'static str>,
 }
@@ -204,10 +249,18 @@ struct State {
 /// it serializes the request's record and pushes it onto the queue. A request
 /// with no entry, a session without duckvis authentication, and a process
 /// without a queue produce no record.
+///
+/// A request can run any number of statements, so the accounting bounds what
+/// it stores: an entry loses its breakdown when the breakdown is deeper than
+/// [`record::MAX_BREAKDOWN_LEVELS`] or would take the entries past
+/// [`record::MAX_ENTRIES_BYTES_WITH_BREAKDOWN`], and no entry is stored once
+/// one would take them past [`record::MAX_ENTRIES_BYTES`]. Such a request's
+/// record is discarded when the request ends and counted as oversized.
 pub struct RequestAccounting {
     request_id: Uuid,
     endpoint: String,
     destination: Option<Destination>,
+    limits: Limits,
     state: Mutex<State>,
     progress: Progress,
 }
@@ -236,9 +289,16 @@ impl RequestAccounting {
             request_id: Uuid::now_v7(),
             endpoint: endpoint.into(),
             destination,
+            limits: Limits::default(),
             state: Mutex::new(State::default()),
             progress: Progress::default(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
     }
 
     pub fn request_id(&self) -> Uuid {
@@ -281,6 +341,10 @@ impl RequestAccounting {
     /// two reads, and returns the `attempt_id` it assigns. Attempt ids count
     /// from 0 in the order of the calls. A label-1 attempt enters the
     /// progress figures and is no longer the open attempt.
+    ///
+    /// The entry is stored within the bounds the type describes. An attempt
+    /// whose entry is not stored still receives its `attempt_id` and still
+    /// enters the progress figures.
     pub fn push_entry(
         &self,
         label: ExecutionLabel,
@@ -289,6 +353,19 @@ impl RequestAccounting {
         abandoned: bool,
         breakdown: Option<BreakdownNode>,
     ) -> u64 {
+        // The breakdown is measured outside the lock.
+        let mut breakdown = breakdown.filter(|_| self.destination.is_some());
+        let mut breakdown_omitted = false;
+        let mut breakdown_bytes = 0;
+        if let Some(root) = &breakdown {
+            if root.is_deeper_than(self.limits.breakdown_levels) {
+                breakdown = None;
+                breakdown_omitted = true;
+            } else {
+                breakdown_bytes = record::BREAKDOWN_MEMBER_BYTES + record::serialized_len(root);
+            }
+        }
+
         let mut state = self.state();
         let attempt_id = state.next_attempt_id;
         state.next_attempt_id += 1;
@@ -302,10 +379,35 @@ impl RequestAccounting {
             progress.closed_peak_bytes = progress.closed_peak_bytes.max(closing.memory_peak_bytes);
             progress.open = None;
         }
-        if self.destination.is_some() {
-            state.entries.push(Entry::from_reads(
-                attempt_id, label, opening, closing, abandoned, breakdown,
-            ));
+        if self.destination.is_some() && !state.overflowed {
+            let mut entry = Entry::from_reads(attempt_id, label, opening, closing, abandoned, None);
+            // The entry and the separator ahead of the next one.
+            let bare_bytes = record::serialized_len(&entry) + 1;
+            let with_breakdown = state
+                .entries_bytes
+                .saturating_add(bare_bytes)
+                .saturating_add(breakdown_bytes);
+            if breakdown.is_some() && with_breakdown > self.limits.entries_bytes_with_breakdown {
+                breakdown = None;
+                breakdown_omitted = true;
+                breakdown_bytes = 0;
+            }
+            let entries_bytes = state
+                .entries_bytes
+                .saturating_add(bare_bytes)
+                .saturating_add(breakdown_bytes);
+            if entries_bytes > self.limits.entries_bytes {
+                // The record is discarded when the request ends, so the
+                // entries stored so far are released here.
+                state.overflowed = true;
+                state.entries = Vec::new();
+                state.entries_bytes = 0;
+            } else {
+                entry.breakdown = breakdown;
+                state.entries.push(entry);
+                state.entries_bytes = entries_bytes;
+                state.breakdown_omitted |= breakdown_omitted;
+            }
         }
         attempt_id
     }
@@ -333,6 +435,10 @@ impl Drop for RequestAccounting {
                 .get_mut()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
+        if state.overflowed {
+            destination.queue.accept(record::Serialized::Oversized);
+            return;
+        }
         if state.entries.is_empty() {
             return;
         }
@@ -345,6 +451,7 @@ impl Drop for RequestAccounting {
             sql: &sql,
             ended_at: chrono::Utc::now(),
             error_type: state.error_type,
+            breakdown_omitted: state.breakdown_omitted,
             entries: state.entries,
         }));
     }
@@ -777,10 +884,256 @@ mod tests {
             );
         }
 
+        // The entries stored before the bound was passed are released.
+        {
+            let state = accounting.state();
+            assert!(state.overflowed);
+            assert!(state.entries.is_empty());
+        }
+
         drop(accounting);
 
         assert!(queued(&queue).is_empty());
         assert_eq!(metrics.snapshot().usage_records_dropped.oversized, 1);
+    }
+
+    fn node(children: Vec<BreakdownNode>) -> BreakdownNode {
+        BreakdownNode {
+            operator_type: "PROJECTION".to_owned(),
+            operator_name: "node".to_owned(),
+            operator_cpu_time: 0.25,
+            operator_timing: 0.5,
+            operator_cardinality: 7,
+            operator_bytes_read: 8,
+            operator_bytes_written: 9,
+            children,
+        }
+    }
+
+    /// A breakdown of `levels` levels with one node at each.
+    fn chain(levels: usize) -> BreakdownNode {
+        (1..levels).fold(node(vec![]), |below, _| node(vec![below]))
+    }
+
+    /// A breakdown of two levels with `leaves` nodes at the second.
+    fn wide(leaves: usize) -> BreakdownNode {
+        node((0..leaves).map(|_| node(vec![])).collect())
+    }
+
+    fn levels_of(breakdown: &Value) -> usize {
+        1 + breakdown["children"]
+            .as_array()
+            .expect("children")
+            .iter()
+            .map(levels_of)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn push(accounting: &RequestAccounting, breakdown: Option<BreakdownNode>) -> u64 {
+        accounting.push_entry(
+            ExecutionLabel::Client,
+            &totals(0, 0),
+            &totals(1_000_000_000, 1),
+            false,
+            breakdown,
+        )
+    }
+
+    /// The bytes the accounting counts for the entry `push` stores under a
+    /// one-digit attempt id.
+    fn counted_bytes(breakdown: Option<&BreakdownNode>) -> usize {
+        let bare = Entry::from_reads(
+            0,
+            ExecutionLabel::Client,
+            &totals(0, 0),
+            &totals(1_000_000_000, 1),
+            false,
+            None,
+        );
+        record::serialized_len(&bare)
+            + 1
+            + breakdown.map_or(0, |root| {
+                record::BREAKDOWN_MEMBER_BYTES + record::serialized_len(root)
+            })
+    }
+
+    #[test]
+    fn the_accounting_stores_within_the_specified_bounds() {
+        let limits = RequestAccounting::new("DoGet", None, None).limits;
+
+        assert_eq!(limits.breakdown_levels, 48);
+        assert_eq!(limits.entries_bytes_with_breakdown, 2_097_152);
+        assert_eq!(limits.entries_bytes, 4_194_304);
+    }
+
+    #[test]
+    fn depth_counts_the_root_as_the_first_level() {
+        assert!(!node(vec![]).is_deeper_than(1));
+        assert!(node(vec![]).is_deeper_than(0));
+        assert!(!chain(48).is_deeper_than(48));
+        assert!(chain(49).is_deeper_than(48));
+        // The deepest branch decides.
+        let uneven = node(vec![chain(2), chain(5), chain(1)]);
+        assert!(!uneven.is_deeper_than(6));
+        assert!(uneven.is_deeper_than(5));
+    }
+
+    #[test]
+    fn a_breakdown_of_48_levels_is_stored() {
+        let (queue, _metrics) = queue();
+        let accounting = RequestAccounting::new("DoGet", Some(&auth()), Some(queue.clone()));
+        push(&accounting, Some(chain(48)));
+
+        drop(accounting);
+
+        // `queued` parses with the nesting limit of 128 the API's parser has.
+        let records = queued(&queue);
+        assert_eq!(records[0]["breakdown_omitted"], json!(false));
+        assert_eq!(levels_of(&records[0]["entries"][0]["breakdown"]), 48);
+    }
+
+    #[test]
+    fn a_breakdown_deeper_than_48_levels_is_omitted() {
+        let (queue, metrics) = queue();
+        let accounting = RequestAccounting::new("DoGet", Some(&auth()), Some(queue.clone()));
+        push(&accounting, Some(chain(48)));
+        push(&accounting, Some(chain(49)));
+        push(&accounting, Some(chain(2)));
+
+        drop(accounting);
+
+        let records = queued(&queue);
+        assert_eq!(records[0]["breakdown_omitted"], json!(true));
+        let entries = records[0]["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(levels_of(&entries[0]["breakdown"]), 48);
+        // The entry keeps its figures.
+        assert!(entries[1].get("breakdown").is_none());
+        assert_eq!(entries[1]["attempt_id"], json!(1));
+        assert_eq!(entries[1]["cpu_seconds"], json!(1.0));
+        assert_eq!(levels_of(&entries[2]["breakdown"]), 2);
+        assert_eq!(metrics.snapshot().usage_records_dropped.oversized, 0);
+    }
+
+    #[test]
+    fn a_breakdown_that_takes_the_entries_past_their_bound_is_omitted() {
+        let large = wide(20);
+        let small = node(vec![]);
+        let with_large = counted_bytes(Some(&large));
+        // Without the large breakdown, a later entry and its small one fit.
+        assert!(counted_bytes(None) + counted_bytes(Some(&small)) < with_large);
+
+        for (bound, large_is_kept) in [(with_large, true), (with_large - 1, false)] {
+            let (queue, _metrics) = queue();
+            let accounting = RequestAccounting::new("DoGet", Some(&auth()), Some(queue.clone()))
+                .with_limits(Limits {
+                    entries_bytes_with_breakdown: bound,
+                    ..Limits::default()
+                });
+            push(&accounting, Some(large.clone()));
+            push(&accounting, Some(small.clone()));
+
+            drop(accounting);
+
+            let records = queued(&queue);
+            let entries = records[0]["entries"].as_array().expect("entries");
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].get("breakdown").is_some(), large_is_kept);
+            assert_eq!(entries[0]["cpu_seconds"], json!(1.0));
+            // Each entry is tested by itself: the small breakdown is stored
+            // where it fits, and omitted where the large one took the room.
+            assert_eq!(entries[1].get("breakdown").is_some(), !large_is_kept);
+            assert_eq!(records[0]["breakdown_omitted"], json!(true));
+        }
+    }
+
+    #[test]
+    fn breakdowns_are_stored_up_to_2_097_152_bytes_of_entries() {
+        let (queue, metrics) = queue();
+        let accounting = RequestAccounting::new("DoGet", Some(&auth()), Some(queue.clone()));
+        let breakdown = wide(2_000);
+        // Attempt ids 0 to 9 keep every entry the same size.
+        let each = counted_bytes(Some(&breakdown));
+        let fitting = 2_097_152 / each;
+        assert!((2..10).contains(&fitting));
+        for _ in 0..10 {
+            push(&accounting, Some(breakdown.clone()));
+        }
+
+        drop(accounting);
+
+        let records = queued(&queue);
+        assert_eq!(records[0]["breakdown_omitted"], json!(true));
+        let kept = records[0]["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .map(|entry| entry.get("breakdown").is_some())
+            .collect::<Vec<_>>();
+        let expected = (0..10).map(|index| index < fitting).collect::<Vec<_>>();
+        assert_eq!(kept, expected);
+        assert_eq!(metrics.snapshot().usage_records_dropped.oversized, 0);
+    }
+
+    #[test]
+    fn an_entry_that_takes_the_entries_past_their_bound_ends_storage() {
+        let limits = Limits {
+            entries_bytes: 3 * counted_bytes(None),
+            ..Limits::default()
+        };
+
+        // Three entries take the entries to the bound, and are stored.
+        let (stored_queue, stored_metrics) = queue();
+        let accounting = RequestAccounting::new("DoPut", Some(&auth()), Some(stored_queue.clone()))
+            .with_limits(limits);
+        for _ in 0..3 {
+            push(&accounting, None);
+        }
+        drop(accounting);
+        let records = queued(&stored_queue);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["entries"].as_array().expect("entries").len(), 3);
+        assert_eq!(stored_metrics.snapshot().usage_records_dropped.oversized, 0);
+
+        // A fourth passes it. Neither it nor a later entry is stored, and
+        // the request's record is discarded and counted.
+        let (queue, metrics) = queue();
+        let accounting =
+            RequestAccounting::new("DoPut", Some(&auth()), Some(queue.clone())).with_limits(limits);
+        let ids = (0..6).map(|_| push(&accounting, None)).collect::<Vec<_>>();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4, 5]);
+        assert!(accounting.state().entries.is_empty());
+        // The progress figures cover every attempt.
+        assert_eq!(accounting.progress().figures().closed_cpu_ns, 6_000_000_000);
+        assert_eq!(metrics.snapshot().usage_records_dropped.oversized, 0);
+
+        drop(accounting);
+
+        assert!(queued(&queue).is_empty());
+        let drops = metrics.snapshot().usage_records_dropped;
+        assert_eq!(
+            (drops.queue_full, drops.oversized, drops.refused),
+            (0, 1, 0)
+        );
+    }
+
+    #[test]
+    fn the_running_size_estimates_the_serialized_entries() {
+        let (queue, _metrics) = queue();
+        let accounting = RequestAccounting::new("DoGet", Some(&auth()), Some(queue.clone()));
+        push(&accounting, Some(wide(3)));
+        push(&accounting, None);
+        push(&accounting, Some(chain(49)));
+        push(&accounting, Some(chain(4)));
+
+        let state = accounting.state();
+        // The estimate counts a separator after every entry, and the array
+        // has one fewer and two brackets.
+        assert_eq!(
+            state.entries_bytes + 1,
+            serde_json::to_vec(&state.entries).expect("JSON").len()
+        );
     }
 
     #[test]

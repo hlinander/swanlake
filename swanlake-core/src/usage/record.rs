@@ -15,6 +15,41 @@ pub const MAX_SQL_BYTES: usize = 65_536;
 /// audit field that holds the record in the duckvis API.
 pub const MAX_RECORD_BYTES: usize = 4_194_304;
 
+/// Most levels a stored breakdown has, its root being the first. A level
+/// serializes as an object inside an array, and the duckvis API's JSON
+/// parser refuses a body nested deeper than 128.
+pub const MAX_BREAKDOWN_LEVELS: usize = 48;
+
+/// Largest serialized size of a request's entries, in bytes, at which an
+/// entry is still stored with its breakdown.
+pub const MAX_ENTRIES_BYTES_WITH_BREAKDOWN: usize = 2_097_152;
+
+/// Largest serialized size of the entries a request stores, in bytes.
+pub const MAX_ENTRIES_BYTES: usize = MAX_RECORD_BYTES;
+
+/// The bytes an entry's serialized form gains from the name of its
+/// `breakdown` member, ahead of the breakdown's own bytes.
+pub(super) const BREAKDOWN_MEMBER_BYTES: usize = r#","breakdown":"#.len();
+
+/// The number of bytes `value` serializes to as JSON.
+pub(super) fn serialized_len<T: Serialize>(value: &T) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    // The writer never fails, and the values measured here hold no map
+    // with a key that is not a string.
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
+}
+
 /// What a record carries of the SQL text a client sent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct SqlText {
@@ -164,6 +199,8 @@ pub(super) struct RecordParts<'a> {
     pub(super) sql: &'a SqlText,
     pub(super) ended_at: chrono::DateTime<chrono::Utc>,
     pub(super) error_type: Option<&'static str>,
+    /// Set when an entry was stored without the breakdown its attempt had.
+    pub(super) breakdown_omitted: bool,
     pub(super) entries: Vec<Entry>,
 }
 
@@ -194,13 +231,15 @@ pub(super) enum Serialized {
 }
 
 /// Serializes a record once. A record that passes [`MAX_RECORD_BYTES`] drops
-/// every breakdown and sets `breakdown_omitted`.
+/// every breakdown and sets `breakdown_omitted`. The request accounting
+/// bounds the entries it stores by an estimate, and this is the test on the
+/// serialized record itself.
 pub(super) fn serialize(parts: RecordParts<'_>) -> Serialized {
     serialize_within(parts, MAX_RECORD_BYTES)
 }
 
 fn serialize_within(mut parts: RecordParts<'_>, max_bytes: usize) -> Serialized {
-    let full = to_json(&parts, false);
+    let full = to_json(&parts, parts.breakdown_omitted);
     if full.len() <= max_bytes {
         return Serialized::Record(full.into());
     }
@@ -284,6 +323,7 @@ mod tests {
             ended_at: chrono::DateTime::from_timestamp(1_700_000_000, 123_456_789)
                 .expect("valid timestamp"),
             error_type: None,
+            breakdown_omitted: false,
             entries,
         }
     }
@@ -600,6 +640,48 @@ mod tests {
             serialize_within(parts(&sql, entries), without_breakdowns - 1),
             Serialized::Oversized
         );
+    }
+
+    #[test]
+    fn a_record_within_the_bound_keeps_the_flag_its_accounting_set() {
+        let sql = SqlText::default();
+        let mut record_parts = parts(
+            &sql,
+            vec![entry(0, None), entry(1, Some(node("kept", vec![])))],
+        );
+        record_parts.breakdown_omitted = true;
+
+        let record = parse(serialize(record_parts));
+
+        assert_eq!(record["breakdown_omitted"], json!(true));
+        assert!(record["entries"][0].get("breakdown").is_none());
+        assert!(record["entries"][1].get("breakdown").is_some());
+    }
+
+    #[test]
+    fn serialized_len_is_the_length_of_the_json() {
+        let with_breakdown = entry(7, Some(node("root", vec![node("leaf", vec![])])));
+        let bare = entry(7, None);
+        let breakdown = with_breakdown.breakdown.clone().expect("breakdown");
+
+        assert_eq!(
+            serialized_len(&with_breakdown),
+            serde_json::to_vec(&with_breakdown).expect("JSON").len()
+        );
+        // An entry's size is its size without the breakdown, the member's
+        // name, and the breakdown.
+        assert_eq!(
+            serialized_len(&with_breakdown),
+            serialized_len(&bare) + BREAKDOWN_MEMBER_BYTES + serialized_len(&breakdown)
+        );
+    }
+
+    #[test]
+    fn the_bounds_are_the_specified_ones() {
+        assert_eq!(MAX_RECORD_BYTES, 4_194_304);
+        assert_eq!(MAX_BREAKDOWN_LEVELS, 48);
+        assert_eq!(MAX_ENTRIES_BYTES_WITH_BREAKDOWN, 2_097_152);
+        assert_eq!(MAX_ENTRIES_BYTES, 4_194_304);
     }
 
     #[test]

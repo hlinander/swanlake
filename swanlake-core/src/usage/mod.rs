@@ -20,4 +20,7 @@ pub use accounting::{
     ResourceTotals, UsageTotals,
 };
 pub use queue::{spawn_delivery, UsageQueue, MAX_QUEUE_BYTES};
-pub use record::{MAX_RECORD_BYTES, MAX_SQL_BYTES};
+pub use record::{
+    MAX_BREAKDOWN_LEVELS, MAX_ENTRIES_BYTES, MAX_ENTRIES_BYTES_WITH_BREAKDOWN, MAX_RECORD_BYTES,
+    MAX_SQL_BYTES,
+};
