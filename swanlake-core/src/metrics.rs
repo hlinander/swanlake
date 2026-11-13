@@ -29,10 +29,7 @@ struct MetricsInner {
     usage_records_dropped_queue_full: AtomicU64,
     usage_records_dropped_oversized: AtomicU64,
     usage_records_dropped_refused: AtomicU64,
-    usage_queue_bytes: AtomicU64,
-    /// Unix milliseconds at which the head record was queued; 0 when the
-    /// queue is empty.
-    usage_queue_head_queued_at_ms: AtomicU64,
+    usage_queue: RwLock<UsageQueueState>,
     query_latencies: RwLock<VecDeque<u64>>,
     update_latencies: RwLock<VecDeque<u64>>,
     slow_queries: RwLock<VecDeque<SlowQuery>>,
@@ -56,6 +53,14 @@ pub struct ErrorEvent {
     pub message: String,
     pub sql: Option<String>,
     pub context: String,
+}
+
+/// What the usage-record queue last reported of itself.
+#[derive(Clone, Copy, Default)]
+struct UsageQueueState {
+    bytes: u64,
+    /// When the head record was pushed; `None` while the queue is empty.
+    head_pushed_at: Option<Instant>,
 }
 
 #[derive(Clone, Serialize)]
@@ -90,7 +95,8 @@ pub struct MetricsSnapshot {
 pub struct UsageQueueSnapshot {
     /// Serialized record bytes the queue holds, the record being sent included.
     pub bytes: u64,
-    /// Milliseconds since the head record was queued; 0 when the queue is empty.
+    /// Milliseconds since the head record was pushed onto the queue; 0 while
+    /// the queue is empty.
     pub head_age_ms: u64,
 }
 
@@ -196,8 +202,7 @@ impl Metrics {
                 usage_records_dropped_queue_full: AtomicU64::new(0),
                 usage_records_dropped_oversized: AtomicU64::new(0),
                 usage_records_dropped_refused: AtomicU64::new(0),
-                usage_queue_bytes: AtomicU64::new(0),
-                usage_queue_head_queued_at_ms: AtomicU64::new(0),
+                usage_queue: RwLock::new(UsageQueueState::default()),
                 query_latencies: RwLock::new(VecDeque::with_capacity(history_size)),
                 update_latencies: RwLock::new(VecDeque::with_capacity(history_size)),
                 slow_queries: RwLock::new(VecDeque::with_capacity(history_size)),
@@ -249,13 +254,33 @@ impl Metrics {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Records the usage-record queue's size and the Unix milliseconds at
-    /// which its head record was queued, `None` for an empty queue.
-    pub fn set_usage_queue(&self, bytes: u64, head_queued_at_ms: Option<u64>) {
-        self.inner.usage_queue_bytes.store(bytes, Ordering::Relaxed);
-        self.inner
-            .usage_queue_head_queued_at_ms
-            .store(head_queued_at_ms.unwrap_or(0), Ordering::Relaxed);
+    /// Records the usage-record queue's size and the time at which its head
+    /// record was pushed onto it, `None` for an empty queue.
+    pub fn set_usage_queue(&self, bytes: u64, head_pushed_at: Option<Instant>) {
+        *self
+            .inner
+            .usage_queue
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = UsageQueueState {
+            bytes,
+            head_pushed_at,
+        };
+    }
+
+    /// The usage-record queue's state as of `now`. The head's age is the
+    /// time from its push to `now`, and 0 while the queue is empty.
+    pub(crate) fn usage_queue_at(&self, now: Instant) -> UsageQueueSnapshot {
+        let state = *self
+            .inner
+            .usage_queue
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        UsageQueueSnapshot {
+            bytes: state.bytes,
+            head_age_ms: state.head_pushed_at.map_or(0, |pushed_at| {
+                now.saturating_duration_since(pushed_at).as_millis() as u64
+            }),
+        }
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -336,17 +361,7 @@ impl Metrics {
                     .usage_records_dropped_refused
                     .load(Ordering::Relaxed),
             },
-            usage_queue: UsageQueueSnapshot {
-                bytes: self.inner.usage_queue_bytes.load(Ordering::Relaxed),
-                head_age_ms: match self
-                    .inner
-                    .usage_queue_head_queued_at_ms
-                    .load(Ordering::Relaxed)
-                {
-                    0 => 0,
-                    queued_at_ms => now_millis().saturating_sub(queued_at_ms),
-                },
-            },
+            usage_queue: self.usage_queue_at(Instant::now()),
         }
     }
 
@@ -622,7 +637,7 @@ fn infer_reasons(
     reasons
 }
 
-pub(crate) fn now_millis() -> u64 {
+fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
@@ -727,18 +742,43 @@ mod tests {
         let empty = metrics.snapshot().usage_queue;
         assert_eq!((empty.bytes, empty.head_age_ms), (0, 0));
 
-        metrics.set_usage_queue(4_096, Some(now_millis() - 5_000));
-        let held = metrics.snapshot().usage_queue;
-        assert_eq!(held.bytes, 4_096);
-        assert!((5_000..60_000).contains(&held.head_age_ms));
+        let pushed_at = Instant::now();
+        metrics.set_usage_queue(4_096, Some(pushed_at));
+        let at_push = metrics.usage_queue_at(pushed_at);
+        assert_eq!((at_push.bytes, at_push.head_age_ms), (4_096, 0));
+        let later = metrics.usage_queue_at(pushed_at + Duration::from_millis(5_250));
+        assert_eq!((later.bytes, later.head_age_ms), (4_096, 5_250));
+        // The snapshot reads the same state at the current time.
+        assert_eq!(metrics.snapshot().usage_queue.bytes, 4_096);
 
-        // A head queued at a later clock reading than now reports no age.
-        metrics.set_usage_queue(1, Some(now_millis() + 60_000));
-        assert_eq!(metrics.snapshot().usage_queue.head_age_ms, 0);
+        // A reading taken before the push reports no age.
+        if let Some(earlier) = pushed_at.checked_sub(Duration::from_secs(60)) {
+            assert_eq!(metrics.usage_queue_at(earlier).head_age_ms, 0);
+        }
 
+        // An empty queue has no head, whatever the time.
         metrics.set_usage_queue(0, None);
+        let drained = metrics.usage_queue_at(pushed_at + Duration::from_secs(3_600));
+        assert_eq!((drained.bytes, drained.head_age_ms), (0, 0));
         let drained = metrics.snapshot().usage_queue;
         assert_eq!((drained.bytes, drained.head_age_ms), (0, 0));
+    }
+
+    #[test]
+    fn usage_queue_snapshot_serializes_under_its_metric_names() {
+        let metrics = Metrics::new(100, 8);
+        metrics.set_usage_queue(12, None);
+
+        let snapshot = serde_json::to_value(metrics.snapshot()).expect("JSON");
+
+        assert_eq!(
+            snapshot["usage_queue"],
+            serde_json::json!({ "bytes": 12, "head_age_ms": 0 })
+        );
+        assert_eq!(
+            snapshot["usage_records_dropped"],
+            serde_json::json!({ "queue_full": 0, "oversized": 0, "refused": 0 })
+        );
     }
 
     #[test]

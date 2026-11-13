@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::Notify;
@@ -12,7 +12,7 @@ use tracing::warn;
 
 use super::record::Serialized;
 use crate::duckvis::DuckvisAuth;
-use crate::metrics::{now_millis, Metrics, UsageRecordDrop};
+use crate::metrics::{Metrics, UsageRecordDrop};
 
 /// Largest total of serialized record bytes the queue holds.
 pub const MAX_QUEUE_BYTES: usize = 67_108_864;
@@ -46,8 +46,8 @@ struct Inner {
 
 #[derive(Default)]
 struct Pending {
-    /// Each record with the Unix milliseconds at which it was queued.
-    records: VecDeque<(Bytes, u64)>,
+    /// Each record with the time at which it was pushed.
+    records: VecDeque<(Bytes, Instant)>,
     bytes: usize,
 }
 
@@ -81,6 +81,12 @@ impl UsageQueue {
     /// Appends `record`. A record that would take the queue past its bound is
     /// discarded and counted. Never blocks.
     fn push(&self, record: Bytes) {
+        self.push_at(record, Instant::now());
+    }
+
+    /// [`Self::push`] at the time `pushed_at`, from which the metrics measure
+    /// the record's age once it is the head.
+    fn push_at(&self, record: Bytes, pushed_at: Instant) {
         {
             let mut pending = self.pending();
             let bytes = pending.bytes.saturating_add(record.len());
@@ -90,7 +96,7 @@ impl UsageQueue {
                 return;
             }
             pending.bytes = bytes;
-            pending.records.push_back((record, now_millis()));
+            pending.records.push_back((record, pushed_at));
             self.report(&pending);
         }
         self.inner.arrived.notify_one();
@@ -114,15 +120,12 @@ impl UsageQueue {
         self.report(&pending);
     }
 
-    /// Publishes the queue's size and its head's queue time to the metrics.
+    /// Publishes the queue's size and its head's push time to the metrics.
     /// Called with the queue locked, so the reports arrive in order.
     fn report(&self, pending: &Pending) {
         self.inner.metrics.set_usage_queue(
             pending.bytes as u64,
-            pending
-                .records
-                .front()
-                .map(|(_, queued_at_ms)| *queued_at_ms),
+            pending.records.front().map(|(_, pushed_at)| *pushed_at),
         );
     }
 
@@ -520,25 +523,70 @@ mod tests {
     #[test]
     fn the_metrics_report_queued_bytes_and_the_head_age() {
         let (queue, metrics) = queue_with_max_bytes(10);
-        let state = |metrics: &Metrics| metrics.snapshot().usage_queue;
-        assert_eq!((state(&metrics).bytes, state(&metrics).head_age_ms), (0, 0));
+        let start = Instant::now();
+        let at = |millis: u64| start + Duration::from_millis(millis);
+        let state = |millis: u64| {
+            let state = metrics.usage_queue_at(at(millis));
+            (state.bytes, state.head_age_ms)
+        };
+        // An empty queue has no head age, whatever the time.
+        assert_eq!(state(0), (0, 0));
+        assert_eq!(state(5_000), (0, 0));
 
-        queue.push(Bytes::from_static(b"123456"));
-        std::thread::sleep(Duration::from_millis(30));
-        queue.push(Bytes::from_static(b"1234"));
+        queue.push_at(Bytes::from_static(b"123456"), at(0));
+        queue.push_at(Bytes::from_static(b"1234"), at(30));
         // A discarded push changes neither figure.
-        queue.push(Bytes::from_static(b"1"));
-        assert_eq!(state(&metrics).bytes, 10);
-        let head_age_ms = state(&metrics).head_age_ms;
-        assert!((30..30_000).contains(&head_age_ms));
+        queue.push_at(Bytes::from_static(b"1"), at(40));
+        assert_eq!(dropped(&metrics), (1, 0, 0));
+        // The age runs from the head's push, not from a later one.
+        assert_eq!(state(0), (10, 0));
+        assert_eq!(state(100), (10, 100));
+        assert_eq!(state(75_000), (10, 75_000));
 
         // The next record becomes the head with its own, shorter age.
         queue.remove_head();
-        assert_eq!(state(&metrics).bytes, 4);
-        assert!(state(&metrics).head_age_ms < head_age_ms);
+        assert_eq!(state(100), (4, 70));
 
         queue.remove_head();
-        assert_eq!((state(&metrics).bytes, state(&metrics).head_age_ms), (0, 0));
+        assert_eq!(state(100), (0, 0));
+
+        // A record pushed onto the drained queue is the head from its push.
+        queue.push_at(Bytes::from_static(b"12"), at(200));
+        assert_eq!(state(260), (2, 60));
+    }
+
+    #[tokio::test]
+    async fn the_head_keeps_its_age_while_it_is_sent_again() {
+        let (queue, metrics) = queue_with_max_bytes(100);
+        let start = Instant::now();
+        queue.push_at(Bytes::from_static(b"head"), start);
+        queue.push_at(
+            Bytes::from_static(b"tail"),
+            start + Duration::from_millis(400),
+        );
+        let ages_while_waiting = Mutex::new(Vec::new());
+        let statuses = Mutex::new(VecDeque::from([Some(503), Some(403), Some(204)]));
+
+        let send = |_body: Bytes| {
+            std::future::ready(statuses.lock().expect("statuses").pop_front().flatten())
+        };
+        let wait = |_duration: Duration| {
+            let state = metrics.usage_queue_at(start + Duration::from_millis(1_000));
+            ages_while_waiting
+                .lock()
+                .expect("ages")
+                .push((state.bytes, state.head_age_ms));
+            std::future::ready(())
+        };
+        deliver_head(&queue, &send, &wait).await;
+
+        // A failed send does not restart the head's age.
+        assert_eq!(
+            *ages_while_waiting.lock().expect("ages"),
+            vec![(8, 1_000), (8, 1_000)]
+        );
+        let after = metrics.usage_queue_at(start + Duration::from_millis(1_000));
+        assert_eq!((after.bytes, after.head_age_ms), (4, 600));
     }
 
     #[tokio::test]
