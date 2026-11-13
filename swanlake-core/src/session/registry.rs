@@ -277,7 +277,8 @@ impl SessionRegistry {
             debug!(session_id = %sid, "creating new connection");
             let conn = factory.create_connection()?;
             if let Some(sql) = secret_dir_sql {
-                conn.execute_statement(&sql)?;
+                // No request owns this statement, so it reaches no entry.
+                conn.execute_statement(&sql, None)?;
             }
             info!(
                 session_id = %sid,

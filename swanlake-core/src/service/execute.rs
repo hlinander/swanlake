@@ -8,6 +8,7 @@ use tracing::{info, warn};
 
 use crate::session::id::StatementHandle;
 use crate::session::{PreparedStatementMeta, Session};
+use crate::usage::RequestAccounting;
 
 use super::SwanFlightSqlService;
 
@@ -16,15 +17,17 @@ impl SwanFlightSqlService {
         sql: &str,
         param_batches: &[Vec<Value>],
         session: &Session,
+        accounting: &RequestAccounting,
     ) -> Result<i64, crate::error::ServerError> {
         if param_batches.is_empty() {
-            let affected = session.execute_statement_with_params(sql, &[])?;
+            let affected = session.execute_statement_with_params(sql, &[], Some(accounting))?;
             return Ok(affected as i64);
         }
 
         let mut total = 0i64;
         for params in param_batches {
-            let affected = session.execute_statement_with_params(sql, params)?;
+            let affected =
+                session.execute_statement_with_params(sql, params, Some(accounting))?;
             total += affected as i64;
         }
         Ok(total)
@@ -35,13 +38,14 @@ impl SwanFlightSqlService {
         session: &Arc<Session>,
         handle: StatementHandle,
         meta: PreparedStatementMeta,
+        accounting: Arc<RequestAccounting>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let parameters = session
             .take_prepared_statement_parameters(handle)
             .map_err(Self::status_from_error)?
             .unwrap_or_else(Vec::new);
 
-        self.execute_prepared_query_with_params(session, handle, meta, parameters)
+        self.execute_prepared_query_with_params(session, handle, meta, parameters, accounting)
             .await
     }
 
@@ -50,6 +54,7 @@ impl SwanFlightSqlService {
         session: &Arc<Session>,
         handle: StatementHandle,
         meta: PreparedStatementMeta,
+        accounting: &Arc<RequestAccounting>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let _in_flight = self.metrics.start_update();
         let start = Instant::now();
@@ -81,15 +86,22 @@ impl SwanFlightSqlService {
         let session_clone = session.clone();
         let params_for_exec = parameters;
         let sql_for_exec = sql.clone();
+        let accounting_for_exec = Arc::clone(accounting);
 
         let result = tokio::task::spawn_blocking(move || {
             if params_for_exec.is_empty() {
-                Self::execute_statement_batches(&sql_for_exec, &[], &session_clone)
+                Self::execute_statement_batches(
+                    &sql_for_exec,
+                    &[],
+                    &session_clone,
+                    &accounting_for_exec,
+                )
             } else {
                 Self::execute_statement_batches(
                     &sql_for_exec,
                     std::slice::from_ref(&params_for_exec),
                     &session_clone,
+                    &accounting_for_exec,
                 )
             }
         })
@@ -100,7 +112,7 @@ impl SwanFlightSqlService {
             Ok(Err(err)) => {
                 self.metrics
                     .record_update_error(&sql, start.elapsed(), err.to_string());
-                return Err(Self::status_from_error(err));
+                return Err(Self::failure_status(accounting, err));
             }
             Err(err) => {
                 self.metrics
@@ -144,6 +156,7 @@ impl SwanFlightSqlService {
         handle: StatementHandle,
         meta: PreparedStatementMeta,
         parameters: Vec<Value>,
+        accounting: Arc<RequestAccounting>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let _in_flight = self.metrics.start_query();
         let start = Instant::now();
@@ -175,6 +188,6 @@ impl SwanFlightSqlService {
             Some(parameters)
         };
 
-        Self::execute_query_streaming(session.clone(), sql, params).await
+        Self::execute_query_streaming(session.clone(), sql, params, accounting).await
     }
 }

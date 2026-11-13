@@ -70,7 +70,7 @@ async fn do_exchange_insert(
         "inserting data via DoExchange"
     );
 
-    let session = service.prepare_request(&request).await?;
+    let (session, accounting) = service.prepare_request(&request, "DoExchange").await?;
     let mut stream = request.into_inner();
 
     // Collect all flight data and decode batches
@@ -97,6 +97,7 @@ async fn do_exchange_insert(
 
     // Insert using appender API
     let session_clone = session.clone();
+    let accounting_clone = accounting.clone();
     let schema_name_owned = schema_name.to_string();
     let table_name_owned = table_name.to_string();
 
@@ -108,11 +109,11 @@ async fn do_exchange_insert(
             format!("{}.{}", schema_name_owned, table_name_owned)
         };
 
-        session_clone.insert_with_appender("", &qualified_table, batches)
+        session_clone.insert_with_appender("", &qualified_table, batches, Some(&accounting_clone))
     })
     .await
     .map_err(SwanFlightSqlService::status_from_join)?
-    .map_err(SwanFlightSqlService::status_from_error)?;
+    .map_err(|error| SwanFlightSqlService::failure_status(&accounting, error))?;
 
     info!(rows_inserted, "insert completed via DoExchange");
 

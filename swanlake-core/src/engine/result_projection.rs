@@ -144,6 +144,12 @@ pub(super) fn contains_variant(data_type: &str) -> bool {
     })
 }
 
+/// Whether `sql` is a single read query, which DESCRIBE may be able to wrap.
+/// This reads the text only and issues no statement.
+pub(super) fn is_query_body(sql: &str) -> bool {
+    query_body(sql).is_some()
+}
+
 /// Preserve the original SQL text while removing trailing terminators/comments.
 /// Commands and batches keep their existing execution path; probing a batch
 /// could execute its earlier statements a second time.

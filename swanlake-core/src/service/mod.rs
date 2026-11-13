@@ -17,6 +17,7 @@ use crate::config::SessionIdMode;
 use crate::error::ServerError;
 use crate::metrics::Metrics;
 use crate::session::{registry::SessionRegistry, Session, SessionId};
+use crate::usage::RequestAccounting;
 
 mod convert;
 mod execute;
@@ -144,13 +145,46 @@ impl SwanFlightSqlService {
         }
     }
 
-    /// Prepare request: extract session_id from header, record to tracing span, and get/create session.
-    /// If `x-expected-session-nonce` is present, validate it against the session's nonce
-    /// to detect sessions that were silently recreated (server restart, idle eviction).
+    /// Admits a request and creates its accounting.
+    ///
+    /// `endpoint` names the Flight RPC that carries the request. The
+    /// accounting holds the request's `request_id` and collects its entries;
+    /// when its last owner drops it, it queues the request's record.
     pub(crate) async fn prepare_request<T>(
         &self,
         request: &Request<T>,
-    ) -> Result<Arc<Session>, Status> {
+        endpoint: &'static str,
+    ) -> Result<(Arc<Session>, Arc<RequestAccounting>), Status> {
+        let session = self.admit(request).await?;
+        let accounting = Arc::new(RequestAccounting::new(
+            endpoint,
+            session.auth(),
+            self.usage_queue.clone(),
+        ));
+        Ok((session, accounting))
+    }
+
+    /// Records the engine's error type of a failure that fails the request,
+    /// and converts the failure to the status the client receives.
+    pub(crate) fn failure_status(accounting: &RequestAccounting, error: ServerError) -> Status {
+        Self::record_failure(accounting, &error);
+        Self::status_from_error(error)
+    }
+
+    /// Records the engine's error type of a failure that fails the request.
+    /// A failure the engine reports without a type records nothing.
+    pub(crate) fn record_failure(accounting: &RequestAccounting, error: &ServerError) {
+        if let ServerError::DuckDb(duckdb::Error::DuckDBFailure(failure, _)) = error {
+            if failure.error_type != libduckdb_sys::duckdb_error_type_DUCKDB_ERROR_INVALID {
+                accounting.set_error_type(failure.error_type);
+            }
+        }
+    }
+
+    /// Admission: extract session_id from header, record to tracing span, and get/create session.
+    /// If `x-expected-session-nonce` is present, validate it against the session's nonce
+    /// to detect sessions that were silently recreated (server restart, idle eviction).
+    pub(crate) async fn admit<T>(&self, request: &Request<T>) -> Result<Arc<Session>, Status> {
         let session_id = self.extract_session_id(request);
         Span::current().record("session_id", session_id.as_ref());
 
@@ -528,7 +562,11 @@ impl SwanFlightService {
 
         info!(sql = %sql, "handling raw Flight SQL passthrough (airport_take_flight)");
 
-        let session = self.inner.prepare_request(&request).await?;
+        let (session, accounting) = self
+            .inner
+            .prepare_request(&request, "GetFlightInfo")
+            .await?;
+        accounting.set_sql(&sql);
 
         // C6 guard: this passthrough runs SQL through connection-level paths
         // (schema_for_streaming) that bypass the guarded Session methods, so
@@ -545,8 +583,13 @@ impl SwanFlightService {
             let session_clone = Arc::clone(&session);
 
             let interrupt_handle = session.connection.interrupt_handle();
+            let statement_accounting = accounting.clone();
             run_interruptible(interrupt_handle, move || {
-                session_clone.execute_statement(&sql_clone)
+                session_clone
+                    .execute_statement(&sql_clone, Some(&statement_accounting))
+                    .inspect_err(|error| {
+                        SwanFlightSqlService::record_failure(&statement_accounting, error)
+                    })
             })
             .await?;
 
@@ -563,20 +606,23 @@ impl SwanFlightService {
         // which handles that case.
         let sql_for_schema = sql.clone();
         let session_clone = Arc::clone(&session);
+        let schema_accounting = accounting.clone();
 
         let cancellation = Arc::new(crate::engine::cancellation::RequestCancellation::default());
         let _cancel_on_disconnect = crate::engine::cancellation::CancelOnDrop(cancellation.clone());
         let schema = tokio::task::spawn_blocking(move || {
             // Binding can open files; apply the same lockdown as execution.
             cancellation.check()?;
-            session_clone.ensure_lockdown()?;
-            session_clone
-                .connection
-                .schema_for_query_cancellable(&sql_for_schema, Some(&cancellation))
+            session_clone.ensure_lockdown(Some(&schema_accounting))?;
+            session_clone.connection.schema_for_query_cancellable(
+                &sql_for_schema,
+                Some(&cancellation),
+                Some(&schema_accounting),
+            )
         })
         .await
         .map_err(SwanFlightSqlService::status_from_join)?
-        .map_err(SwanFlightSqlService::status_from_error)?;
+        .map_err(|error| SwanFlightSqlService::failure_status(&accounting, error))?;
 
         let ticket_payload = TicketStatementPayload::new(StatementTicketKind::Ephemeral)
             .with_fallback_sql(&sql)

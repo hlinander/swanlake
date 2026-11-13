@@ -22,6 +22,7 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::engine::{cancellation::RequestCancellation, DuckDbConnection, QueryResult};
 use crate::error::ServerError;
+use crate::usage::{ExecutionLabel, RequestAccounting};
 use crate::session::id::{
     StatementHandle, StatementHandleGenerator, TransactionId, TransactionIdGenerator,
 };
@@ -345,7 +346,10 @@ impl Session {
     /// roots plus scratch as the allowed set, configuration locked; a writer
     /// keeps external access and locks the flag set. Sessions without duckvis
     /// auth are out of scope.
-    pub(crate) fn ensure_lockdown(&self) -> Result<(), ServerError> {
+    pub(crate) fn ensure_lockdown(
+        &self,
+        accounting: Option<&RequestAccounting>,
+    ) -> Result<(), ServerError> {
         let (Some(template), Some(auth)) = (self.lockdown.as_ref(), self.auth.as_ref()) else {
             return Ok(());
         };
@@ -360,7 +364,8 @@ impl Session {
             ServerError::Internal(format!("failed to create session scratch directory: {e}"))
         })?;
         let sql = lockdown_sql(template, auth.writer, &state.roots);
-        self.connection.execute_batch(&sql)?;
+        self.connection
+            .execute_batch(&sql, ExecutionLabel::SwanLake, accounting)?;
         state.applied = true;
         info!(session_id = %self.id, writer = auth.writer, "session write-hardening lockdown applied");
         Ok(())
@@ -375,6 +380,7 @@ impl Session {
         secrets_sql: &[String],
         sql: &str,
         search_path_sql: Option<&str>,
+        accounting: Option<&RequestAccounting>,
     ) -> Result<(), ServerError> {
         let mut state = self
             .lockdown_state
@@ -383,17 +389,7 @@ impl Session {
         let confined =
             self.auth.as_ref().is_some_and(|auth| !auth.writer) && self.lockdown.is_some();
         if confined && state.applied {
-            let conn = self
-                .connection
-                .conn
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            let attached: bool = conn.query_row(
-                "SELECT EXISTS (SELECT 1 FROM duckdb_databases() WHERE lower(database_name) = lower(?))",
-                [catalog],
-                |row| row.get(0),
-            )?;
-            if !attached {
+            if !self.connection.catalog_attached(catalog, accounting)? {
                 return Err(ServerError::AttachmentRequiresSessionRecreation);
             }
         }
@@ -402,24 +398,24 @@ impl Session {
         // Engine text for a failed secret is not relayed: it can echo the
         // statement, which carries the credential.
         for secret_sql in secrets_sql {
-            self.execute_statement_privileged(secret_sql).map_err(|_| {
+            self.execute_statement_privileged(secret_sql, accounting).map_err(|_| {
                 ServerError::Internal("failed to create the attachment's session secret".into())
             })?;
         }
-        self.execute_statement_privileged(sql)?;
+        self.execute_statement_privileged(sql, accounting)?;
         if confined && !state.applied {
             if let Some(root) = crate::duckvis::attach::attach_data_path(sql) {
                 state.roots.insert(root);
             }
             // Existing DuckLakes store their authoritative roots in metadata;
             // ordinary catalogs do not provide ducklake_options.
-            match self.ducklake_data_roots(catalog) {
+            match self.ducklake_data_roots(catalog, accounting) {
                 Ok(roots) => state.roots.extend(roots),
                 Err(error) => debug!("no DuckLake data roots for armed catalog: {error}"),
             }
         }
         if let Some(sql) = search_path_sql {
-            self.execute_statement_privileged(sql)?;
+            self.execute_statement_privileged(sql, accounting)?;
         }
         Ok(())
     }
@@ -451,24 +447,17 @@ impl Session {
     /// Distinct values cover a table- or schema-scoped `data_path` override.
     /// Runs on the raw connection so it does not trip the lockdown before the
     /// caller registers the roots it returns.
-    pub fn ducklake_data_roots(&self, catalog: &str) -> Result<Vec<String>, ServerError> {
+    pub fn ducklake_data_roots(
+        &self,
+        catalog: &str,
+        accounting: Option<&RequestAccounting>,
+    ) -> Result<Vec<String>, ServerError> {
         let sql = format!(
             "SELECT DISTINCT value FROM ducklake_options('{}') \
              WHERE option_name = 'data_path' AND value IS NOT NULL",
             escape_sql_literal(catalog)
         );
-        let conn = self
-            .connection
-            .conn
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut roots = Vec::new();
-        for row in rows {
-            roots.push(row?);
-        }
-        Ok(roots)
+        self.connection.query_strings(&sql, accounting)
     }
 
     /// Get time since last activity
@@ -490,52 +479,83 @@ impl Session {
     }
 
     /// Execute a SELECT query
-    #[instrument(skip(self), fields(session_id = %self.id, sql = %sql))]
-    pub fn execute_query(&self, sql: &str) -> Result<QueryResult, ServerError> {
+    #[instrument(skip(self, accounting), fields(session_id = %self.id, sql = %sql))]
+    pub fn execute_query(
+        &self,
+        sql: &str,
+        accounting: Option<&RequestAccounting>,
+    ) -> Result<QueryResult, ServerError> {
         self.validate_user_sql(sql)?;
-        self.ensure_lockdown()?;
+        self.ensure_lockdown(accounting)?;
         self.touch();
-        self.connection.execute_query(sql)
+        self.connection.execute_query(sql, accounting)
     }
 
     /// Execute a query with parameters
-    #[instrument(skip(self, params), fields(session_id = %self.id, sql = %sql))]
+    #[instrument(skip(self, params, accounting), fields(session_id = %self.id, sql = %sql))]
     pub fn execute_query_with_params(
         &self,
         sql: &str,
         params: &[Value],
+        accounting: Option<&RequestAccounting>,
     ) -> Result<QueryResult, ServerError> {
         self.validate_user_sql(sql)?;
-        self.ensure_lockdown()?;
+        self.ensure_lockdown(accounting)?;
         self.touch();
-        self.connection.execute_query_with_params(sql, params)
+        self.connection
+            .execute_query_with_params(sql, params, accounting)
     }
 
     /// Return the number of parameters expected by a statement.
-    pub fn parameter_count(&self, sql: &str) -> Result<usize, ServerError> {
+    pub fn parameter_count(
+        &self,
+        sql: &str,
+        accounting: Option<&RequestAccounting>,
+    ) -> Result<usize, ServerError> {
         // Binding a statement can open files (table functions), so the
         // lockdown precedes it.
-        self.ensure_lockdown()?;
+        self.ensure_lockdown(accounting)?;
         self.touch();
-        self.connection.parameter_count(sql)
+        self.connection.parameter_count(sql, accounting)
     }
 
     /// Execute a statement (DDL/DML)
-    #[instrument(skip(self), fields(session_id = %self.id, sql = %sql))]
-    pub fn execute_statement(&self, sql: &str) -> Result<i64, ServerError> {
+    #[instrument(skip(self, accounting), fields(session_id = %self.id, sql = %sql))]
+    pub fn execute_statement(
+        &self,
+        sql: &str,
+        accounting: Option<&RequestAccounting>,
+    ) -> Result<i64, ServerError> {
         self.validate_user_sql(sql)?;
-        self.ensure_lockdown()?;
-        self.execute_statement_inner(sql)
+        self.ensure_lockdown(accounting)?;
+        self.touch();
+        let result = self.connection.execute_statement(sql, accounting);
+        if result.is_ok() && Self::should_invalidate_schema_cache(sql) {
+            self.clear_schema_cache();
+        }
+        result
     }
 
     /// Execute a statement bypassing the raw-ATTACH guard (contract C6).
     ///
     /// This is used ONLY by the `duckvis_attach` action handler to run the
     /// server-resolved, normalized ATTACH statement on the session connection.
-    /// Never call this with user-supplied SQL.
-    #[instrument(skip(self, sql), fields(session_id = %self.id))]
-    pub fn execute_statement_privileged(&self, sql: &str) -> Result<i64, ServerError> {
-        self.execute_statement_inner(sql)
+    /// Never call this with user-supplied SQL. The statement is SwanLake's
+    /// own, so its attempt carries label 0.
+    #[instrument(skip(self, sql, accounting), fields(session_id = %self.id))]
+    pub fn execute_statement_privileged(
+        &self,
+        sql: &str,
+        accounting: Option<&RequestAccounting>,
+    ) -> Result<i64, ServerError> {
+        self.touch();
+        let result = self
+            .connection
+            .execute_statement_privileged(sql, accounting);
+        if result.is_ok() && Self::should_invalidate_schema_cache(sql) {
+            self.clear_schema_cache();
+        }
+        result
     }
 
     pub fn execute_statement_with_telemetry(
@@ -543,13 +563,17 @@ impl Session {
         sql: &str,
         execution: Option<&str>,
         cancellation: &RequestCancellation,
+        accounting: Option<&RequestAccounting>,
     ) -> Result<i64, ServerError> {
         self.validate_user_sql(sql)?;
-        self.ensure_lockdown()?;
+        self.ensure_lockdown(accounting)?;
         self.touch();
-        let result =
-            self.connection
-                .execute_statement_with_telemetry(sql, execution, Some(cancellation));
+        let result = self.connection.execute_statement_with_telemetry(
+            sql,
+            execution,
+            Some(cancellation),
+            accounting,
+        );
         if result.is_ok() && Self::should_invalidate_schema_cache(sql) {
             self.clear_schema_cache();
         }
@@ -594,15 +618,6 @@ impl Session {
         }
     }
 
-    fn execute_statement_inner(&self, sql: &str) -> Result<i64, ServerError> {
-        self.touch();
-        let result = self.connection.execute_statement(sql);
-        if result.is_ok() && Self::should_invalidate_schema_cache(sql) {
-            self.clear_schema_cache();
-        }
-        result
-    }
-
     /// Invalidate the session's cached query schemas. Used after a privileged
     /// ATTACH so subsequent catalog lookups see the new database.
     pub fn invalidate_schema_cache(&self) {
@@ -610,16 +625,19 @@ impl Session {
     }
 
     /// Execute a statement with parameters
-    #[instrument(skip(self, params), fields(session_id = %self.id, sql = %sql))]
+    #[instrument(skip(self, params, accounting), fields(session_id = %self.id, sql = %sql))]
     pub fn execute_statement_with_params(
         &self,
         sql: &str,
         params: &[Value],
+        accounting: Option<&RequestAccounting>,
     ) -> Result<usize, ServerError> {
         self.validate_user_sql(sql)?;
-        self.ensure_lockdown()?;
+        self.ensure_lockdown(accounting)?;
         self.touch();
-        let result = self.connection.execute_statement_with_params(sql, params);
+        let result = self
+            .connection
+            .execute_statement_with_params(sql, params, accounting);
         if result.is_ok() && Self::should_invalidate_schema_cache(sql) {
             self.clear_schema_cache();
         }
@@ -627,21 +645,26 @@ impl Session {
     }
 
     /// Get schema for a query
-    #[instrument(skip(self), fields(session_id = %self.id, sql = %sql))]
-    pub fn schema_for_query(&self, sql: &str) -> Result<arrow_schema::Schema, ServerError> {
-        self.schema_for_query_cancellable(sql, None)
+    #[instrument(skip(self, accounting), fields(session_id = %self.id, sql = %sql))]
+    pub fn schema_for_query(
+        &self,
+        sql: &str,
+        accounting: Option<&RequestAccounting>,
+    ) -> Result<arrow_schema::Schema, ServerError> {
+        self.schema_for_query_cancellable(sql, None, accounting)
     }
 
     pub(crate) fn schema_for_query_cancellable(
         &self,
         sql: &str,
         cancellation: Option<&RequestCancellation>,
+        accounting: Option<&RequestAccounting>,
     ) -> Result<arrow_schema::Schema, ServerError> {
         if let Some(cancellation) = cancellation {
             cancellation.check()?;
         }
         self.validate_user_sql(sql)?;
-        self.ensure_lockdown()?;
+        self.ensure_lockdown(accounting)?;
         self.touch();
         let cache_key = Self::schema_cache_key(sql);
         if !cache_key.is_empty() {
@@ -658,7 +681,7 @@ impl Session {
 
         let schema = self
             .connection
-            .schema_for_query_cancellable(sql, cancellation)?;
+            .schema_for_query_cancellable(sql, cancellation, accounting)?;
 
         if !cache_key.is_empty() {
             self.schema_cache
@@ -674,27 +697,35 @@ impl Session {
     ///
     /// This is an optimized path for INSERT statements that avoids
     /// converting RecordBatches to individual parameter values.
-    #[instrument(skip(self, batches), fields(session_id = %self.id, catalog_name = %catalog_name, table_name = %table_name, rows = batches.iter().map(|b| b.num_rows()).sum::<usize>()))]
+    #[instrument(skip(self, batches, accounting), fields(session_id = %self.id, catalog_name = %catalog_name, table_name = %table_name, rows = batches.iter().map(|b| b.num_rows()).sum::<usize>()))]
     pub fn insert_with_appender(
         &self,
         catalog_name: &str,
         table_name: &str,
         batches: Vec<arrow_array::RecordBatch>,
+        accounting: Option<&RequestAccounting>,
     ) -> Result<usize, ServerError> {
-        self.ensure_lockdown()?;
+        self.ensure_lockdown(accounting)?;
         self.touch();
         self.connection
-            .insert_with_appender(catalog_name, table_name, batches)
+            .insert_with_appender(catalog_name, table_name, batches, accounting)
     }
 
     /// Get the schema of a table
-    pub fn table_schema(&self, table_name: &str) -> Result<arrow_schema::Schema, ServerError> {
-        self.connection.table_schema(table_name)
+    pub fn table_schema(
+        &self,
+        table_name: &str,
+        accounting: Option<&RequestAccounting>,
+    ) -> Result<arrow_schema::Schema, ServerError> {
+        self.connection.table_schema(table_name, accounting)
     }
 
     /// Return the current catalog selected for this session.
-    pub fn current_catalog(&self) -> Result<String, ServerError> {
-        self.connection.current_catalog()
+    pub fn current_catalog(
+        &self,
+        accounting: Option<&RequestAccounting>,
+    ) -> Result<String, ServerError> {
+        self.connection.current_catalog(accounting)
     }
 
     fn schema_cache_key(sql: &str) -> String {
@@ -730,10 +761,11 @@ impl Session {
         &self,
         parts: &[String],
         default_catalog: &str,
+        accounting: Option<&RequestAccounting>,
     ) -> (String, String) {
         if parts.len() == 1 {
             let catalog = self
-                .current_catalog()
+                .current_catalog(accounting)
                 .ok()
                 .filter(|c| !c.eq_ignore_ascii_case("memory"))
                 .unwrap_or_else(|| default_catalog.to_string());
@@ -874,12 +906,16 @@ impl Session {
     // === Transactions ===
 
     /// Begin a new transaction
-    #[instrument(skip(self), fields(session_id = %self.id))]
-    pub fn begin_transaction(&self) -> Result<TransactionId, ServerError> {
+    #[instrument(skip(self, accounting), fields(session_id = %self.id))]
+    pub fn begin_transaction(
+        &self,
+        accounting: Option<&RequestAccounting>,
+    ) -> Result<TransactionId, ServerError> {
         self.touch();
 
         // Execute BEGIN TRANSACTION on the connection
-        self.connection.execute_batch("BEGIN TRANSACTION")?;
+        self.connection
+            .execute_batch("BEGIN TRANSACTION", ExecutionLabel::Client, accounting)?;
 
         let tx_id = self.transaction_id_gen.next();
         let mut transactions = self
@@ -893,15 +929,23 @@ impl Session {
     }
 
     /// Commit a transaction
-    #[instrument(skip(self), fields(session_id = %self.id, transaction_id = %transaction_id))]
-    pub fn commit_transaction(&self, transaction_id: TransactionId) -> Result<(), ServerError> {
-        self.end_transaction(transaction_id, "COMMIT", "committed")
+    #[instrument(skip(self, accounting), fields(session_id = %self.id, transaction_id = %transaction_id))]
+    pub fn commit_transaction(
+        &self,
+        transaction_id: TransactionId,
+        accounting: Option<&RequestAccounting>,
+    ) -> Result<(), ServerError> {
+        self.end_transaction(transaction_id, "COMMIT", "committed", accounting)
     }
 
     /// Rollback a transaction
-    #[instrument(skip(self), fields(session_id = %self.id, transaction_id = %transaction_id))]
-    pub fn rollback_transaction(&self, transaction_id: TransactionId) -> Result<(), ServerError> {
-        self.end_transaction(transaction_id, "ROLLBACK", "rolled back")
+    #[instrument(skip(self, accounting), fields(session_id = %self.id, transaction_id = %transaction_id))]
+    pub fn rollback_transaction(
+        &self,
+        transaction_id: TransactionId,
+        accounting: Option<&RequestAccounting>,
+    ) -> Result<(), ServerError> {
+        self.end_transaction(transaction_id, "ROLLBACK", "rolled back", accounting)
     }
 
     fn end_transaction(
@@ -909,6 +953,7 @@ impl Session {
         transaction_id: TransactionId,
         sql: &str,
         op_name: &str,
+        accounting: Option<&RequestAccounting>,
     ) -> Result<(), ServerError> {
         self.touch();
 
@@ -929,7 +974,9 @@ impl Session {
 
         // DuckDB ends the transaction whether COMMIT or ROLLBACK succeeds or
         // fails, so the id is released before the result is returned.
-        let result = self.connection.execute_batch(sql);
+        let result = self
+            .connection
+            .execute_batch(sql, ExecutionLabel::Client, accounting);
         self.transactions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1199,17 +1246,17 @@ mod lockdown_tests {
     }
 
     fn raw_batch(conn: &DuckDbConnection, sql: &str) -> std::result::Result<(), duckdb::Error> {
-        let raw = conn.conn.lock().unwrap_or_else(|p| p.into_inner());
-        raw.execute_batch(sql)
+        conn.with_raw(|raw| raw.execute_batch(sql))
     }
 
     fn raw_setting(conn: &DuckDbConnection, name: &str) -> Result<String> {
-        let raw = conn.conn.lock().unwrap_or_else(|p| p.into_inner());
-        Ok(raw.query_row(
-            &format!("SELECT current_setting('{name}')::VARCHAR"),
-            [],
-            |row| row.get::<_, String>(0),
-        )?)
+        Ok(conn.with_raw(|raw| {
+            raw.query_row(
+                &format!("SELECT current_setting('{name}')::VARCHAR"),
+                [],
+                |row| row.get::<_, String>(0),
+            )
+        })?)
     }
 
     fn test_connection() -> Result<DuckDbConnection> {
@@ -1231,7 +1278,7 @@ mod lockdown_tests {
             }),
             Some(template(scratch)),
         );
-        session.ensure_lockdown()?;
+        session.ensure_lockdown(None)?;
         Ok(session)
     }
 
@@ -1278,12 +1325,13 @@ mod lockdown_tests {
             "lk",
             true,
         )?;
-        session.attach_catalog("lk", &[secret], &attach, None)?;
-        session.ensure_lockdown()?;
+        session.attach_catalog("lk", &[secret], &attach, None, None)?;
+        session.ensure_lockdown(None)?;
 
         let raw_text = |sql: &str| -> Result<String> {
-            let raw = session.connection.conn.lock().unwrap_or_else(|p| p.into_inner());
-            Ok(raw.query_row(sql, [], |row| row.get::<_, String>(0))?)
+            Ok(session
+                .connection
+                .with_raw(|raw| raw.query_row(sql, [], |row| row.get::<_, String>(0)))?)
         };
         let path = raw_text("SELECT path FROM duckdb_databases() WHERE database_name = 'lk'")?;
         assert!(!path.contains(&password), "catalog path exposes the password");
@@ -1297,17 +1345,17 @@ mod lockdown_tests {
             "SELECT * FROM ducklake_list_files('lk', 'any')".to_string(),
         ] {
             assert!(
-                matches!(session.execute_query(&sql), Err(ServerError::WriteNotPermitted(_))),
+                matches!(session.execute_query(&sql, None), Err(ServerError::WriteNotPermitted(_))),
                 "expected refusal: {sql}"
             );
         }
         // Past admission, the session still holds no credential a fresh
         // libpq connection can use.
-        let raw = session.connection.conn.lock().unwrap_or_else(|p| p.into_inner());
-        assert!(raw
-            .execute_batch(&format!(
+        assert!(session
+            .connection
+            .with_raw(|raw| raw.execute_batch(&format!(
                 "SELECT * FROM postgres_scan('{dsn}', '{schema}', 'ducklake_snapshot')"
-            ))
+            )))
             .is_err());
         Ok(())
     }
@@ -1318,12 +1366,12 @@ mod lockdown_tests {
             let scratch = tempfile::tempdir()?;
             let session = locked_session(writer, scratch.path())?;
             for finish in ["COMMIT", "ROLLBACK"] {
-                session.execute_statement("BEGIN TRANSACTION")?;
-                session.schema_for_query("SELECT 42 AS value")?;
+                session.execute_statement("BEGIN TRANSACTION", None)?;
+                session.schema_for_query("SELECT 42 AS value", None)?;
                 let (tx, mut rx) = tokio::sync::mpsc::channel(4);
                 session
                     .connection
-                    .execute_query_streaming("SELECT 42 AS value", tx, None)?;
+                    .execute_query_streaming("SELECT 42 AS value", tx, None, None)?;
                 let mut rows = 0;
                 while let Some(message) = rx.blocking_recv() {
                     match message {
@@ -1337,8 +1385,8 @@ mod lockdown_tests {
                     }
                 }
                 assert_eq!(rows, 1);
-                session.execute_statement(finish)?;
-                assert_eq!(session.execute_query("SELECT 43")?.total_rows, 1);
+                session.execute_statement(finish, None)?;
+                assert_eq!(session.execute_query("SELECT 43", None)?.total_rows, 1);
             }
             assert_eq!(
                 raw_setting(&session.connection, "lock_configuration")?,
@@ -1349,11 +1397,11 @@ mod lockdown_tests {
                 writer.to_string()
             );
             assert!(session
-                .execute_statement("SET lock_configuration = false")
+                .execute_statement("SET lock_configuration = false", None)
                 .is_err());
             if !writer {
                 assert!(matches!(
-                    session.execute_statement("COPY (SELECT 1) TO '/tmp/denied.csv'"),
+                    session.execute_statement("COPY (SELECT 1) TO '/tmp/denied.csv'", None),
                     Err(ServerError::WriteNotPermitted(_))
                 ));
             }
@@ -1368,10 +1416,10 @@ mod lockdown_tests {
             let session = locked_session(writer, scratch.path())?;
             // Exercise the transaction action followed by an execution error
             // and explicit SQL rollback.
-            session.begin_transaction()?;
-            assert!(session.execute_query("SELECT sum(CAST(CASE WHEN i=199999 THEN 'invalid' ELSE '1' END AS BIGINT)) FROM range(200000) t(i)").is_err());
-            session.execute_statement("ROLLBACK")?;
-            assert_eq!(session.execute_query("SELECT 43")?.total_rows, 1);
+            session.begin_transaction(None)?;
+            assert!(session.execute_query("SELECT sum(CAST(CASE WHEN i=199999 THEN 'invalid' ELSE '1' END AS BIGINT)) FROM range(200000) t(i)", None).is_err());
+            session.execute_statement("ROLLBACK", None)?;
+            assert_eq!(session.execute_query("SELECT 43", None)?.total_rows, 1);
         }
         Ok(())
     }
@@ -1381,15 +1429,15 @@ mod lockdown_tests {
         for writer in [false, true] {
             let scratch = tempfile::tempdir()?;
             let session = locked_session(writer, scratch.path())?;
-            session.execute_statement("CREATE TEMP TABLE transaction_rows (value INTEGER)")?;
+            session.execute_statement("CREATE TEMP TABLE transaction_rows (value INTEGER)", None)?;
             for finish in ["COMMIT", "ROLLBACK"] {
-                session.execute_statement("BEGIN TRANSACTION")?;
-                session.execute_statement("INSERT INTO transaction_rows VALUES (42)")?;
-                session.execute_statement(finish)?;
+                session.execute_statement("BEGIN TRANSACTION", None)?;
+                session.execute_statement("INSERT INTO transaction_rows VALUES (42)", None)?;
+                session.execute_statement(finish, None)?;
             }
             assert_eq!(
                 session
-                    .execute_query("SELECT * FROM transaction_rows")?
+                    .execute_query("SELECT * FROM transaction_rows", None)?
                     .total_rows,
                 1
             );
@@ -1402,21 +1450,21 @@ mod lockdown_tests {
         for writer in [false, true] {
             let scratch = tempfile::tempdir()?;
             let session = locked_session(writer, scratch.path())?;
-            session.execute_statement("CREATE TEMP TABLE transaction_rows (value INTEGER)")?;
+            session.execute_statement("CREATE TEMP TABLE transaction_rows (value INTEGER)", None)?;
             for finish in ["COMMIT", "ROLLBACK"] {
-                session.execute_statement("BEGIN TRANSACTION")?;
+                session.execute_statement("BEGIN TRANSACTION", None)?;
                 assert_eq!(
                     session.execute_statement_with_params(
                         "INSERT INTO transaction_rows VALUES (?)",
-                        &[Value::Int(42)]
+                        &[Value::Int(42)], None
                     )?,
                     1
                 );
-                session.execute_statement(finish)?;
+                session.execute_statement(finish, None)?;
             }
             assert_eq!(
                 session
-                    .execute_query("SELECT * FROM transaction_rows")?
+                    .execute_query("SELECT * FROM transaction_rows", None)?
                     .total_rows,
                 1
             );
@@ -1540,7 +1588,7 @@ mod lockdown_tests {
         session.register_armed_root(&lake.path().to_string_lossy());
 
         let result = session
-            .execute_query("SELECT current_setting('lock_configuration')::VARCHAR AS v")
+            .execute_query("SELECT current_setting('lock_configuration')::VARCHAR AS v", None)
             .map_err(|e| anyhow!("{e}"))?;
         let batch = result.batches.first().ok_or_else(|| anyhow!("no batch"))?;
         let column = batch
@@ -1553,7 +1601,7 @@ mod lockdown_tests {
         // The root armed before the first statement is readable.
         let csv = lake.path().join("t.csv");
         session
-            .execute_query(&format!("SELECT * FROM read_csv_auto('{}')", csv.display()))
+            .execute_query(&format!("SELECT * FROM read_csv_auto('{}')", csv.display()), None)
             .map_err(|e| anyhow!("in-root read failed: {e}"))?;
 
         // A root armed after lockdown does not widen the allowed set.
@@ -1565,8 +1613,122 @@ mod lockdown_tests {
             .execute_query(&format!(
                 "SELECT * FROM read_csv_auto('{}')",
                 late_csv.display()
-            ))
+            ), None)
             .is_err());
+        Ok(())
+    }
+
+    // === Entries and labels (duckvis#815, C7) ===
+
+    use crate::usage::testing::{attempts, record_of};
+
+    fn swanlake(abandoned: bool) -> (String, bool) {
+        ("SWANLAKE".to_string(), abandoned)
+    }
+
+    fn client(abandoned: bool) -> (String, bool) {
+        ("CLIENT".to_string(), abandoned)
+    }
+
+    /// The lockdown block is one label-0 attempt of the request that
+    /// triggers it, ahead of the request's own statements, and later
+    /// requests record none.
+    #[test]
+    fn the_lockdown_records_under_label_0_once() -> Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let session = Session::new_with_id_and_auth(
+            SessionId::from_string("lockdown-labels".to_string()),
+            Arc::new(test_connection()?),
+            Some(SessionAuth {
+                subject: "sub-1".to_string(),
+                project_id: "project-1".to_string(),
+                writer: false,
+            }),
+            Some(template(scratch.path())),
+        );
+
+        let (result, record) = record_of(|accounting| {
+            session.execute_query("SELECT 42 AS answer", Some(accounting))
+        });
+        result.map_err(|e| anyhow!("{e}"))?;
+        assert_eq!(
+            attempts(&record.expect("a record")),
+            [swanlake(false), swanlake(false), client(false)],
+            "the lockdown, the schema probe, the statement"
+        );
+
+        let (result, record) = record_of(|accounting| {
+            session.execute_query("SELECT 42 AS answer", Some(accounting))
+        });
+        result.map_err(|e| anyhow!("{e}"))?;
+        assert_eq!(
+            attempts(&record.expect("a record")),
+            [swanlake(false), client(false)]
+        );
+        Ok(())
+    }
+
+    /// Each Flight transaction action is one label-1 attempt.
+    #[test]
+    fn transaction_actions_record_under_label_1() -> Result<()> {
+        let session = Session::new_with_id(
+            SessionId::from_string("transaction-labels".to_string()),
+            Arc::new(test_connection()?),
+        );
+        let (begun, record) = record_of(|accounting| session.begin_transaction(Some(accounting)));
+        let first = begun.map_err(|e| anyhow!("{e}"))?;
+        assert_eq!(attempts(&record.expect("a record")), [client(false)]);
+
+        let (ended, record) =
+            record_of(|accounting| session.commit_transaction(first, Some(accounting)));
+        ended.map_err(|e| anyhow!("{e}"))?;
+        assert_eq!(attempts(&record.expect("a record")), [client(false)]);
+
+        let second = session.begin_transaction(None).map_err(|e| anyhow!("{e}"))?;
+        let (ended, record) =
+            record_of(|accounting| session.rollback_transaction(second, Some(accounting)));
+        ended.map_err(|e| anyhow!("{e}"))?;
+        assert_eq!(attempts(&record.expect("a record")), [client(false)]);
+        Ok(())
+    }
+
+    /// The `ATTACH` and the search-path statement of `attach_catalog` are
+    /// label-0 attempts, and on a locked non-writer session the existence
+    /// probe is one more.
+    #[test]
+    fn attaching_a_catalog_records_under_label_0() -> Result<()> {
+        let session = Session::new_with_id(
+            SessionId::from_string("attach-labels".to_string()),
+            Arc::new(test_connection()?),
+        );
+        let (attached, record) = record_of(|accounting| {
+            session.attach_catalog(
+                "side",
+                &[],
+                "ATTACH ':memory:' AS side",
+                Some("USE side"),
+                Some(accounting),
+            )
+        });
+        attached.map_err(|e| anyhow!("{e}"))?;
+        assert_eq!(
+            attempts(&record.expect("a record")),
+            [swanlake(false), swanlake(false)]
+        );
+
+        let scratch = tempfile::tempdir()?;
+        let locked = locked_session(false, scratch.path())?;
+        locked.ensure_lockdown(None).map_err(|e| anyhow!("{e}"))?;
+        let (attached, record) = record_of(|accounting| {
+            locked.attach_catalog("absent", &[], "ATTACH ':memory:' AS absent", None, Some(accounting))
+        });
+        assert!(matches!(
+            attached,
+            Err(ServerError::AttachmentRequiresSessionRecreation)
+        ));
+        let record = record.expect("a record");
+        assert_eq!(attempts(&record).len(), 1, "the existence probe alone");
+        assert_eq!(record["entries"][0]["provenance"], "SWANLAKE");
         Ok(())
     }
 }

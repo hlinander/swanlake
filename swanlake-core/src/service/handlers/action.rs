@@ -258,7 +258,7 @@ pub(crate) async fn do_action_list_schemas(
     service: &SwanFlightSqlService,
     request: Request<Action>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
-    let session = service.prepare_request(&request).await?;
+    let (session, accounting) = service.prepare_request(&request, "DoAction").await?;
 
     info!("handling list_schemas action");
 
@@ -266,10 +266,13 @@ pub(crate) async fn do_action_list_schemas(
     let sql = "SELECT DISTINCT schema_name FROM information_schema.schemata ORDER BY schema_name";
 
     let session_clone = session.clone();
-    let query_result = tokio::task::spawn_blocking(move || session_clone.execute_query(sql))
-        .await
-        .map_err(SwanFlightSqlService::status_from_join)?
-        .map_err(SwanFlightSqlService::status_from_error)?;
+    let accounting_clone = accounting.clone();
+    let query_result = tokio::task::spawn_blocking(move || {
+        session_clone.execute_query(sql, Some(&accounting_clone))
+    })
+    .await
+    .map_err(SwanFlightSqlService::status_from_join)?
+    .map_err(|error| SwanFlightSqlService::failure_status(&accounting, error))?;
 
     // Convert the Arrow batches to a list of schema names
     let mut schema_names = Vec::new();
@@ -339,11 +342,13 @@ pub(crate) async fn do_action_list_schemas(
         );
 
         let session_clone = session.clone();
-        let tables_result =
-            tokio::task::spawn_blocking(move || session_clone.execute_query(&tables_sql))
-                .await
-                .map_err(SwanFlightSqlService::status_from_join)?
-                .map_err(SwanFlightSqlService::status_from_error)?;
+        let accounting_clone = accounting.clone();
+        let tables_result = tokio::task::spawn_blocking(move || {
+            session_clone.execute_query(&tables_sql, Some(&accounting_clone))
+        })
+        .await
+        .map_err(SwanFlightSqlService::status_from_join)?
+        .map_err(|error| SwanFlightSqlService::failure_status(&accounting, error))?;
 
         // Group columns by table
         let mut tables: HashMap<String, Vec<(String, DataType)>> = HashMap::new();
@@ -744,7 +749,7 @@ pub(crate) async fn do_action_catalog_version(
     service: &SwanFlightSqlService,
     request: Request<Action>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
-    let _session = service.prepare_request(&request).await?;
+    let (_session, _accounting) = service.prepare_request(&request, "DoAction").await?;
 
     info!("handling catalog_version action");
 
@@ -771,7 +776,7 @@ pub(crate) async fn do_action_endpoints(
     service: &SwanFlightSqlService,
     request: Request<Action>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
-    let _session = service.prepare_request(&request).await?;
+    let (_session, _accounting) = service.prepare_request(&request, "DoAction").await?;
 
     // Parse the request
     let request_data: AirportGetFlightEndpointsRequest =
@@ -933,7 +938,7 @@ pub(crate) async fn do_action_create_table(
     service: &SwanFlightSqlService,
     request: Request<Action>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
-    let session = service.prepare_request(&request).await?;
+    let (session, accounting) = service.prepare_request(&request, "DoAction").await?;
 
     // Parse the request parameters
     let params: AirportCreateTableParameters =
@@ -1018,10 +1023,13 @@ pub(crate) async fn do_action_create_table(
 
     // Execute CREATE TABLE
     let session_clone = session.clone();
-    tokio::task::spawn_blocking(move || session_clone.execute_statement(&sql))
-        .await
-        .map_err(SwanFlightSqlService::status_from_join)?
-        .map_err(SwanFlightSqlService::status_from_error)?;
+    let accounting_clone = accounting.clone();
+    tokio::task::spawn_blocking(move || {
+        session_clone.execute_statement(&sql, Some(&accounting_clone))
+    })
+    .await
+    .map_err(SwanFlightSqlService::status_from_join)?
+    .map_err(|error| SwanFlightSqlService::failure_status(&accounting, error))?;
 
     info!(table = %params.table_name, "table created successfully");
 
@@ -1067,7 +1075,7 @@ pub(crate) async fn do_action_create_schema(
     service: &SwanFlightSqlService,
     request: Request<Action>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
-    let session = service.prepare_request(&request).await?;
+    let (session, accounting) = service.prepare_request(&request, "DoAction").await?;
 
     // Parse the request parameters
     let params: AirportCreateSchemaParameters =
@@ -1084,13 +1092,14 @@ pub(crate) async fn do_action_create_schema(
     // Execute CREATE SCHEMA IF NOT EXISTS
     let schema_name = params.schema.clone();
     let session_clone = session.clone();
+    let accounting_clone = accounting.clone();
     tokio::task::spawn_blocking(move || {
         let sql = format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema_name);
-        session_clone.execute_statement(&sql)
+        session_clone.execute_statement(&sql, Some(&accounting_clone))
     })
     .await
     .map_err(SwanFlightSqlService::status_from_join)?
-    .map_err(SwanFlightSqlService::status_from_error)?;
+    .map_err(|error| SwanFlightSqlService::failure_status(&accounting, error))?;
 
     info!(schema = %params.schema, "schema created successfully");
 
@@ -1124,7 +1133,7 @@ pub(crate) async fn do_action_execution_identity(
     service: &SwanFlightSqlService,
     request: Request<Action>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
-    service.prepare_request(&request).await?;
+    service.prepare_request(&request, "DoAction").await?;
     let body = serde_json::to_vec(&service.execution_identity)
         .map_err(|e| Status::internal(e.to_string()))?;
     Ok(Response::new(Box::pin(stream::iter(vec![Ok(
@@ -1158,7 +1167,7 @@ pub(crate) async fn do_action_execute(
     request: Request<Action>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
     let guarded = request.get_ref().r#type == "execute_guarded";
-    let session = service.prepare_request(&request).await?;
+    let (session, accounting) = service.prepare_request(&request, "DoAction").await?;
     if let Some(expected) = request.metadata().get("x-swanlake-generation") {
         if expected.to_str().ok() != Some(service.execution_identity.generation.as_str()) {
             return Err(Status::failed_precondition(
@@ -1249,16 +1258,18 @@ pub(crate) async fn do_action_execute(
     // Execute the SQL statement
     let sql_clone = sql.clone();
     let session_clone = session.clone();
+    let accounting_clone = accounting.clone();
     let affected_rows = tokio::task::spawn_blocking(move || {
         session_clone.execute_statement_with_telemetry(
             &sql_clone,
             execution.as_deref(),
             &cancellation,
+            Some(&accounting_clone),
         )
     })
     .await
     .map_err(SwanFlightSqlService::status_from_join)?
-    .map_err(SwanFlightSqlService::status_from_error)?;
+    .map_err(|error| SwanFlightSqlService::failure_status(&accounting, error))?;
 
     if !guarded {
         info!(sql = %sql, affected_rows, "execute action completed");
@@ -1288,7 +1299,7 @@ pub(crate) async fn do_action_cancel_execution(
     service: &SwanFlightSqlService,
     request: Request<Action>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
-    let session = service.prepare_request(&request).await?;
+    let (session, _accounting) = service.prepare_request(&request, "DoAction").await?;
     let id = std::str::from_utf8(&request.get_ref().body)
         .map_err(|_| Status::invalid_argument("invalid request ID"))?;
     uuid::Uuid::parse_str(id).map_err(|_| Status::invalid_argument("request ID must be a UUID"))?;
@@ -1311,7 +1322,7 @@ pub(crate) async fn do_action_session_info(
     service: &SwanFlightSqlService,
     request: Request<Action>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
-    let session = service.prepare_request(&request).await?;
+    let (session, _accounting) = service.prepare_request(&request, "DoAction").await?;
     info!("handling session_info action");
 
     #[derive(Serialize)]
@@ -1337,7 +1348,7 @@ pub(crate) async fn do_action_close_session(
     request: Request<Action>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
     let session_id = service.extract_session_id(&request);
-    let session = service.prepare_request(&request).await?;
+    let (session, _accounting) = service.prepare_request(&request, "DoAction").await?;
     let removed = service.registry.remove(&session_id, session.nonce());
     info!(%session_id, removed, "closed session");
 
@@ -1354,19 +1365,20 @@ pub(crate) async fn do_action_execute_sql(
     sql: &str,
     request: Request<Action>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoActionStream>, Status> {
-    let session = service.prepare_request(&request).await?;
+    let (session, accounting) = service.prepare_request(&request, "DoAction").await?;
 
     info!(sql = %sql, "executing SQL from action type");
 
     // Execute the SQL statement
     let sql_owned = sql.to_string();
     let session_clone = session.clone();
+    let accounting_clone = accounting.clone();
     let affected_rows = tokio::task::spawn_blocking(move || {
-        session_clone.execute_statement(&sql_owned)
+        session_clone.execute_statement(&sql_owned, Some(&accounting_clone))
     })
     .await
     .map_err(SwanFlightSqlService::status_from_join)?
-    .map_err(SwanFlightSqlService::status_from_error)?;
+    .map_err(|error| SwanFlightSqlService::failure_status(&accounting, error))?;
 
     info!(sql = %sql, affected_rows, "SQL action completed");
 
@@ -1430,7 +1442,7 @@ pub(crate) async fn do_action_duckvis_attach(
         .clone();
 
     // Runs the auth gate (validates token, binds/checks session project).
-    let session = service.prepare_request(&request).await?;
+    let (session, accounting) = service.prepare_request(&request, "DoAction").await?;
 
     // The session must carry auth (guaranteed by the auth gate in duckvis mode).
     let auth = session
@@ -1491,17 +1503,19 @@ pub(crate) async fn do_action_duckvis_attach(
     let session_clone = session.clone();
     let normalized_for_exec = normalized;
     let catalog = attachment_name.clone();
+    let accounting_clone = accounting.clone();
     tokio::task::spawn_blocking(move || {
         session_clone.attach_catalog(
             &catalog,
             &secrets_sql,
             &normalized_for_exec,
             search_path_sql.as_deref(),
+            Some(&accounting_clone),
         )
     })
     .await
     .map_err(SwanFlightSqlService::status_from_join)?
-    .map_err(SwanFlightSqlService::status_from_error)?;
+    .map_err(|error| SwanFlightSqlService::failure_status(&accounting, error))?;
 
     // Invalidate the session schema cache (catalog changed).
     session.invalidate_schema_cache();
@@ -1533,7 +1547,7 @@ pub(crate) async fn do_action_execution_updates(
         .and_then(|v| v.to_str().ok())
         .filter(|v| !v.is_empty())
         .ok_or_else(|| Status::failed_precondition("telemetry requires a session nonce"))?;
-    let session = service.prepare_request(&request).await?;
+    let (session, _accounting) = service.prepare_request(&request, "DoAction").await?;
     let body = &request.get_ref().body;
     if body.len() > 16384 {
         return Err(Status::invalid_argument("telemetry request too large"));

@@ -21,6 +21,7 @@ use crate::service::SwanFlightSqlService;
 use crate::session::id::StatementHandle;
 use crate::session::{PreparedStatementMeta, PreparedStatementOptions, Session};
 use crate::sql::parser::ParsedStatement;
+use crate::usage::RequestAccounting;
 
 const DEFAULT_CATALOG: &str = "swanlake";
 
@@ -40,8 +41,17 @@ async fn resolve_session_and_meta<T>(
     handle_bytes: &[u8],
     context: &'static str,
     request: &Request<T>,
-) -> Result<(Arc<Session>, StatementHandle, PreparedStatementMeta), Status> {
-    let session = service.prepare_request(request).await?;
+    endpoint: &'static str,
+) -> Result<
+    (
+        Arc<Session>,
+        Arc<RequestAccounting>,
+        StatementHandle,
+        PreparedStatementMeta,
+    ),
+    Status,
+> {
+    let (session, accounting) = service.prepare_request(request, endpoint).await?;
     let handle = if handle_bytes.is_empty() {
         let last_handle = session.last_prepared_statement_handle().ok_or_else(|| {
             error!(
@@ -64,7 +74,7 @@ async fn resolve_session_and_meta<T>(
         .get_prepared_statement_meta(handle)
         .map_err(SwanFlightSqlService::status_from_error)?;
     tracing::Span::current().record("sql", meta.sql.as_str());
-    Ok((session, handle, meta))
+    Ok((session, accounting, handle, meta))
 }
 
 /// Creates a prepared statement for the provided SQL, inferring whether it is
@@ -87,7 +97,7 @@ pub(crate) async fn do_action_create_prepared_statement(
         .unwrap_or_else(|| parsed.as_ref().is_some_and(|p| p.is_query()));
 
     tracing::Span::current().record("is_query", is_query);
-    let session = service.prepare_request(&request).await?;
+    let (session, accounting) = service.prepare_request(&request, "DoAction").await?;
 
     if multi_statement && is_query {
         debug!(
@@ -99,14 +109,16 @@ pub(crate) async fn do_action_create_prepared_statement(
     let (cached_schema, dataset_schema) = if is_query && !multi_statement {
         let sql_for_schema = sql.clone();
         let session_clone = Arc::clone(&session);
+        let accounting_clone = Arc::clone(&accounting);
         tokio::task::spawn_blocking(move || {
-            let schema = session_clone.schema_for_query(&sql_for_schema)?;
+            let schema =
+                session_clone.schema_for_query(&sql_for_schema, Some(&accounting_clone))?;
             let bytes = SwanFlightSqlService::schema_to_ipc_bytes(&schema)?;
             Ok::<_, crate::error::ServerError>((Some(schema), bytes))
         })
         .await
         .map_err(SwanFlightSqlService::status_from_join)?
-        .map_err(SwanFlightSqlService::status_from_error)?
+        .map_err(|error| SwanFlightSqlService::failure_status(&accounting, error))?
     } else {
         (None, Vec::new())
     };
@@ -114,14 +126,17 @@ pub(crate) async fn do_action_create_prepared_statement(
     let param_count = {
         let sql_for_params = sql.clone();
         let session_clone = Arc::clone(&session);
-        tokio::task::spawn_blocking(move || session_clone.parameter_count(&sql_for_params))
-            .await
-            .map_err(SwanFlightSqlService::status_from_join)?
-            .map_err(SwanFlightSqlService::status_from_error)?
+        let accounting_clone = Arc::clone(&accounting);
+        tokio::task::spawn_blocking(move || {
+            session_clone.parameter_count(&sql_for_params, Some(&accounting_clone))
+        })
+        .await
+        .map_err(SwanFlightSqlService::status_from_join)?
+        .map_err(|error| SwanFlightSqlService::failure_status(&accounting, error))?
     };
 
     let parameter_schema = if param_count > 0 {
-        let inferred_schema = infer_parameter_schema(&session, &sql, param_count);
+        let inferred_schema = infer_parameter_schema(&session, &sql, param_count, &accounting);
         let schema = inferred_schema.unwrap_or_else(|| {
             let fields: Vec<Field> = (1..=param_count)
                 .map(|idx| Field::new(format!("${idx}"), DataType::Utf8, true))
@@ -156,7 +171,12 @@ pub(crate) async fn do_action_create_prepared_statement(
     })
 }
 
-fn infer_parameter_schema(session: &Arc<Session>, sql: &str, param_count: usize) -> Option<Schema> {
+fn infer_parameter_schema(
+    session: &Arc<Session>,
+    sql: &str,
+    param_count: usize,
+    accounting: &RequestAccounting,
+) -> Option<Schema> {
     let parsed = ParsedStatement::parse(sql)?;
 
     let table_ref = if parsed.is_insert() {
@@ -166,9 +186,11 @@ fn infer_parameter_schema(session: &Arc<Session>, sql: &str, param_count: usize)
     }?;
 
     let (catalog_name, table_name) =
-        session.resolve_catalog_and_table(table_ref.parts(), DEFAULT_CATALOG);
+        session.resolve_catalog_and_table(table_ref.parts(), DEFAULT_CATALOG, Some(accounting));
     let qualified_table = format!("{catalog_name}.{table_name}");
-    let table_schema = session.table_schema(&qualified_table).ok()?;
+    let table_schema = session
+        .table_schema(&qualified_table, Some(accounting))
+        .ok()?;
 
     if parsed.is_insert() {
         if !parsed.insert_values_all_placeholders() {
@@ -249,13 +271,15 @@ pub(crate) async fn get_flight_info_prepared_statement(
     query: CommandPreparedStatementQuery,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
-    let (session, handle, meta) = resolve_session_and_meta(
+    let (session, accounting, handle, meta) = resolve_session_and_meta(
         service,
         query.prepared_statement_handle.as_ref(),
         "get_flight_info_prepared_statement",
         &request,
+        "GetFlightInfo",
     )
     .await?;
+    accounting.set_sql(&meta.sql);
 
     let returns_rows = meta.is_query;
     info!(
@@ -271,12 +295,13 @@ pub(crate) async fn get_flight_info_prepared_statement(
         } else {
             let sql_for_schema = meta.sql.clone();
             let session_clone = Arc::clone(&session);
+            let accounting_clone = Arc::clone(&accounting);
             let schema = tokio::task::spawn_blocking(move || {
-                session_clone.schema_for_query(&sql_for_schema)
+                session_clone.schema_for_query(&sql_for_schema, Some(&accounting_clone))
             })
             .await
             .map_err(SwanFlightSqlService::status_from_join)?
-            .map_err(SwanFlightSqlService::status_from_error)?;
+            .map_err(|error| SwanFlightSqlService::failure_status(&accounting, error))?;
             session
                 .cache_prepared_statement_schema(handle, schema.clone())
                 .map_err(SwanFlightSqlService::status_from_error)?;
@@ -320,21 +345,23 @@ pub(crate) async fn do_get_prepared_statement(
     query: CommandPreparedStatementQuery,
     request: Request<Ticket>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoGetStream>, Status> {
-    let (session, handle, meta) = resolve_session_and_meta(
+    let (session, accounting, handle, meta) = resolve_session_and_meta(
         service,
         query.prepared_statement_handle.as_ref(),
         "do_get_prepared_statement",
         &request,
+        "DoGet",
     )
     .await?;
+    accounting.set_sql(&meta.sql);
 
     if meta.is_query {
         service
-            .execute_prepared_query_handle(&session, handle, meta)
+            .execute_prepared_query_handle(&session, handle, meta, accounting)
             .await
     } else {
         service
-            .execute_prepared_update_handle(&session, handle, meta)
+            .execute_prepared_update_handle(&session, handle, meta, &accounting)
             .await
     }
 }
@@ -346,11 +373,12 @@ pub(crate) async fn do_put_prepared_statement_query(
     query: CommandPreparedStatementQuery,
     request: Request<PeekableFlightDataStream>,
 ) -> Result<DoPutPreparedStatementResult, Status> {
-    let (session, handle, meta) = resolve_session_and_meta(
+    let (session, _accounting, handle, meta) = resolve_session_and_meta(
         service,
         query.prepared_statement_handle.as_ref(),
         "do_put_prepared_statement_query",
         &request,
+        "DoPut",
     )
     .await?;
 
@@ -381,7 +409,7 @@ pub(crate) async fn do_action_close_prepared_statement(
         query.prepared_statement_handle.as_ref(),
         "do_action_close_prepared_statement",
     )?;
-    let session = service.prepare_request(&request).await?;
+    let (session, _accounting) = service.prepare_request(&request, "DoAction").await?;
 
     session
         .close_prepared_statement(handle)
@@ -396,13 +424,15 @@ pub(crate) async fn do_put_prepared_statement_update(
     query: CommandPreparedStatementUpdate,
     request: Request<PeekableFlightDataStream>,
 ) -> Result<i64, Status> {
-    let (session, handle, PreparedStatementMeta { sql, is_query, .. }) = resolve_session_and_meta(
-        service,
-        query.prepared_statement_handle.as_ref(),
-        "do_put_prepared_statement_update",
-        &request,
-    )
-    .await?;
+    let (session, accounting, handle, PreparedStatementMeta { sql, is_query, .. }) =
+        resolve_session_and_meta(
+            service,
+            query.prepared_statement_handle.as_ref(),
+            "do_put_prepared_statement_update",
+            &request,
+            "DoPut",
+        )
+        .await?;
 
     if is_query {
         error!(
@@ -435,16 +465,26 @@ pub(crate) async fn do_put_prepared_statement_update(
         let batches = SwanFlightSqlService::collect_record_batches(request).await?;
         if batches.is_empty() {
             // No batches sent, execute the statement with empty params.
+            accounting.set_sql(&sql);
             let session_clone = Arc::clone(&session);
+            let accounting_clone = Arc::clone(&accounting);
             let sql_for_exec = sql.clone();
             let result = tokio::task::spawn_blocking(move || {
-                SwanFlightSqlService::execute_statement_batches(&sql_for_exec, &[], &session_clone)
+                SwanFlightSqlService::execute_statement_batches(
+                    &sql_for_exec,
+                    &[],
+                    &session_clone,
+                    &accounting_clone,
+                )
             })
             .await;
             match result {
                 Ok(Ok(rows)) => rows,
                 Ok(Err(err)) => {
-                    return Err(record_error(SwanFlightSqlService::status_from_error(err)));
+                    return Err(record_error(SwanFlightSqlService::failure_status(
+                        &accounting,
+                        err,
+                    )));
                 }
                 Err(err) => {
                     return Err(record_error(SwanFlightSqlService::status_from_join(err)));
@@ -456,7 +496,7 @@ pub(crate) async fn do_put_prepared_statement_update(
             // Extract catalog and table name from the parsed reference
             // Format: "catalog.table" or just "table" (uses default catalog)
             let (catalog_name, table_name) =
-                session.resolve_catalog_and_table(parts, DEFAULT_CATALOG);
+                session.resolve_catalog_and_table(parts, DEFAULT_CATALOG, Some(&accounting));
             let insert_columns = parsed.get_insert_columns();
 
             info!(
@@ -468,11 +508,14 @@ pub(crate) async fn do_put_prepared_statement_update(
             );
 
             let session_clone = Arc::clone(&session);
+            let accounting_clone = Arc::clone(&accounting);
             let sql_for_exec = sql.clone();
             let result = tokio::task::spawn_blocking(move || {
                 // Get the target table schema for validation and alignment
                 let qualified_table = format!("{catalog_name}.{table_name}");
-                let table_schema = Arc::new(session_clone.table_schema(&qualified_table)?);
+                let table_schema = Arc::new(
+                    session_clone.table_schema(&qualified_table, Some(&accounting_clone))?,
+                );
 
                 // Align batches if INSERT specifies column list
                 // Example: "INSERT INTO t (col2, col1)" needs column reordering
@@ -489,7 +532,12 @@ pub(crate) async fn do_put_prepared_statement_update(
 
                 // Use DuckDB appender API for efficient bulk insert
                 let total_rows = session_clone
-                    .insert_with_appender(&catalog_name, &table_name, batches_to_use)
+                    .insert_with_appender(
+                        &catalog_name,
+                        &table_name,
+                        batches_to_use,
+                        Some(&accounting_clone),
+                    )
                     .map_err(|e| {
                         error!(
                             %e,
@@ -506,7 +554,10 @@ pub(crate) async fn do_put_prepared_statement_update(
             match result {
                 Ok(Ok(rows)) => rows,
                 Ok(Err(err)) => {
-                    return Err(record_error(SwanFlightSqlService::status_from_error(err)));
+                    return Err(record_error(SwanFlightSqlService::failure_status(
+                        &accounting,
+                        err,
+                    )));
                 }
                 Err(err) => {
                     return Err(record_error(SwanFlightSqlService::status_from_join(err)));
@@ -523,16 +574,26 @@ pub(crate) async fn do_put_prepared_statement_update(
             "executing prepared statement update with parameters"
         );
 
+        accounting.set_sql(&sql);
         let session_clone = Arc::clone(&session);
+        let accounting_clone = Arc::clone(&accounting);
         let sql_for_exec = sql.clone();
         let result = tokio::task::spawn_blocking(move || {
-            SwanFlightSqlService::execute_statement_batches(&sql_for_exec, &params, &session_clone)
+            SwanFlightSqlService::execute_statement_batches(
+                &sql_for_exec,
+                &params,
+                &session_clone,
+                &accounting_clone,
+            )
         })
         .await;
         match result {
             Ok(Ok(rows)) => rows,
             Ok(Err(err)) => {
-                return Err(record_error(SwanFlightSqlService::status_from_error(err)));
+                return Err(record_error(SwanFlightSqlService::failure_status(
+                    &accounting,
+                    err,
+                )));
             }
             Err(err) => {
                 return Err(record_error(SwanFlightSqlService::status_from_join(err)));

@@ -1,258 +1,154 @@
-//! Resource tracking for running queries.
+//! Resource figures of a running request.
 //!
-//! Samples DuckDB memory usage and CPU time on a background thread,
-//! providing metrics that can be streamed to Flight clients alongside
-//! query progress.
+//! A snapshot takes its CPU and memory figures from the request's progress
+//! figures and one `duckdb_resource_totals_read` of the request's connection.
+//! Flight clients receive it alongside query progress.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
-use std::time::Duration;
-
-use super::DuckDbConnection;
+use duckdb::InterruptHandle;
 use libduckdb_sys as ffi;
-use tracing::{trace, warn};
+
+use crate::usage::{Progress, ResourceTotals, UsageTotals};
 
 /// Snapshot of resource usage at a point in time.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceSnapshot {
     pub peak_memory_bytes: u64,
     pub current_memory_bytes: u64,
     pub cpu_time_us: u64,
 }
 
-/// The sampler thread retains the owning connection for every raw-pointer read.
-struct SendConn(ffi::duckdb_connection);
-unsafe impl Send for SendConn {}
-
-/// How long the sampler waits between samples.
-const SAMPLE_PERIOD: Duration = Duration::from_millis(100);
-
-/// Stops the sampler without waiting out its current wait. The sampler waits on
-/// the condvar rather than sleeping, so a shutdown costs the sample in flight
-/// instead of the remainder of [`SAMPLE_PERIOD`] — a `DoGet` that outlives its
-/// query by microseconds used to pay that remainder before its response stream
-/// could end.
-#[derive(Default)]
-struct Stop {
-    stopped: Mutex<bool>,
-    wake: Condvar,
-}
-
-impl Stop {
-    /// Wait out one period, or return early once [`Self::signal`] has run.
-    /// Returns whether sampling continues.
-    fn wait(&self) -> bool {
-        let stopped = self.stopped.lock().unwrap_or_else(|p| p.into_inner());
-        if *stopped {
-            return false;
-        }
-        let (stopped, _) = self
-            .wake
-            .wait_timeout(stopped, SAMPLE_PERIOD)
-            .unwrap_or_else(|p| p.into_inner());
-        !*stopped
-    }
-
-    /// A signal nothing waits on, for a tracker with no sampler thread.
-    fn stopped() -> Self {
+impl From<ffi::duckdb_usage_totals> for UsageTotals {
+    fn from(totals: ffi::duckdb_usage_totals) -> Self {
         Self {
-            stopped: Mutex::new(true),
-            wake: Condvar::new(),
+            cpu_ns: totals.cpu_ns,
+            bytes_read: totals.bytes_read,
+            bytes_written: totals.bytes_written,
         }
     }
+}
 
-    fn signal(&self) {
-        *self.stopped.lock().unwrap_or_else(|p| p.into_inner()) = true;
-        self.wake.notify_all();
+impl From<ffi::duckdb_resource_totals> for ResourceTotals {
+    fn from(totals: ffi::duckdb_resource_totals) -> Self {
+        Self {
+            connection: totals.connection.into(),
+            database: totals.database.into(),
+            memory_bytes: totals.memory_bytes,
+            memory_peak_bytes: totals.memory_peak_bytes,
+            memory_byte_ms: totals.memory_byte_ms,
+        }
     }
 }
 
-/// Mirror of InterruptHandle's internal layout (same as in progress.rs).
-#[repr(C)]
-struct InterruptHandleHack {
-    conn: std::sync::Mutex<ffi::duckdb_connection>,
-}
-
-/// Tracks resource usage of a running DuckDB query by polling on a background thread.
+/// Reads the totals of the connection behind `handle`, and of its database.
 ///
-/// Memory: uses a separate monitoring connection (via `try_clone()`) to query
-/// `duckdb_memory()` every ~100ms.
+/// The call takes no lock a running statement holds, so it returns while the
+/// statement thread executes. It runs inside the handle's mutex, which keeps
+/// the native connection open for the read. Returns `None` once the
+/// connection is closed, and when the engine reports a failure.
+pub fn read_totals(handle: &InterruptHandle) -> Option<ResourceTotals> {
+    handle
+        .with_connection(|native| {
+            let mut totals = ffi::duckdb_resource_totals {
+                connection: ffi::duckdb_usage_totals {
+                    cpu_ns: 0,
+                    bytes_read: 0,
+                    bytes_written: 0,
+                },
+                database: ffi::duckdb_usage_totals {
+                    cpu_ns: 0,
+                    bytes_read: 0,
+                    bytes_written: 0,
+                },
+                memory_bytes: 0,
+                memory_peak_bytes: 0,
+                memory_byte_ms: 0,
+            };
+            // SAFETY: `with_connection` passes a live connection and holds the
+            // mutex that closing it takes, and `totals` is a valid struct.
+            let state = unsafe { ffi::duckdb_resource_totals_read(native, &mut totals) };
+            (state == ffi::DuckDBSuccess).then(|| ResourceTotals::from(totals))
+        })
+        .flatten()
+}
+
+/// The resource figures of a request's label-1 attempts as of this call.
 ///
-/// CPU time: calls `duckdb_get_accumulated_cpu_time()` on the query connection,
-/// which acquires the profiler lock internally for thread safety.
-pub struct ResourceTracker {
-    peak_memory_bytes: Arc<AtomicU64>,
-    current_memory_bytes: Arc<AtomicU64>,
-    cpu_time_us: Arc<AtomicU64>,
-    stop: Arc<Stop>,
-    sampler_handle: Option<thread::JoinHandle<()>>,
-}
-
-impl ResourceTracker {
-    /// Start sampling resource usage on a background thread.
-    ///
-    /// - `monitoring_conn`: separate connection to the same database (for memory queries)
-    /// - `query_connection`: actual owner of the connection being sampled
-    ///
-    /// Call during blocking setup: obtaining its interrupt handle takes the
-    /// connection mutex. The sampler then reads the profiler without that mutex.
-    pub fn start(
-        monitoring_conn: duckdb::Connection,
-        query_connection: Arc<DuckDbConnection>,
-    ) -> Self {
-        let peak_memory_bytes = Arc::new(AtomicU64::new(0));
-        let current_memory_bytes = Arc::new(AtomicU64::new(0));
-        let cpu_time_us = Arc::new(AtomicU64::new(0));
-        let stop = Arc::new(Stop::default());
-
-        let peak = Arc::clone(&peak_memory_bytes);
-        let current = Arc::clone(&current_memory_bytes);
-        let cpu = Arc::clone(&cpu_time_us);
-        let stop_signal = Arc::clone(&stop);
-
-        // Derive the pointer from the same connection the thread will retain.
-        // InterruptHandle alone does not keep a native connection alive.
-        let query_interrupt = query_connection.interrupt_handle();
-        let query_conn = SendConn({
-            let hack: &InterruptHandleHack =
-                unsafe { std::mem::transmute(query_interrupt.as_ref()) };
-            *hack.conn.lock().expect("interrupt handle mutex poisoned")
-        });
-
-        let sampler_handle = thread::Builder::new()
-            .name("resource-sampler".into())
-            .spawn(move || {
-                // Keep the actual owner alive until the sampler exits. Retaining
-                // only InterruptHandle leaves a dangling pointer after session
-                // closure or a completed query whose response is still alive.
-                let _query_owner = query_connection;
-                // Force capture of entire SendConn (not just .0) for Send impl.
-                let query_conn = query_conn;
-                let mut warned = false;
-
-                loop {
-                    // Sample memory via monitoring connection
-                    match monitoring_conn.query_row(
-                        "SELECT sum(memory_usage_bytes) FROM duckdb_memory()",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    ) {
-                        Ok(memory) if memory >= 0 => {
-                            let mem = memory as u64;
-                            current.store(mem, Ordering::Relaxed);
-                            peak.fetch_max(mem, Ordering::Relaxed);
-                            trace!(memory_bytes = mem, "sampled duckdb memory");
-                            warned = false;
-                        }
-                        Ok(_) => {
-                            warned = false;
-                        }
-                        Err(e) => {
-                            if !warned {
-                                warn!(%e, "failed to query duckdb_memory()");
-                                warned = true;
-                            }
-                        }
-                    }
-
-                    // Sample CPU time from query connection's profiler
-                    if !query_conn.0.is_null() {
-                        let cpu_seconds =
-                            unsafe { ffi::duckdb_get_accumulated_cpu_time(query_conn.0) };
-                        if cpu_seconds > 0.0 {
-                            let us = (cpu_seconds * 1_000_000.0) as u64;
-                            cpu.store(us, Ordering::Relaxed);
-                            trace!(cpu_time_us = us, "sampled cpu time");
-                        }
-                    }
-
-                    // Outside the lock: a shutdown never queues behind a sample.
-                    if !stop_signal.wait() {
-                        break;
-                    }
-                }
-            })
-            .expect("failed to spawn resource sampler thread");
-
-        Self {
-            peak_memory_bytes,
-            current_memory_bytes,
-            cpu_time_us,
-            stop,
-            sampler_handle: Some(sampler_handle),
-        }
-    }
-
-    /// Create a disabled resource tracker (no sampling).
-    pub fn disabled() -> Self {
-        Self {
-            peak_memory_bytes: Arc::new(AtomicU64::new(0)),
-            current_memory_bytes: Arc::new(AtomicU64::new(0)),
-            cpu_time_us: Arc::new(AtomicU64::new(0)),
-            stop: Arc::new(Stop::stopped()),
-            sampler_handle: None,
-        }
-    }
-
-    /// Get a snapshot of current resource usage.
-    pub fn snapshot(&self) -> ResourceSnapshot {
-        ResourceSnapshot {
-            peak_memory_bytes: self.peak_memory_bytes.load(Ordering::Relaxed),
-            current_memory_bytes: self.current_memory_bytes.load(Ordering::Relaxed),
-            cpu_time_us: self.cpu_time_us.load(Ordering::Relaxed),
-        }
-    }
-}
-
-impl Drop for ResourceTracker {
-    fn drop(&mut self) {
-        self.stop.signal();
-        if let Some(handle) = self.sampler_handle.take() {
-            let _ = handle.join();
-        }
+/// While an attempt is open, the snapshot adds the database's CPU since that
+/// attempt's opening read to the CPU of the attempts that have closed, and
+/// its memory level and peak are those of one read of the connection behind
+/// `handle`. With no attempt open it reads nothing: the snapshot carries the
+/// closed attempts' CPU and their largest peak, and no memory level. Once the
+/// request's last label-1 attempt has closed, the snapshot equals the
+/// request's total.
+pub fn progress_snapshot(handle: &InterruptHandle, progress: &Progress) -> ResourceSnapshot {
+    let figures = progress.figures();
+    let current = figures.open.and_then(|_| read_totals(handle));
+    ResourceSnapshot {
+        peak_memory_bytes: current.map_or(figures.closed_peak_bytes, |read| read.memory_peak_bytes),
+        current_memory_bytes: current.map_or(0, |read| read.memory_bytes),
+        cpu_time_us: figures.cpu_ns(current.as_ref()) / 1_000,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
-    #[test]
-    fn shutdown_costs_a_sample_rather_than_a_sampling_period() {
+    use super::*;
+    use crate::engine::DuckDbConnection;
+    use crate::usage::{ExecutionLabel, RequestAccounting};
+
+    const BUSY_SQL: &str = "SELECT sum(sin(i::DOUBLE)) FROM range(200000) t(i)";
+
+    fn connection() -> Arc<DuckDbConnection> {
         let native = duckdb::Connection::open_in_memory().unwrap();
-        let monitoring = native.try_clone().unwrap();
-        let connection = Arc::new(DuckDbConnection::new(native));
-        let tracker = ResourceTracker::start(monitoring, connection);
-        // Put the sampler inside its wait, which is the state a DoGet drops it
-        // in: one sample costs a fraction of a millisecond, so this grace is
-        // three orders of magnitude clear of it and well short of one period.
-        thread::sleep(Duration::from_millis(20));
-        let start = std::time::Instant::now();
-        drop(tracker);
+        native.execute_batch("SET threads=2").unwrap();
+        Arc::new(DuckDbConnection::new(native))
+    }
+
+    /// A read never waits for the statement thread: it returns while another
+    /// thread holds the connection guard inside a statement.
+    #[test]
+    fn a_read_returns_while_a_statement_holds_the_guard() {
+        let connection = connection();
+        let handle = connection.interrupt_handle();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let worker = {
+            let connection = connection.clone();
+            thread::spawn(move || {
+                connection.with_raw(|native| {
+                    native.execute_batch(BUSY_SQL).unwrap();
+                    started_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                });
+            })
+        };
+        started_rx.recv().unwrap();
+        assert!(connection.guard_is_held());
+        let start = Instant::now();
+        let totals = read_totals(&handle).expect("the connection is open");
         let elapsed = start.elapsed();
-        // An absolute bound, not a fraction of SAMPLE_PERIOD: a sample that
-        // blocked on the profiler lock would otherwise pass unnoticed.
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(totals.database.cpu_ns > 0, "the statement's CPU is in the totals");
         assert!(
-            elapsed < Duration::from_millis(10),
-            "dropping a tracker took {elapsed:?}; a DoGet pays this before its \
-             response stream can end"
+            elapsed < Duration::from_millis(100),
+            "a read took {elapsed:?} while a statement held the guard"
         );
     }
 
+    /// The totals survive what emptied the profiling tree: an execution error
+    /// in autocommit, and an explicit rollback. They never decrease.
     #[test]
-    fn sampler_survives_autocommit_errors_and_explicit_rollbacks() {
-        let native = duckdb::Connection::open_in_memory().unwrap();
-        native.execute_batch("SET threads=2; SET enable_profiling='no_output'; \
-            SET custom_profiling_settings='{\"OPERATOR_CPU_TIME\":\"true\",\"CPU_TIME_ACTUAL\":\"true\"}'").unwrap();
-        let monitoring = native.try_clone().unwrap();
-        let connection = Arc::new(DuckDbConnection::new(native));
-        let weak = Arc::downgrade(&connection);
-        let tracker = ResourceTracker::start(monitoring, connection.clone());
-        let worker = thread::spawn(move || {
-            let native = connection.conn.lock().unwrap();
-            for _ in 0..150 {
-                // Fail during execution, after the profiler builds its tree.
+    fn totals_survive_autocommit_errors_and_explicit_rollbacks() {
+        let connection = connection();
+        let handle = connection.interrupt_handle();
+        let mut last = read_totals(&handle).unwrap();
+        for _ in 0..20 {
+            connection.with_raw(|native| {
                 let error = native.query_row::<i64, _, _>(
                     "SELECT sum(CAST(CASE WHEN i=199999 THEN 'invalid' ELSE '1' END AS BIGINT)) \
                      FROM range(200000) t(i)",
@@ -260,71 +156,87 @@ mod tests {
                     |row| row.get(0),
                 );
                 assert!(error.is_err());
+            });
+            let after_error = read_totals(&handle).unwrap();
+            assert!(after_error.database.cpu_ns > last.database.cpu_ns);
+            connection.with_raw(|native| {
                 native.execute_batch("BEGIN TRANSACTION").unwrap();
-                let _: f64 = native
-                    .query_row(
-                        "SELECT sum(sin(i::DOUBLE)) FROM range(200000) t(i)",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
+                let _: f64 = native.query_row(BUSY_SQL, [], |row| row.get(0)).unwrap();
                 native.execute_batch("ROLLBACK").unwrap();
-            }
-            let _: f64 = native
-                .query_row(
-                    "SELECT sum(sin(i::DOUBLE)) FROM range(200000) t(i)",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-        });
-        worker.join().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while tracker.snapshot().cpu_time_us == 0 && std::time::Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
+            });
+            let after_rollback = read_totals(&handle).unwrap();
+            assert!(after_rollback.database.cpu_ns > after_error.database.cpu_ns);
+            assert!(after_rollback.connection.cpu_ns >= after_error.connection.cpu_ns);
+            last = after_rollback;
         }
-        assert!(tracker.snapshot().cpu_time_us > 0);
-        assert!(weak.upgrade().is_some());
-        drop(tracker);
-        assert!(weak.upgrade().is_none());
     }
 
+    /// A handle does not keep its connection open, and a read through it
+    /// after the connection closed reports nothing.
     #[test]
-    fn sampler_retains_connection_through_query_turnover_and_owner_drop() {
-        let native = duckdb::Connection::open_in_memory().unwrap();
-        native.execute_batch("SET threads=2; SET enable_profiling='no_output'; \
-            SET custom_profiling_settings='{\"OPERATOR_CPU_TIME\":\"true\",\"CPU_TIME_ACTUAL\":\"true\"}'").unwrap();
-        let monitoring = native.try_clone().unwrap();
-        let connection = Arc::new(DuckDbConnection::new(native));
+    fn a_read_after_the_connection_closed_reports_nothing() {
+        let connection = connection();
+        let handle = connection.interrupt_handle();
         let weak = Arc::downgrade(&connection);
-        let tracker = ResourceTracker::start(monitoring, connection.clone());
-        let worker = thread::spawn(move || {
-            let native = connection.conn.lock().unwrap();
-            // Repeated start/finalize/reset while the profiler is sampled.
-            for _ in 0..150 {
-                let _: f64 = native
-                    .query_row(
-                        "SELECT sum(sin(i::DOUBLE)) FROM range(200000) t(i)",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-            }
-        });
-        worker.join().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while tracker.snapshot().cpu_time_us == 0 && std::time::Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
+        for _ in 0..20 {
+            connection
+                .execute_query(BUSY_SQL, None)
+                .expect("the query runs");
         }
-        assert!(tracker.snapshot().cpu_time_us > 0);
-        assert!(
-            weak.upgrade().is_some(),
-            "sampler lost its native connection owner"
+        assert!(read_totals(&handle).is_some());
+        drop(connection);
+        assert!(weak.upgrade().is_none(), "a handle retained its connection");
+        assert!(read_totals(&handle).is_none());
+        let progress = RequestAccounting::new("DoGet", None, None).progress();
+        assert_eq!(
+            progress_snapshot(&handle, &progress),
+            ResourceSnapshot {
+                peak_memory_bytes: 0,
+                current_memory_bytes: 0,
+                cpu_time_us: 0,
+            }
         );
-        drop(tracker);
-        assert!(
-            weak.upgrade().is_none(),
-            "sampler leaked its connection after shutdown"
-        );
+    }
+
+    /// The snapshot follows the request's label-1 attempts: it reads the
+    /// connection while one is open, and equals the request's total once the
+    /// last has closed.
+    #[test]
+    fn a_snapshot_reads_the_open_attempt_and_settles_on_the_total() {
+        let connection = connection();
+        let handle = connection.interrupt_handle();
+        let accounting = RequestAccounting::new("DoGet", None, None);
+        let progress = accounting.progress();
+
+        // A label-0 attempt is no part of the request's total.
+        connection
+            .execute_batch("SELECT 1", ExecutionLabel::SwanLake, Some(&accounting))
+            .unwrap();
+        assert_eq!(progress_snapshot(&handle, &progress).cpu_time_us, 0);
+
+        let during = connection
+            .guarded(None, Some(&accounting), |native, bracket| {
+                Ok(bracket.measure(ExecutionLabel::Client, || {
+                    native.execute_batch(BUSY_SQL).unwrap();
+                    let first = progress_snapshot(&handle, &progress);
+                    native.execute_batch(BUSY_SQL).unwrap();
+                    (first, progress_snapshot(&handle, &progress))
+                }))
+            })
+            .unwrap();
+        let (first, second) = during;
+        assert!(first.cpu_time_us > 0, "an open attempt reports its CPU so far");
+        assert!(second.cpu_time_us > first.cpu_time_us);
+        assert!(second.peak_memory_bytes >= second.current_memory_bytes);
+
+        let figures = progress.figures();
+        assert!(figures.open.is_none());
+        let settled = progress_snapshot(&handle, &progress);
+        assert_eq!(settled.cpu_time_us, figures.closed_cpu_ns / 1_000);
+        assert_eq!(settled.peak_memory_bytes, figures.closed_peak_bytes);
+        assert!(settled.cpu_time_us >= second.cpu_time_us);
+        // Later work on the connection is no part of the request.
+        connection.execute_query(BUSY_SQL, None).unwrap();
+        assert_eq!(progress_snapshot(&handle, &progress), settled);
     }
 }
