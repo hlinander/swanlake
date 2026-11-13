@@ -10,6 +10,9 @@ use tracing::warn;
 
 use super::{sa, DuckvisAuth, DuckvisError};
 
+/// The timeout of one usage-record POST. The shared client sets none.
+pub(crate) const USAGE_RECORD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A resolved project attachment (contract C3 allow path). `secret_config` is
 /// the full ATTACH statement and `secrets` the credentials it references by
 /// name; neither may be logged.
@@ -219,10 +222,21 @@ impl DuckvisAuth {
     /// Shares the SA token cache of [`Self::post_json_with_retry`]: a 401
     /// re-mints the token once and sends again, and the second response's
     /// status is the result. `Err(Unavailable)` is a failure to mint the
-    /// token or to send the request.
+    /// token, a failure to send the request, or no response within 30
+    /// seconds of a send.
     pub async fn post_usage_record(
         &self,
         record: bytes::Bytes,
+    ) -> Result<reqwest::StatusCode, DuckvisError> {
+        self.post_usage_record_within(record, USAGE_RECORD_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::post_usage_record`] with `timeout` on each send.
+    pub(crate) async fn post_usage_record_within(
+        &self,
+        record: bytes::Bytes,
+        timeout: std::time::Duration,
     ) -> Result<reqwest::StatusCode, DuckvisError> {
         let url = format!("{}/v1/usage/requests", self.api_url.trim_end_matches('/'));
         let token = sa::get_token(
@@ -235,7 +249,9 @@ impl DuckvisAuth {
         )
         .await?;
 
-        let status = self.send_usage_record(&url, record.clone(), &token).await?;
+        let status = self
+            .send_usage_record(&url, record.clone(), &token, timeout)
+            .await?;
         if status != reqwest::StatusCode::UNAUTHORIZED {
             return Ok(status);
         }
@@ -249,7 +265,7 @@ impl DuckvisAuth {
             &self.signing_key,
         )
         .await?;
-        self.send_usage_record(&url, record, &fresh).await
+        self.send_usage_record(&url, record, &fresh, timeout).await
     }
 
     async fn send_usage_record(
@@ -257,11 +273,13 @@ impl DuckvisAuth {
         url: &str,
         record: bytes::Bytes,
         token: &str,
+        timeout: std::time::Duration,
     ) -> Result<reqwest::StatusCode, DuckvisError> {
         self.client
             .post(url)
             .bearer_auth(token)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .timeout(timeout)
             .body(record)
             .send()
             .await
