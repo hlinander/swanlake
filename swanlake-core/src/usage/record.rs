@@ -1,11 +1,10 @@
 //! The record of one request: its JSON form, the SQL text rules, and the size
 //! bound.
-//!
-//! The record carries neither `ended_at` nor `error_type`: the specification
-//! defines no encoding for either.
 
 use bytes::Bytes;
 use serde::Serialize;
+
+use libduckdb_sys as ffi;
 
 use super::accounting::Entry;
 
@@ -100,6 +99,58 @@ fn can_carry_credential(sql: &str) -> bool {
     false
 }
 
+/// The name of a `duckdb_error_type` constant without its `DUCKDB_ERROR_`
+/// prefix. `None` for `DUCKDB_INVALID_CONFIGURATION`, which has no such
+/// prefix, and for a value that is no constant of the enum.
+pub(super) fn error_type_name(error_type: ffi::duckdb_error_type) -> Option<&'static str> {
+    let name = match error_type {
+        ffi::duckdb_error_type_DUCKDB_ERROR_INVALID => "INVALID",
+        ffi::duckdb_error_type_DUCKDB_ERROR_OUT_OF_RANGE => "OUT_OF_RANGE",
+        ffi::duckdb_error_type_DUCKDB_ERROR_CONVERSION => "CONVERSION",
+        ffi::duckdb_error_type_DUCKDB_ERROR_UNKNOWN_TYPE => "UNKNOWN_TYPE",
+        ffi::duckdb_error_type_DUCKDB_ERROR_DECIMAL => "DECIMAL",
+        ffi::duckdb_error_type_DUCKDB_ERROR_MISMATCH_TYPE => "MISMATCH_TYPE",
+        ffi::duckdb_error_type_DUCKDB_ERROR_DIVIDE_BY_ZERO => "DIVIDE_BY_ZERO",
+        ffi::duckdb_error_type_DUCKDB_ERROR_OBJECT_SIZE => "OBJECT_SIZE",
+        ffi::duckdb_error_type_DUCKDB_ERROR_INVALID_TYPE => "INVALID_TYPE",
+        ffi::duckdb_error_type_DUCKDB_ERROR_SERIALIZATION => "SERIALIZATION",
+        ffi::duckdb_error_type_DUCKDB_ERROR_TRANSACTION => "TRANSACTION",
+        ffi::duckdb_error_type_DUCKDB_ERROR_NOT_IMPLEMENTED => "NOT_IMPLEMENTED",
+        ffi::duckdb_error_type_DUCKDB_ERROR_EXPRESSION => "EXPRESSION",
+        ffi::duckdb_error_type_DUCKDB_ERROR_CATALOG => "CATALOG",
+        ffi::duckdb_error_type_DUCKDB_ERROR_PARSER => "PARSER",
+        ffi::duckdb_error_type_DUCKDB_ERROR_PLANNER => "PLANNER",
+        ffi::duckdb_error_type_DUCKDB_ERROR_SCHEDULER => "SCHEDULER",
+        ffi::duckdb_error_type_DUCKDB_ERROR_EXECUTOR => "EXECUTOR",
+        ffi::duckdb_error_type_DUCKDB_ERROR_CONSTRAINT => "CONSTRAINT",
+        ffi::duckdb_error_type_DUCKDB_ERROR_INDEX => "INDEX",
+        ffi::duckdb_error_type_DUCKDB_ERROR_STAT => "STAT",
+        ffi::duckdb_error_type_DUCKDB_ERROR_CONNECTION => "CONNECTION",
+        ffi::duckdb_error_type_DUCKDB_ERROR_SYNTAX => "SYNTAX",
+        ffi::duckdb_error_type_DUCKDB_ERROR_SETTINGS => "SETTINGS",
+        ffi::duckdb_error_type_DUCKDB_ERROR_BINDER => "BINDER",
+        ffi::duckdb_error_type_DUCKDB_ERROR_NETWORK => "NETWORK",
+        ffi::duckdb_error_type_DUCKDB_ERROR_OPTIMIZER => "OPTIMIZER",
+        ffi::duckdb_error_type_DUCKDB_ERROR_NULL_POINTER => "NULL_POINTER",
+        ffi::duckdb_error_type_DUCKDB_ERROR_IO => "IO",
+        ffi::duckdb_error_type_DUCKDB_ERROR_INTERRUPT => "INTERRUPT",
+        ffi::duckdb_error_type_DUCKDB_ERROR_FATAL => "FATAL",
+        ffi::duckdb_error_type_DUCKDB_ERROR_INTERNAL => "INTERNAL",
+        ffi::duckdb_error_type_DUCKDB_ERROR_INVALID_INPUT => "INVALID_INPUT",
+        ffi::duckdb_error_type_DUCKDB_ERROR_OUT_OF_MEMORY => "OUT_OF_MEMORY",
+        ffi::duckdb_error_type_DUCKDB_ERROR_PERMISSION => "PERMISSION",
+        ffi::duckdb_error_type_DUCKDB_ERROR_PARAMETER_NOT_RESOLVED => "PARAMETER_NOT_RESOLVED",
+        ffi::duckdb_error_type_DUCKDB_ERROR_PARAMETER_NOT_ALLOWED => "PARAMETER_NOT_ALLOWED",
+        ffi::duckdb_error_type_DUCKDB_ERROR_DEPENDENCY => "DEPENDENCY",
+        ffi::duckdb_error_type_DUCKDB_ERROR_HTTP => "HTTP",
+        ffi::duckdb_error_type_DUCKDB_ERROR_MISSING_EXTENSION => "MISSING_EXTENSION",
+        ffi::duckdb_error_type_DUCKDB_ERROR_AUTOLOAD => "AUTOLOAD",
+        ffi::duckdb_error_type_DUCKDB_ERROR_SEQUENCE => "SEQUENCE",
+        _ => return None,
+    };
+    Some(name)
+}
+
 /// The parts of a record that [`serialize`] puts into one JSON object.
 pub(super) struct RecordParts<'a> {
     pub(super) request_id: uuid::Uuid,
@@ -107,6 +158,8 @@ pub(super) struct RecordParts<'a> {
     pub(super) subject: &'a str,
     pub(super) endpoint: &'a str,
     pub(super) sql: &'a SqlText,
+    pub(super) ended_at: chrono::DateTime<chrono::Utc>,
+    pub(super) error_type: Option<&'static str>,
     pub(super) entries: Vec<Entry>,
 }
 
@@ -120,6 +173,9 @@ struct RecordJson<'a> {
     sql: Option<&'a str>,
     sql_truncated: bool,
     sql_redacted: bool,
+    ended_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_type: Option<&'static str>,
     breakdown_omitted: bool,
     entries: &'a [Entry],
 }
@@ -163,6 +219,10 @@ fn to_json(parts: &RecordParts<'_>, breakdown_omitted: bool) -> Vec<u8> {
         sql: parts.sql.text.as_deref(),
         sql_truncated: parts.sql.truncated,
         sql_redacted: parts.sql.redacted,
+        ended_at: parts
+            .ended_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        error_type: parts.error_type,
         breakdown_omitted,
         entries: &parts.entries,
     };
@@ -217,6 +277,9 @@ mod tests {
             subject: "subject-1",
             endpoint: "DoGet",
             sql,
+            ended_at: chrono::DateTime::from_timestamp(1_700_000_000, 123_456_789)
+                .expect("valid timestamp"),
+            error_type: None,
             entries,
         }
     }
@@ -270,7 +333,7 @@ mod tests {
     #[test]
     fn record_carries_the_specified_fields() {
         let sql = SqlText::capture("SELECT 1");
-        let record_parts = parts(
+        let mut record_parts = parts(
             &sql,
             vec![
                 entry(0, Some(node("t", vec![node("child", vec![])]))),
@@ -281,6 +344,7 @@ mod tests {
                 },
             ],
         );
+        record_parts.error_type = error_type_name(ffi::duckdb_error_type_DUCKDB_ERROR_TRANSACTION);
 
         assert_eq!(
             parse(serialize(record_parts)),
@@ -292,6 +356,8 @@ mod tests {
                 "sql": "SELECT 1",
                 "sql_truncated": false,
                 "sql_redacted": false,
+                "ended_at": "2023-11-14T22:13:20.123Z",
+                "error_type": "TRANSACTION",
                 "breakdown_omitted": false,
                 "entries": [
                     entry_json(0, "CLIENT", false, Some(node_json("t", json!([node_json("child", json!([]))])))),
@@ -302,14 +368,63 @@ mod tests {
     }
 
     #[test]
-    fn record_without_sql_omits_it() {
+    fn record_without_sql_or_error_type_omits_both() {
         let sql = SqlText::default();
         let record = parse(serialize(parts(&sql, vec![entry(0, None)])));
         let object = record.as_object().expect("record is an object");
 
         assert!(!object.contains_key("sql"));
+        assert!(!object.contains_key("error_type"));
         assert_eq!(object["sql_truncated"], json!(false));
         assert_eq!(object["sql_redacted"], json!(false));
+    }
+
+    #[test]
+    fn ended_at_is_utc_with_millisecond_precision() {
+        let sql = SqlText::default();
+        let mut record_parts = parts(&sql, vec![entry(0, None)]);
+        record_parts.ended_at =
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp");
+
+        let record = parse(serialize(record_parts));
+
+        assert_eq!(record["ended_at"], json!("2023-11-14T22:13:20.000Z"));
+    }
+
+    #[test]
+    fn error_type_names_drop_the_constant_prefix() {
+        assert_eq!(
+            error_type_name(ffi::duckdb_error_type_DUCKDB_ERROR_INVALID),
+            Some("INVALID")
+        );
+        assert_eq!(
+            error_type_name(ffi::duckdb_error_type_DUCKDB_ERROR_TRANSACTION),
+            Some("TRANSACTION")
+        );
+        assert_eq!(
+            error_type_name(ffi::duckdb_error_type_DUCKDB_ERROR_PARAMETER_NOT_RESOLVED),
+            Some("PARAMETER_NOT_RESOLVED")
+        );
+        assert_eq!(
+            error_type_name(ffi::duckdb_error_type_DUCKDB_ERROR_SEQUENCE),
+            Some("SEQUENCE")
+        );
+        // Every value from the first constant to the last prefixed one has a
+        // distinct name.
+        let names = (0..=41)
+            .map(error_type_name)
+            .collect::<Option<std::collections::BTreeSet<_>>>()
+            .expect("a name for each prefixed constant");
+        assert_eq!(names.len(), 42);
+    }
+
+    #[test]
+    fn error_types_without_the_prefix_have_no_name() {
+        assert_eq!(
+            error_type_name(ffi::duckdb_error_type_DUCKDB_INVALID_CONFIGURATION),
+            None
+        );
+        assert_eq!(error_type_name(43), None);
     }
 
     #[test]

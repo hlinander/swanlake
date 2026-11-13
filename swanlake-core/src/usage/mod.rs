@@ -16,8 +16,8 @@ mod queue;
 mod record;
 
 pub use accounting::{
-    BreakdownNode, Entry, ExecutionLabel, ProgressFigures, RequestAccounting, ResourceTotals,
-    UsageTotals,
+    BreakdownNode, Entry, ExecutionLabel, Progress, ProgressFigures, RequestAccounting,
+    ResourceTotals, UsageTotals,
 };
 pub use queue::{spawn_delivery, UsageQueue, MAX_QUEUE_BYTES};
 pub use record::{MAX_RECORD_BYTES, MAX_SQL_BYTES};

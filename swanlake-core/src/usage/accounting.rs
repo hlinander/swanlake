@@ -1,7 +1,7 @@
 //! Request accounting: one request's identity, its entries, and its progress
 //! figures, from admission until its record is queued.
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::Serialize;
 use uuid::Uuid;
@@ -155,6 +155,24 @@ impl ProgressFigures {
     }
 }
 
+/// A request's progress figures, shared between the request's accounting,
+/// which writes them, and readers that outlive it. Clones share one value.
+#[derive(Debug, Clone, Default)]
+pub struct Progress(Arc<Mutex<ProgressFigures>>);
+
+impl Progress {
+    /// The figures as of this call.
+    pub fn figures(&self) -> ProgressFigures {
+        *self.lock()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, ProgressFigures> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// Where a request's record goes, and the attribution it carries.
 struct Destination {
     project_id: String,
@@ -167,7 +185,7 @@ struct State {
     next_attempt_id: u64,
     entries: Vec<Entry>,
     sql: Option<SqlText>,
-    progress: ProgressFigures,
+    error_type: Option<&'static str>,
 }
 
 /// One request's identity, entries, and progress figures.
@@ -181,6 +199,7 @@ pub struct RequestAccounting {
     endpoint: String,
     destination: Option<Destination>,
     state: Mutex<State>,
+    progress: Progress,
 }
 
 impl RequestAccounting {
@@ -208,6 +227,7 @@ impl RequestAccounting {
             endpoint: endpoint.into(),
             destination,
             state: Mutex::new(State::default()),
+            progress: Progress::default(),
         }
     }
 
@@ -229,11 +249,21 @@ impl RequestAccounting {
         self.state().sql.get_or_insert(captured);
     }
 
+    /// Records the DuckDB error type of the failure that failed the request
+    /// in the engine. The record carries the type's name. The first type set
+    /// is the request's; later calls change nothing. A type that
+    /// has no name sets nothing.
+    pub fn set_error_type(&self, error_type: libduckdb_sys::duckdb_error_type) {
+        if let Some(name) = record::error_type_name(error_type) {
+            self.state().error_type.get_or_insert(name);
+        }
+    }
+
     /// Records the opening read of an attempt. A label-1 attempt becomes the
     /// open attempt of the progress figures.
     pub fn attempt_opened(&self, label: ExecutionLabel, opening: &ResourceTotals) {
         if label == ExecutionLabel::Client {
-            self.state().progress.open = Some(*opening);
+            self.progress.lock().open = Some(*opening);
         }
     }
 
@@ -257,7 +287,7 @@ impl RequestAccounting {
                 .database
                 .cpu_ns
                 .saturating_sub(opening.database.cpu_ns);
-            let progress = &mut state.progress;
+            let mut progress = self.progress.lock();
             progress.closed_cpu_ns = progress.closed_cpu_ns.saturating_add(cpu_ns);
             progress.closed_peak_bytes = progress.closed_peak_bytes.max(closing.memory_peak_bytes);
             progress.open = None;
@@ -270,9 +300,10 @@ impl RequestAccounting {
         attempt_id
     }
 
-    /// The progress figures of the request's label-1 attempts.
-    pub fn progress(&self) -> ProgressFigures {
-        self.state().progress
+    /// The progress figures of the request's label-1 attempts. The handle
+    /// stays readable after the accounting is dropped.
+    pub fn progress(&self) -> Progress {
+        self.progress.clone()
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -302,6 +333,8 @@ impl Drop for RequestAccounting {
             subject: &destination.subject,
             endpoint: &self.endpoint,
             sql: &sql,
+            ended_at: chrono::Utc::now(),
+            error_type: state.error_type,
             entries: state.entries,
         }));
     }
@@ -580,7 +613,7 @@ mod tests {
 
         // Attempt ids and progress figures do not depend on a destination.
         assert_eq!(attempt_id, 0);
-        assert_eq!(accounting.progress().closed_cpu_ns, 5);
+        assert_eq!(accounting.progress().figures().closed_cpu_ns, 5);
         drop(accounting);
         assert!(queued(&queue).is_empty());
     }
@@ -606,6 +639,98 @@ mod tests {
     }
 
     #[test]
+    fn the_record_carries_the_first_error_type_by_name() {
+        use libduckdb_sys as ffi;
+
+        let (queue, _metrics) = queue();
+        let accounting = RequestAccounting::new("DoGet", Some(&auth()), Some(queue.clone()));
+        // A type with no name sets nothing, so the next call is the first.
+        accounting.set_error_type(ffi::duckdb_error_type_DUCKDB_INVALID_CONFIGURATION);
+        accounting.set_error_type(ffi::duckdb_error_type_DUCKDB_ERROR_CONSTRAINT);
+        accounting.set_error_type(ffi::duckdb_error_type_DUCKDB_ERROR_TRANSACTION);
+        accounting.push_entry(
+            ExecutionLabel::Client,
+            &totals(0, 0),
+            &totals(1, 1),
+            false,
+            None,
+        );
+
+        drop(accounting);
+
+        assert_eq!(queued(&queue)[0]["error_type"], json!("CONSTRAINT"));
+    }
+
+    #[test]
+    fn a_request_that_sets_no_error_type_omits_it() {
+        let (queue, _metrics) = queue();
+        let accounting = RequestAccounting::new("DoGet", Some(&auth()), Some(queue.clone()));
+        accounting.push_entry(
+            ExecutionLabel::Client,
+            &totals(0, 0),
+            &totals(1, 1),
+            false,
+            None,
+        );
+
+        drop(accounting);
+
+        assert!(queued(&queue)[0].get("error_type").is_none());
+    }
+
+    #[test]
+    fn ended_at_is_the_time_of_the_drop() {
+        let (queue, _metrics) = queue();
+        let accounting = RequestAccounting::new("DoGet", Some(&auth()), Some(queue.clone()));
+        accounting.push_entry(
+            ExecutionLabel::Client,
+            &totals(0, 0),
+            &totals(1, 1),
+            false,
+            None,
+        );
+
+        let before = chrono::Utc::now();
+        drop(accounting);
+        let after = chrono::Utc::now();
+
+        let records = queued(&queue);
+        let text = records[0]["ended_at"].as_str().expect("ended_at");
+        // `YYYY-MM-DDTHH:MM:SS.mmmZ`
+        assert_eq!(text.len(), 24);
+        assert!(text.ends_with('Z'));
+        let ended_at = chrono::DateTime::parse_from_rfc3339(text).expect("RFC 3339");
+        assert!(ended_at >= before - chrono::Duration::milliseconds(1));
+        assert!(ended_at <= after);
+    }
+
+    #[test]
+    fn the_progress_handle_outlives_the_accounting() {
+        let accounting = RequestAccounting::new("DoGet", None, None);
+        let progress = accounting.progress();
+        accounting.attempt_opened(ExecutionLabel::Client, &totals(10, 0));
+        assert_eq!(progress.figures().open, Some(totals(10, 0)));
+        accounting.push_entry(
+            ExecutionLabel::Client,
+            &totals(10, 0),
+            &totals(40, 77),
+            false,
+            None,
+        );
+
+        drop(accounting);
+
+        assert_eq!(
+            progress.figures(),
+            ProgressFigures {
+                closed_cpu_ns: 30,
+                closed_peak_bytes: 77,
+                open: None,
+            }
+        );
+    }
+
+    #[test]
     fn an_oversized_record_is_counted_and_not_queued() {
         let (queue, metrics) = queue();
         let accounting = RequestAccounting::new("DoPut", Some(&auth()), Some(queue.clone()));
@@ -628,7 +753,7 @@ mod tests {
     #[test]
     fn progress_follows_the_label_1_attempts() {
         let accounting = RequestAccounting::new("DoGet", None, None);
-        assert_eq!(accounting.progress(), ProgressFigures::default());
+        assert_eq!(accounting.progress().figures(), ProgressFigures::default());
 
         // A label-0 attempt enters no progress figure.
         accounting.attempt_opened(ExecutionLabel::SwanLake, &totals(100, 0));
@@ -639,11 +764,11 @@ mod tests {
             false,
             None,
         );
-        assert_eq!(accounting.progress(), ProgressFigures::default());
+        assert_eq!(accounting.progress().figures(), ProgressFigures::default());
 
         let first_open = totals(150, 0);
         accounting.attempt_opened(ExecutionLabel::Client, &first_open);
-        let progress = accounting.progress();
+        let progress = accounting.progress().figures();
         assert_eq!(progress.open, Some(first_open));
         assert_eq!(progress.cpu_ns(None), 0);
         assert_eq!(progress.cpu_ns(Some(&totals(180, 0))), 30);
@@ -655,7 +780,7 @@ mod tests {
             false,
             None,
         );
-        let progress = accounting.progress();
+        let progress = accounting.progress().figures();
         assert_eq!(
             progress,
             ProgressFigures {
@@ -669,7 +794,13 @@ mod tests {
 
         let second_open = totals(200, 0);
         accounting.attempt_opened(ExecutionLabel::Client, &second_open);
-        assert_eq!(accounting.progress().cpu_ns(Some(&totals(210, 0))), 60);
+        assert_eq!(
+            accounting
+                .progress()
+                .figures()
+                .cpu_ns(Some(&totals(210, 0))),
+            60
+        );
         accounting.push_entry(
             ExecutionLabel::Client,
             &second_open,
@@ -678,7 +809,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            accounting.progress(),
+            accounting.progress().figures(),
             ProgressFigures {
                 closed_cpu_ns: 125,
                 closed_peak_bytes: 500,
