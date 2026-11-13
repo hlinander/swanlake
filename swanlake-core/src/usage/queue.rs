@@ -616,6 +616,16 @@ mod tests {
     /// and never answer it.
     const STALL: u16 = 0;
 
+    /// How the stand-in API departs from answering every request at once.
+    #[derive(Default)]
+    struct Behavior {
+        /// The token mint, counted from 1, that is held open and never
+        /// answered.
+        stalled_mint: Option<usize>,
+        /// How long every answer is held back.
+        answer_delay: Duration,
+    }
+
     /// A local HTTP listener standing in for the duckvis API. It mints
     /// `token-1`, `token-2`, … at the token route and answers each usage POST
     /// with the next scripted status.
@@ -626,6 +636,10 @@ mod tests {
 
     impl StandInApi {
         fn start(usage_statuses: impl IntoIterator<Item = u16>) -> Self {
+            Self::start_with(usage_statuses, Behavior::default())
+        }
+
+        fn start_with(usage_statuses: impl IntoIterator<Item = u16>, behavior: Behavior) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             let url = format!("http://{}", listener.local_addr().expect("local addr"));
             let received = Arc::new(Mutex::new(Vec::new()));
@@ -646,11 +660,13 @@ mod tests {
                     } else {
                         (usage_statuses.pop_front().unwrap_or(500), String::new())
                     };
+                    let is_mint = request.path == "/v1/auth/oauth/token";
                     seen.lock().expect("received").push(request);
-                    if status == STALL {
+                    if status == STALL || (is_mint && behavior.stalled_mint == Some(minted)) {
                         stalled.push(stream);
                         continue;
                     }
+                    std::thread::sleep(behavior.answer_delay);
                     let response = format!(
                         "HTTP/1.1 {status} Scripted\r\ncontent-type: application/json\r\n\
                          content-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -893,6 +909,109 @@ mod tests {
             crate::duckvis::api::USAGE_RECORD_TIMEOUT,
             Duration::from_secs(30)
         );
+    }
+
+    #[tokio::test]
+    async fn a_token_mint_that_never_answers_times_out() {
+        let api = StandInApi::start_with(
+            [204],
+            Behavior {
+                stalled_mint: Some(1),
+                ..Behavior::default()
+            },
+        );
+
+        let started = std::time::Instant::now();
+        let status = api
+            .auth()
+            .post_usage_record_within(Bytes::from_static(b"{}"), Duration::from_millis(200))
+            .await;
+
+        assert_eq!(status, Err(crate::duckvis::DuckvisError::Unavailable));
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert_eq!(api.token_mints(), 1);
+        assert!(api.usage_posts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_re_mint_that_never_answers_times_out() {
+        let api = StandInApi::start_with(
+            [401, 204],
+            Behavior {
+                stalled_mint: Some(2),
+                ..Behavior::default()
+            },
+        );
+
+        let started = std::time::Instant::now();
+        let status = api
+            .auth()
+            .post_usage_record_within(Bytes::from_static(b"{}"), Duration::from_millis(200))
+            .await;
+
+        assert_eq!(status, Err(crate::duckvis::DuckvisError::Unavailable));
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert_eq!(api.token_mints(), 2);
+        assert_eq!(api.usage_posts().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn one_limit_covers_the_mint_and_the_send_together() {
+        // Each answer arrives within the limit, and the two together do not.
+        let api = StandInApi::start_with(
+            [204],
+            Behavior {
+                answer_delay: Duration::from_millis(300),
+                ..Behavior::default()
+            },
+        );
+
+        let status = api
+            .auth()
+            .post_usage_record_within(Bytes::from_static(b"{}"), Duration::from_millis(450))
+            .await;
+
+        assert_eq!(status, Err(crate::duckvis::DuckvisError::Unavailable));
+        assert_eq!(api.token_mints(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_send_that_passes_the_limit_is_sent_again() {
+        let api = StandInApi::start_with(
+            [204],
+            Behavior {
+                stalled_mint: Some(1),
+                ..Behavior::default()
+            },
+        );
+        let (queue, metrics) = queue_with_max_bytes(MAX_QUEUE_BYTES);
+        let record = queue_one_record(&queue);
+        let auth = api.auth();
+        let waits = Mutex::new(Vec::new());
+        let send = |record: Bytes| {
+            let auth = Arc::clone(&auth);
+            async move {
+                auth.post_usage_record_within(record, Duration::from_millis(200))
+                    .await
+                    .ok()
+                    .map(|status| status.as_u16())
+            }
+        };
+        let wait = |duration: Duration| {
+            waits.lock().expect("waits").push(duration.as_secs());
+            std::future::ready(())
+        };
+
+        deliver_head(&queue, &send, &wait).await;
+
+        // The first send timed out in its mint; the second minted and sent.
+        assert_eq!(*waits.lock().expect("waits"), vec![1]);
+        assert_eq!(api.token_mints(), 2);
+        let posts = api.usage_posts();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].body, record);
+        assert!(queue.snapshot().is_empty());
+        assert_eq!(dropped(&metrics), (0, 0, 0));
     }
 
     #[tokio::test]
