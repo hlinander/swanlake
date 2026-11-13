@@ -34,6 +34,9 @@ use crate::session::id::{
 #[derive(Debug, Clone)]
 pub struct PreparedStatementMeta {
     pub sql: String,
+    /// The text the client's `CreatePreparedStatement` request sent, ahead
+    /// of any rewrite. A request that runs the statement reports this text.
+    pub client_sql: String,
     pub is_query: bool,
     pub schema: Option<Schema>,
     pub ephemeral: bool,
@@ -49,6 +52,8 @@ pub struct PreparedStatementMeta {
 pub struct PreparedStatementOptions {
     pub cached_schema: Option<Schema>,
     pub ephemeral: bool,
+    /// The text the client sent, where it differs from the text to run.
+    pub client_sql: Option<String>,
 }
 
 impl PreparedStatementOptions {
@@ -63,6 +68,11 @@ impl PreparedStatementOptions {
 
     pub fn ephemeral(mut self) -> Self {
         self.ephemeral = true;
+        self
+    }
+
+    pub fn with_client_sql(mut self, sql: String) -> Self {
+        self.client_sql = Some(sql);
         self
     }
 }
@@ -790,6 +800,7 @@ impl Session {
 
         let handle = self.statement_handle_gen.next();
         let meta = PreparedStatementMeta {
+            client_sql: options.client_sql.unwrap_or_else(|| sql.clone()),
             sql,
             is_query,
             schema: options.cached_schema,

@@ -98,6 +98,7 @@ pub(crate) async fn do_action_create_prepared_statement(
 
     tracing::Span::current().record("is_query", is_query);
     let (session, accounting) = service.prepare_request(&request, "DoAction").await?;
+    accounting.set_sql(&raw_sql);
 
     if multi_statement && is_query {
         debug!(
@@ -153,7 +154,9 @@ pub(crate) async fn do_action_create_prepared_statement(
         .create_prepared_statement(
             sql.clone(),
             is_query,
-            PreparedStatementOptions::new().with_cached_schema(cached_schema),
+            PreparedStatementOptions::new()
+                .with_cached_schema(cached_schema)
+                .with_client_sql(raw_sql),
         )
         .map_err(SwanFlightSqlService::status_from_error)?;
 
@@ -279,7 +282,7 @@ pub(crate) async fn get_flight_info_prepared_statement(
         "GetFlightInfo",
     )
     .await?;
-    accounting.set_sql(&meta.sql);
+    accounting.set_sql(&meta.client_sql);
 
     let returns_rows = meta.is_query;
     info!(
@@ -353,7 +356,7 @@ pub(crate) async fn do_get_prepared_statement(
         "DoGet",
     )
     .await?;
-    accounting.set_sql(&meta.sql);
+    accounting.set_sql(&meta.client_sql);
 
     if meta.is_query {
         service
@@ -424,15 +427,24 @@ pub(crate) async fn do_put_prepared_statement_update(
     query: CommandPreparedStatementUpdate,
     request: Request<PeekableFlightDataStream>,
 ) -> Result<i64, Status> {
-    let (session, accounting, handle, PreparedStatementMeta { sql, is_query, .. }) =
-        resolve_session_and_meta(
-            service,
-            query.prepared_statement_handle.as_ref(),
-            "do_put_prepared_statement_update",
-            &request,
-            "DoPut",
-        )
-        .await?;
+    let (
+        session,
+        accounting,
+        handle,
+        PreparedStatementMeta {
+            sql,
+            client_sql,
+            is_query,
+            ..
+        },
+    ) = resolve_session_and_meta(
+        service,
+        query.prepared_statement_handle.as_ref(),
+        "do_put_prepared_statement_update",
+        &request,
+        "DoPut",
+    )
+    .await?;
 
     if is_query {
         error!(
@@ -465,7 +477,7 @@ pub(crate) async fn do_put_prepared_statement_update(
         let batches = SwanFlightSqlService::collect_record_batches(request).await?;
         if batches.is_empty() {
             // No batches sent, execute the statement with empty params.
-            accounting.set_sql(&sql);
+            accounting.set_sql(&client_sql);
             let session_clone = Arc::clone(&session);
             let accounting_clone = Arc::clone(&accounting);
             let sql_for_exec = sql.clone();
@@ -574,7 +586,7 @@ pub(crate) async fn do_put_prepared_statement_update(
             "executing prepared statement update with parameters"
         );
 
-        accounting.set_sql(&sql);
+        accounting.set_sql(&client_sql);
         let session_clone = Arc::clone(&session);
         let accounting_clone = Arc::clone(&accounting);
         let sql_for_exec = sql.clone();
