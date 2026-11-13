@@ -9,6 +9,8 @@
 
 pub(crate) mod batch;
 mod breakdown;
+#[cfg(test)]
+mod extension_bytes;
 pub mod cancellation;
 pub mod connection;
 pub mod kernel_telemetry;
