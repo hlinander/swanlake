@@ -26,11 +26,12 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace};
 
 use crate::engine::cancellation::{CancelOnDrop, RequestCancellation};
-use crate::engine::{ResourceSnapshot, ResourceTracker, StreamingBatch, query_progress};
+use crate::engine::{ResourceSnapshot, StreamingBatch, progress_snapshot, query_progress};
 use crate::session::Session;
+use crate::usage::{Progress, RequestAccounting};
 
 use super::SwanFlightSqlService;
 
@@ -129,10 +130,16 @@ impl SwanFlightSqlService {
     /// - A monitor task watches for receiver closure (client disconnect)
     /// - Disconnects cancel this request while it owns the connection
     /// - Dropping a completed stream cannot interrupt a subsequent query
+    ///
+    /// The stream task holds `accounting` until the query ends, so the
+    /// request's record is queued after its last attempt closes and not when
+    /// the handler returns. The response stream holds the progress figures
+    /// alone.
     pub(crate) async fn execute_query_streaming(
         session: Arc<Session>,
         sql: String,
         params: Option<Vec<duckdb::types::Value>>,
+        accounting: Arc<RequestAccounting>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         // Create channel for streaming batches (buffer of 4 for pipelining)
         let (tx, rx) = mpsc::channel::<StreamingBatch>(4);
@@ -144,32 +151,12 @@ impl SwanFlightSqlService {
         // off the async runtime and reject cancelled requests after acquisition.
         let setup_session = session.clone();
         let setup_cancellation = cancellation.clone();
-        let (interrupt_handle, resource_tracker) = tokio::task::spawn_blocking(move || {
-            let conn = setup_session
-                .connection
-                .conn
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let interrupt_handle = tokio::task::spawn_blocking(move || {
+            let interrupt = setup_session.connection.interrupt_handle();
             setup_cancellation
                 .check()
                 .map_err(Self::status_from_error)?;
-            let interrupt = conn.interrupt_handle();
-            let monitor = conn.try_clone();
-            drop(conn);
-            let resource_tracker = match monitor {
-                Ok(conn) => Arc::new(ResourceTracker::start(
-                    conn,
-                    setup_session.connection.clone(),
-                )),
-                Err(e) => {
-                    warn!(%e, "failed to clone monitoring connection, resource tracking disabled");
-                    Arc::new(ResourceTracker::disabled())
-                }
-            };
-            setup_cancellation
-                .check()
-                .map_err(Self::status_from_error)?;
-            Ok::<_, Status>((interrupt, resource_tracker))
+            Ok::<_, Status>(interrupt)
         })
         .await
         .map_err(Self::status_from_join)??;
@@ -183,20 +170,26 @@ impl SwanFlightSqlService {
 
         let query_connection = session.connection.clone();
         let sql_clone = sql.clone();
+        let progress = accounting.progress();
         tokio::task::spawn_blocking(move || {
             let result = cancellation
                 .check()
-                .and_then(|()| session.ensure_lockdown())
+                .and_then(|()| session.ensure_lockdown(Some(&accounting)))
                 .and_then(|()| {
                     session.connection.stream_query_cancellable(
                         &sql_clone,
                         params.as_deref(),
                         tx.clone(),
                         &cancellation,
+                        Some(&accounting),
                     )
                 });
             if let Err(e) = result {
                 error!(%e, "streaming query execution failed");
+                Self::record_failure(&accounting, &e);
+                // The record is queued before the client can observe the
+                // stream's end.
+                drop(accounting);
                 let _ = tx.blocking_send(StreamingBatch::Error(e));
             }
         });
@@ -211,7 +204,7 @@ impl SwanFlightSqlService {
         let stream = StreamingBatchToFlightData::new(
             rx_stream,
             interrupt_handle,
-            resource_tracker,
+            progress,
             cancel_on_disconnect,
             query_connection,
         );
@@ -239,8 +232,8 @@ struct StreamingBatchToFlightData<S> {
     interrupt_handle: Arc<InterruptHandle>,
     /// Cancels only the query belonging to this response, even after completion.
     _cancel_on_disconnect: CancelOnDrop,
-    /// Resource tracker for memory usage sampling.
-    resource_tracker: Arc<ResourceTracker>,
+    /// The request's progress figures, which outlive its accounting.
+    progress: Progress,
     /// Rows sent so far (for fallback progress calculation)
     rows_sent: u64,
     /// Periodic timer for sending progress heartbeats between data batches.
@@ -251,7 +244,7 @@ impl<S> StreamingBatchToFlightData<S> {
     fn new(
         inner: S,
         interrupt_handle: Arc<InterruptHandle>,
-        resource_tracker: Arc<ResourceTracker>,
+        progress: Progress,
         cancel_on_disconnect: CancelOnDrop,
         query_connection: Arc<crate::engine::DuckDbConnection>,
     ) -> Self {
@@ -268,10 +261,15 @@ impl<S> StreamingBatchToFlightData<S> {
             done: false,
             interrupt_handle,
             _cancel_on_disconnect: cancel_on_disconnect,
-            resource_tracker,
+            progress,
             rows_sent: 0,
             heartbeat,
         }
+    }
+
+    /// The request's CPU and memory figures as of this call.
+    fn snapshot(&self) -> ResourceSnapshot {
+        progress_snapshot(&self.interrupt_handle, &self.progress)
     }
 
     /// Get current progress (0.0 to 1.0) from DuckDB's query progress API.
@@ -320,7 +318,7 @@ where
 
                     // Get progress and resource stats
                     let progress = self.get_progress();
-                    let snapshot = self.resource_tracker.snapshot();
+                    let snapshot = self.snapshot();
                     info!(
                         rows = batch_rows,
                         total_rows_sent = self.rows_sent,
@@ -361,7 +359,7 @@ where
                 if let Some(schema) = self.schema.clone() {
                     if self.heartbeat.poll_tick(cx).is_ready() {
                         let progress = self.get_progress();
-                        let snapshot = self.resource_tracker.snapshot();
+                        let snapshot = self.snapshot();
                         let has_data = progress.is_some()
                             || snapshot.peak_memory_bytes > 0
                             || snapshot.cpu_time_us > 0;
@@ -411,6 +409,11 @@ mod cancellation_tests {
         assert!(metadata.get("cpu_time_us").is_none());
     }
 
+    /// The accounting of a request whose record nothing reads.
+    fn accounting() -> Arc<RequestAccounting> {
+        Arc::new(RequestAccounting::new("DoGet", None, None))
+    }
+
     async fn session() -> anyhow::Result<Arc<Session>> {
         let config = ServerConfig::default();
         let registry = SessionRegistry::new(
@@ -429,38 +432,47 @@ mod cancellation_tests {
             .await?)
     }
 
+    /// The progress messages of a running statement carry the CPU the
+    /// database has used since the attempt opened: the figure is positive and
+    /// rises while the statement still holds the connection guard, and it
+    /// never falls.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn executing_query_reports_positive_cpu_before_completion() -> anyhow::Result<()> {
+    async fn executing_query_reports_rising_cpu_before_completion() -> anyhow::Result<()> {
         use futures::StreamExt;
         let session = session().await?;
         let mut response = SwanFlightSqlService::execute_query_streaming(
             session.clone(),
-            // The aggregate flushes profiling data while the cross-product
-            // continues streaming under client backpressure.
+            // The aggregate uses CPU before the first row, and the
+            // cross-product keeps the statement running while the client
+            // reads.
             "SELECT sin(i::DOUBLE) + s FROM range(1000000) t(i) CROSS JOIN \
              (SELECT sum(sin(j::DOUBLE)) AS s FROM range(1000000) t(j))"
                 .into(),
             None,
+            accounting(),
         )
         .await?
         .into_inner();
-        let observed = tokio::time::timeout(Duration::from_secs(5), async {
-            let mut live_cpu = false;
-            // Leave output buffered long enough for the 100ms sampler tick.
-            let _schema = response.next().await.transpose()?;
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        let observed = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut live = Vec::new();
+            let mut last = 0;
             while let Some(batch) = response.next().await {
                 let batch = batch?;
-                if !batch.app_metadata.is_empty() {
-                    let metadata: serde_json::Value = rmp_serde::from_slice(&batch.app_metadata)?;
-                    if metadata["cpu_time_us"].as_u64().unwrap_or(0) > 0
-                        && session.connection.conn.try_lock().is_err()
-                    {
-                        live_cpu = true;
-                    }
+                if batch.app_metadata.is_empty() {
+                    continue;
+                }
+                let metadata: serde_json::Value = rmp_serde::from_slice(&batch.app_metadata)?;
+                let cpu = metadata["cpu_time_us"].as_u64().unwrap_or(0);
+                anyhow::ensure!(cpu >= last, "CPU figure fell from {last} to {cpu}");
+                last = cpu;
+                if cpu > 0 && session.connection.guard_is_held() {
+                    live.push(cpu);
                 }
             }
-            anyhow::ensure!(live_cpu, "no CPU telemetry while the query was executing");
+            anyhow::ensure!(
+                live.first() < live.last(),
+                "CPU figure did not rise while the query was executing: {live:?}"
+            );
             Ok::<_, anyhow::Error>(())
         })
         .await;
@@ -474,7 +486,7 @@ mod cancellation_tests {
         let session = session().await?;
         let connection = Arc::downgrade(&session.connection);
         let mut response =
-            SwanFlightSqlService::execute_query_streaming(session.clone(), "SELECT 1".into(), None)
+            SwanFlightSqlService::execute_query_streaming(session.clone(), "SELECT 1".into(), None, accounting())
                 .await?
                 .into_inner();
         drop(session);
@@ -499,15 +511,16 @@ mod cancellation_tests {
         let session = session().await?;
         let connection = session.connection.clone();
         let poisoned = std::thread::spawn(move || {
-            let _guard = connection.conn.lock().unwrap();
-            panic!("Failed to fetch Arrow record batch: INTERRUPT Error: Interrupted!");
+            connection.with_raw(|_| {
+                panic!("Failed to fetch Arrow record batch: INTERRUPT Error: Interrupted!")
+            })
         })
         .join();
         assert!(poisoned.is_err());
-        assert!(session.connection.conn.is_poisoned());
+        assert!(session.connection.guard_is_poisoned());
 
         let mut response =
-            SwanFlightSqlService::execute_query_streaming(session, "SELECT 42".into(), None)
+            SwanFlightSqlService::execute_query_streaming(session, "SELECT 42".into(), None, accounting())
                 .await?
                 .into_inner();
         let mut messages = 0;
@@ -519,6 +532,85 @@ mod cancellation_tests {
         Ok(())
     }
 
+    /// The record a stream's request queues once the stream task ends.
+    async fn queued_record(queue: &crate::usage::UsageQueue) -> anyhow::Result<serde_json::Value> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(record) = crate::usage::testing::records(queue).pop() {
+                    return record;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("the request queued no record"))
+    }
+
+    /// A stream the client reads to its end queues one record once the
+    /// stream task ends: the label-0 attempt of the session's lockdown, the
+    /// probe's abandoned label-0 attempt, then the statement's label-1
+    /// attempt, which is not abandoned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drained_stream_records_its_probe_and_its_statement() -> anyhow::Result<()> {
+        use crate::usage::testing;
+        use futures::StreamExt;
+        let session = session().await?;
+        let queue = testing::queue();
+        let mut response = SwanFlightSqlService::execute_query_streaming(
+            session,
+            "SELECT i FROM range(1000) t(i)".into(),
+            None,
+            testing::accounting("DoGet", &queue),
+        )
+        .await?
+        .into_inner();
+        while let Some(message) = response.next().await {
+            message?;
+        }
+        let record = queued_record(&queue).await?;
+        assert_eq!(record["endpoint"], "DoGet");
+        assert_eq!(
+            testing::attempts(&record),
+            [
+                ("SWANLAKE".to_string(), false),
+                ("SWANLAKE".to_string(), true),
+                ("CLIENT".to_string(), false)
+            ],
+            "the session's lockdown, the probe, the statement"
+        );
+        assert_eq!(testing::records(&queue).len(), 1);
+        Ok(())
+    }
+
+    /// A client that stops reading abandons the statement: its label-1
+    /// attempt carries `abandoned`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_stream_marks_its_statement() -> anyhow::Result<()> {
+        use crate::usage::testing;
+        use futures::StreamExt;
+        let session = session().await?;
+        let queue = testing::queue();
+        let mut response = SwanFlightSqlService::execute_query_streaming(
+            session,
+            "SELECT i FROM range(100000000) t(i)".into(),
+            None,
+            testing::accounting("DoGet", &queue),
+        )
+        .await?
+        .into_inner();
+        // The schema, then one message of the running statement.
+        for _ in 0..2 {
+            response.next().await.transpose()?;
+        }
+        drop(response);
+        let record = queued_record(&queue).await?;
+        assert_eq!(
+            testing::attempts(&record).last(),
+            Some(&("CLIENT".to_string(), true))
+        );
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn disconnected_stream_releases_active_query() -> anyhow::Result<()> {
         let session = session().await?;
@@ -527,17 +619,18 @@ mod cancellation_tests {
             session.clone(),
             "SELECT sum(i) FROM range(1000000000) t(i)".into(),
             None,
+            accounting(),
         )
         .await?;
         tokio::time::timeout(Duration::from_secs(5), async {
-            while session.connection.conn.try_lock().is_ok() {
+            while !session.connection.guard_is_held() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await?;
         drop(response);
         let released = tokio::time::timeout(Duration::from_secs(2), async {
-            while session.connection.conn.try_lock().is_err() {
+            while session.connection.guard_is_held() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -545,7 +638,7 @@ mod cancellation_tests {
         .is_ok();
         if !released {
             for _ in 0..100 {
-                if session.connection.conn.try_lock().is_ok() {
+                if !session.connection.guard_is_held() {
                     break;
                 }
                 cleanup.interrupt();
@@ -553,7 +646,7 @@ mod cancellation_tests {
             }
         }
         let next = tokio::task::spawn_blocking(move || {
-            session.execute_statement("CREATE TABLE after_stream_cancel AS SELECT 42 AS value")
+            session.execute_statement("CREATE TABLE after_stream_cancel AS SELECT 42 AS value", None)
         });
         tokio::time::timeout(Duration::from_secs(5), next).await???;
         assert!(released, "disconnected stream left its query running");
@@ -567,16 +660,17 @@ mod cancellation_tests {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let blocker = tokio::task::spawn_blocking(move || {
-            let _lock = connection.conn.lock().unwrap();
-            let _ = ready_tx.send(());
-            // Bound the pre-fix failure: a synchronous setup lock stalls the
-            // sole runtime thread, preventing its request deadline from firing.
-            let _ = release_rx.recv_timeout(Duration::from_secs(1));
+            connection.with_raw(|_| {
+                let _ = ready_tx.send(());
+                // Bound the pre-fix failure: a synchronous setup lock stalls the
+                // sole runtime thread, preventing its request deadline from firing.
+                let _ = release_rx.recv_timeout(Duration::from_secs(1));
+            });
         });
         ready_rx.await?;
         let result = tokio::time::timeout(
             Duration::from_millis(50),
-            SwanFlightSqlService::execute_query_streaming(session.clone(), "SELECT 1".into(), None),
+            SwanFlightSqlService::execute_query_streaming(session.clone(), "SELECT 1".into(), None, accounting()),
         )
         .await;
         let _ = release_tx.send(());
@@ -586,7 +680,7 @@ mod cancellation_tests {
             "waiting for a connection blocked the request deadline"
         );
         let next = tokio::task::spawn_blocking(move || {
-            session.execute_statement("CREATE TABLE after_queued_cancel AS SELECT 42 AS value")
+            session.execute_statement("CREATE TABLE after_queued_cancel AS SELECT 42 AS value", None)
         });
         tokio::time::timeout(Duration::from_secs(2), next).await???;
         Ok(())
@@ -596,21 +690,22 @@ mod cancellation_tests {
     async fn dropping_completed_response_cannot_interrupt_next_query() -> anyhow::Result<()> {
         let session = session().await?;
         let completed =
-            SwanFlightSqlService::execute_query_streaming(session.clone(), "SELECT 1".into(), None)
+            SwanFlightSqlService::execute_query_streaming(session.clone(), "SELECT 1".into(), None, accounting())
                 .await?;
         // Let the producer finish, but leave its small result unconsumed.
         tokio::time::sleep(Duration::from_millis(100)).await;
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let connection = session.connection.clone();
         let next = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
-            let conn = connection.conn.lock().unwrap();
-            // A late interrupt must not hit the next owner of this connection.
-            let _ = ready_tx.send(());
-            Ok(
-                conn.query_row("SELECT sum(i) FROM range(100000000) t(i)", [], |row| {
-                    row.get(0)
-                })?,
-            )
+            connection.with_raw(|conn| {
+                // A late interrupt must not hit the next owner of this connection.
+                let _ = ready_tx.send(());
+                Ok(
+                    conn.query_row("SELECT sum(i) FROM range(100000000) t(i)", [], |row| {
+                        row.get(0)
+                    })?,
+                )
+            })
         });
         ready_rx.await?;
         tokio::time::sleep(Duration::from_millis(10)).await;

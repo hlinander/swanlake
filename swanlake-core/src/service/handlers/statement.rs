@@ -15,7 +15,8 @@ use tracing::{debug, error, info};
 use super::ticket::{StatementTicketKind, TicketStatementPayload};
 use crate::error::ServerError;
 use crate::service::SwanFlightSqlService;
-use crate::session::PreparedStatementOptions;
+use crate::session::{PreparedStatementOptions, Session};
+use crate::usage::RequestAccounting;
 use crate::sql::parser::ParsedStatement;
 
 /// Plans an ad-hoc SQL statement and returns a FlightInfo+ticket that can be
@@ -28,7 +29,8 @@ pub(crate) async fn get_flight_info_statement(
 ) -> Result<Response<FlightInfo>, Status> {
     let raw_sql = query.query;
     let sql = crate::sql::rewrite::strip_select_locks(&raw_sql).sql;
-    let session = service.prepare_request(&request).await?;
+    let (session, accounting) = service.prepare_request(&request, "GetFlightInfo").await?;
+    accounting.set_sql(&raw_sql);
 
     let parsed = ParsedStatement::parse(&sql);
     let statement_count = ParsedStatement::statement_count(&sql);
@@ -49,8 +51,13 @@ pub(crate) async fn get_flight_info_statement(
     let schema = if should_plan_schema {
         let sql_for_schema = sql.clone();
         let session_for_schema = Arc::clone(&session);
+        let accounting_for_schema = Arc::clone(&accounting);
         match tokio::task::spawn_blocking(move || {
-            session_for_schema.schema_for_query_cancellable(&sql_for_schema, Some(&cancellation))
+            session_for_schema.schema_for_query_cancellable(
+                &sql_for_schema,
+                Some(&cancellation),
+                Some(&accounting_for_schema),
+            )
         })
         .await
         {
@@ -65,7 +72,7 @@ pub(crate) async fn get_flight_info_statement(
                 ));
             }
             Ok(Err(err)) if returns_rows => {
-                return Err(SwanFlightSqlService::status_from_error(err));
+                return Err(SwanFlightSqlService::failure_status(&accounting, err));
             }
             Ok(Err(err)) => {
                 debug!(%err, "treating statement as command after schema planning failed");
@@ -112,7 +119,7 @@ pub(crate) async fn do_get_statement(
         })?;
 
     if let Some(handle) = payload.handle() {
-        let session = service.prepare_request(&request).await?;
+        let (session, accounting) = service.prepare_request(&request, "DoGet").await?;
         match session.get_prepared_statement_meta(handle) {
             Ok(meta) => {
                 let ticket_kind = payload
@@ -125,13 +132,14 @@ pub(crate) async fn do_get_statement(
                     returns_rows = meta.is_query,
                     "executing statement via indexed ticket"
                 );
+                accounting.set_sql(&meta.sql);
                 return if meta.is_query {
                     service
-                        .execute_prepared_query_handle(&session, handle, meta)
+                        .execute_prepared_query_handle(&session, handle, meta, accounting)
                         .await
                 } else {
                     service
-                        .execute_prepared_update_handle(&session, handle, meta)
+                        .execute_prepared_update_handle(&session, handle, meta, &accounting)
                         .await
                 };
             }
@@ -141,11 +149,13 @@ pub(crate) async fn do_get_statement(
                         handle = %handle,
                         "prepared handle missing; executing fallback SQL"
                     );
+                    // The fallback runs under this request's accounting.
                     return execute_ephemeral_ticket_statement(
                         service,
                         sql.to_owned(),
                         payload.returns_rows_flag(),
-                        &request,
+                        session,
+                        accounting,
                     )
                     .await;
                 }
@@ -159,11 +169,13 @@ pub(crate) async fn do_get_statement(
     }
 
     if let Some(sql) = payload.fallback_sql_str() {
+        let (session, accounting) = service.prepare_request(&request, "DoGet").await?;
         return execute_ephemeral_ticket_statement(
             service,
             sql.to_owned(),
             payload.returns_rows_flag(),
-            &request,
+            session,
+            accounting,
         )
         .await;
     }
@@ -181,20 +193,24 @@ pub(crate) async fn do_put_statement_update(
     request: Request<PeekableFlightDataStream>,
 ) -> Result<i64, Status> {
     let sql = command.query;
-    let session = service.prepare_request(&request).await?;
+    let (session, accounting) = service.prepare_request(&request, "DoPut").await?;
+    accounting.set_sql(&sql);
     let _in_flight = service.metrics.start_update();
     let start = Instant::now();
 
     let sql_for_exec = sql.clone();
-    let result =
-        tokio::task::spawn_blocking(move || session.execute_statement(&sql_for_exec)).await;
+    let accounting_for_exec = Arc::clone(&accounting);
+    let result = tokio::task::spawn_blocking(move || {
+        session.execute_statement(&sql_for_exec, Some(&accounting_for_exec))
+    })
+    .await;
     let affected_rows = match result {
         Ok(Ok(rows)) => rows,
         Ok(Err(err)) => {
             service
                 .metrics
                 .record_update_error(&sql, start.elapsed(), err.to_string());
-            return Err(SwanFlightSqlService::status_from_error(err));
+            return Err(SwanFlightSqlService::failure_status(&accounting, err));
         }
         Err(err) => {
             service
@@ -215,10 +231,11 @@ async fn execute_ephemeral_ticket_statement(
     service: &SwanFlightSqlService,
     sql: String,
     returns_rows: bool,
-    request: &Request<Ticket>,
+    session: Arc<Session>,
+    accounting: Arc<RequestAccounting>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoGetStream>, Status> {
     info!(sql = %sql, "executing ticket via fallback SQL");
-    let session = service.prepare_request(request).await?;
+    accounting.set_sql(&sql);
     if returns_rows {
         let handle = session
             .create_prepared_statement(
@@ -231,23 +248,25 @@ async fn execute_ephemeral_ticket_statement(
             .get_prepared_statement_meta(handle)
             .map_err(SwanFlightSqlService::status_from_error)?;
         service
-            .execute_prepared_query_handle(&session, handle, meta)
+            .execute_prepared_query_handle(&session, handle, meta, accounting)
             .await
     } else {
         let sql_for_exec = sql.clone();
         let session_clone = Arc::clone(&session);
+        let accounting_for_exec = Arc::clone(&accounting);
         let _in_flight = service.metrics.start_update();
         let start = Instant::now();
-        let result =
-            tokio::task::spawn_blocking(move || session_clone.execute_statement(&sql_for_exec))
-                .await;
+        let result = tokio::task::spawn_blocking(move || {
+            session_clone.execute_statement(&sql_for_exec, Some(&accounting_for_exec))
+        })
+        .await;
         let affected_rows = match result {
             Ok(Ok(rows)) => rows,
             Ok(Err(err)) => {
                 service
                     .metrics
                     .record_update_error(&sql, start.elapsed(), err.to_string());
-                return Err(SwanFlightSqlService::status_from_error(err));
+                return Err(SwanFlightSqlService::failure_status(&accounting, err));
             }
             Err(err) => {
                 service
@@ -311,7 +330,7 @@ mod cancellation_tests {
         });
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if session.connection.conn.try_lock().is_err() {
+                if session.connection.guard_is_held() {
                     break;
                 }
                 assert!(!task.is_finished(), "planning finished before cancellation");
@@ -322,7 +341,7 @@ mod cancellation_tests {
         task.abort();
         let _ = task.await;
         let released = tokio::time::timeout(Duration::from_secs(2), async {
-            while session.connection.conn.try_lock().is_err() {
+            while session.connection.guard_is_held() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -331,7 +350,7 @@ mod cancellation_tests {
         // Clean up even on the pre-fix failure, so no blocking task survives.
         if !released {
             for _ in 0..100 {
-                if session.connection.conn.try_lock().is_ok() {
+                if !session.connection.guard_is_held() {
                     break;
                 }
                 cleanup.interrupt();
@@ -342,7 +361,7 @@ mod cancellation_tests {
         tokio::time::timeout(
             Duration::from_secs(5),
             tokio::task::spawn_blocking(move || {
-                connection.execute_statement("CREATE TABLE after_cancel AS SELECT 42 AS value")
+                connection.execute_statement("CREATE TABLE after_cancel AS SELECT 42 AS value", None)
             }),
         )
         .await???;

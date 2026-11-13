@@ -13,13 +13,16 @@ pub(crate) async fn do_action_begin_transaction(
     _query: ActionBeginTransactionRequest,
     request: Request<arrow_flight::Action>,
 ) -> Result<ActionBeginTransactionResult, Status> {
-    let session = service.prepare_request(&request).await?;
+    let (session, accounting) = service.prepare_request(&request, "DoAction").await?;
 
     let session_clone = session.clone();
-    let transaction_id = tokio::task::spawn_blocking(move || session_clone.begin_transaction())
-        .await
-        .map_err(SwanFlightSqlService::status_from_join)?
-        .map_err(SwanFlightSqlService::status_from_error)?;
+    let accounting_clone = accounting.clone();
+    let transaction_id = tokio::task::spawn_blocking(move || {
+        session_clone.begin_transaction(Some(&accounting_clone))
+    })
+    .await
+    .map_err(SwanFlightSqlService::status_from_join)?
+    .map_err(|error| SwanFlightSqlService::failure_status(&accounting, error))?;
 
     info!(transaction_id = %transaction_id, "transaction started in session");
 
@@ -35,7 +38,7 @@ pub(crate) async fn do_action_end_transaction(
     query: ActionEndTransactionRequest,
     request: Request<arrow_flight::Action>,
 ) -> Result<(), Status> {
-    let session = service.prepare_request(&request).await?;
+    let (session, accounting) = service.prepare_request(&request, "DoAction").await?;
 
     let transaction_id = match TransactionId::from_bytes(&query.transaction_id) {
         Some(id) => id,
@@ -53,17 +56,18 @@ pub(crate) async fn do_action_end_transaction(
 
     let session_clone = session.clone();
     let txn_id_clone = transaction_id;
+    let accounting_clone = accounting.clone();
 
     tokio::task::spawn_blocking(move || {
         if action == 1 {
-            session_clone.commit_transaction(txn_id_clone)
+            session_clone.commit_transaction(txn_id_clone, Some(&accounting_clone))
         } else {
-            session_clone.rollback_transaction(txn_id_clone)
+            session_clone.rollback_transaction(txn_id_clone, Some(&accounting_clone))
         }
     })
     .await
     .map_err(SwanFlightSqlService::status_from_join)?
-    .map_err(SwanFlightSqlService::status_from_error)?;
+    .map_err(|error| SwanFlightSqlService::failure_status(&accounting, error))?;
 
     let op = if action == 1 {
         "committed"

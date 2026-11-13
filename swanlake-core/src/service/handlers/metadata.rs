@@ -15,6 +15,7 @@ use tonic::{Request, Response, Status};
 use tracing::{error, warn};
 
 use crate::service::SwanFlightSqlService;
+use crate::usage::RequestAccounting;
 
 const SCHEMAS_SQL: &str = "SELECT \
     catalog_name AS catalog_name, \
@@ -77,7 +78,7 @@ pub(crate) async fn get_flight_info_catalogs(
     query: CommandGetCatalogs,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
-    service.prepare_request(&request).await?;
+    service.prepare_request(&request, "GetFlightInfo").await?;
 
     let ticket_bytes = query.as_any().encode_to_vec();
     let endpoint = FlightEndpoint::new().with_ticket(Ticket::new(ticket_bytes));
@@ -99,10 +100,11 @@ pub(crate) async fn do_get_catalogs(
     query: CommandGetCatalogs,
     request: Request<Ticket>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoGetStream>, Status> {
-    let session = service.prepare_request(&request).await?;
+    let (session, accounting) = service.prepare_request(&request, "DoGet").await?;
     let session_clone = Arc::clone(&session);
+    let accounting_clone = Arc::clone(&accounting);
     let result = tokio::task::spawn_blocking(move || {
-        let query_result = session_clone.execute_query(CATALOGS_SQL)?;
+        let query_result = session_clone.execute_query(CATALOGS_SQL, Some(&accounting_clone))?;
         let mut rows = Vec::new();
         for batch in query_result.batches {
             rows.extend(extract_catalog_rows(&batch));
@@ -122,7 +124,7 @@ pub(crate) async fn do_get_catalogs(
     if catalogs.is_empty() {
         catalogs.push(
             session
-                .current_catalog()
+                .current_catalog(Some(&accounting))
                 .unwrap_or_else(|_| "memory".to_string()),
         );
     }
@@ -146,7 +148,7 @@ pub(crate) async fn get_flight_info_schemas(
     query: CommandGetDbSchemas,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
-    service.prepare_request(&request).await?;
+    service.prepare_request(&request, "GetFlightInfo").await?;
 
     let ticket_bytes = query.as_any().encode_to_vec();
     let endpoint = FlightEndpoint::new().with_ticket(Ticket::new(ticket_bytes));
@@ -168,14 +170,15 @@ pub(crate) async fn do_get_schemas(
     query: CommandGetDbSchemas,
     request: Request<Ticket>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoGetStream>, Status> {
-    let session = service.prepare_request(&request).await?;
+    let (session, accounting) = service.prepare_request(&request, "DoGet").await?;
     let session_clone = Arc::clone(&session);
+    let accounting_clone = Arc::clone(&accounting);
 
     let result = tokio::task::spawn_blocking(move || {
         let current_catalog = session_clone
-            .current_catalog()
+            .current_catalog(Some(&accounting_clone))
             .unwrap_or_else(|_| "memory".to_string());
-        let query_result = session_clone.execute_query(SCHEMAS_SQL)?;
+        let query_result = session_clone.execute_query(SCHEMAS_SQL, Some(&accounting_clone))?;
 
         let mut rows = Vec::new();
         for batch in query_result.batches {
@@ -186,7 +189,8 @@ pub(crate) async fn do_get_schemas(
     .await
     .map_err(SwanFlightSqlService::status_from_join)?;
 
-    let rows = result.map_err(SwanFlightSqlService::status_from_error)?;
+    let rows =
+        result.map_err(|error| SwanFlightSqlService::failure_status(&accounting, error))?;
     let mut builder = query.into_builder();
     for (catalog, schema_name) in rows {
         builder.append(catalog, schema_name);
@@ -203,7 +207,7 @@ pub(crate) async fn get_flight_info_tables(
     query: CommandGetTables,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
-    service.prepare_request(&request).await?;
+    service.prepare_request(&request, "GetFlightInfo").await?;
 
     let ticket_bytes = query.as_any().encode_to_vec();
     let endpoint = FlightEndpoint::new().with_ticket(Ticket::new(ticket_bytes));
@@ -226,14 +230,15 @@ pub(crate) async fn do_get_tables(
     request: Request<Ticket>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoGetStream>, Status> {
     let include_schema = query.include_schema;
-    let session = service.prepare_request(&request).await?;
+    let (session, accounting) = service.prepare_request(&request, "DoGet").await?;
     let session_clone = Arc::clone(&session);
+    let accounting_clone = Arc::clone(&accounting);
 
     let result = tokio::task::spawn_blocking(move || {
         let current_catalog = session_clone
-            .current_catalog()
+            .current_catalog(Some(&accounting_clone))
             .unwrap_or_else(|_| "memory".to_string());
-        let query_result = session_clone.execute_query(TABLES_SQL)?;
+        let query_result = session_clone.execute_query(TABLES_SQL, Some(&accounting_clone))?;
         let mut rows = Vec::new();
         for batch in query_result.batches {
             rows.extend(extract_table_rows(
@@ -241,6 +246,7 @@ pub(crate) async fn do_get_tables(
                 &session_clone,
                 include_schema,
                 &current_catalog,
+                Some(&accounting_clone),
             ));
         }
         Ok::<_, crate::error::ServerError>(rows)
@@ -248,7 +254,8 @@ pub(crate) async fn do_get_tables(
     .await
     .map_err(SwanFlightSqlService::status_from_join)?;
 
-    let rows = result.map_err(SwanFlightSqlService::status_from_error)?;
+    let rows =
+        result.map_err(|error| SwanFlightSqlService::failure_status(&accounting, error))?;
     let mut builder = query.into_builder();
     for row in rows {
         builder
@@ -274,7 +281,7 @@ pub(crate) async fn get_flight_info_table_types(
     query: CommandGetTableTypes,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
-    service.prepare_request(&request).await?;
+    service.prepare_request(&request, "GetFlightInfo").await?;
 
     let ticket_bytes = query.as_any().encode_to_vec();
     let endpoint = FlightEndpoint::new().with_ticket(Ticket::new(ticket_bytes));
@@ -296,7 +303,7 @@ pub(crate) async fn do_get_table_types(
     query: CommandGetTableTypes,
     request: Request<Ticket>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoGetStream>, Status> {
-    service.prepare_request(&request).await?;
+    service.prepare_request(&request, "DoGet").await?;
 
     let mut builder = query.into_builder();
     builder.append("TABLE");
@@ -313,7 +320,7 @@ pub(crate) async fn get_flight_info_primary_keys(
     query: CommandGetPrimaryKeys,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
-    service.prepare_request(&request).await?;
+    service.prepare_request(&request, "GetFlightInfo").await?;
     flight_info_with_schema(
         query.as_any().encode_to_vec(),
         primary_keys_schema(),
@@ -326,7 +333,7 @@ pub(crate) async fn do_get_primary_keys(
     _query: CommandGetPrimaryKeys,
     request: Request<Ticket>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoGetStream>, Status> {
-    service.prepare_request(&request).await?;
+    service.prepare_request(&request, "DoGet").await?;
     stream_single_batch(empty_batch(primary_keys_schema())?)
 }
 
@@ -335,7 +342,7 @@ pub(crate) async fn get_flight_info_exported_keys(
     query: CommandGetExportedKeys,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
-    service.prepare_request(&request).await?;
+    service.prepare_request(&request, "GetFlightInfo").await?;
     flight_info_with_schema(
         query.as_any().encode_to_vec(),
         foreign_keys_schema(),
@@ -348,7 +355,7 @@ pub(crate) async fn do_get_exported_keys(
     _query: CommandGetExportedKeys,
     request: Request<Ticket>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoGetStream>, Status> {
-    service.prepare_request(&request).await?;
+    service.prepare_request(&request, "DoGet").await?;
     stream_single_batch(empty_batch(foreign_keys_schema())?)
 }
 
@@ -357,7 +364,7 @@ pub(crate) async fn get_flight_info_imported_keys(
     query: CommandGetImportedKeys,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
-    service.prepare_request(&request).await?;
+    service.prepare_request(&request, "GetFlightInfo").await?;
     flight_info_with_schema(
         query.as_any().encode_to_vec(),
         foreign_keys_schema(),
@@ -370,7 +377,7 @@ pub(crate) async fn do_get_imported_keys(
     _query: CommandGetImportedKeys,
     request: Request<Ticket>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoGetStream>, Status> {
-    service.prepare_request(&request).await?;
+    service.prepare_request(&request, "DoGet").await?;
     stream_single_batch(empty_batch(foreign_keys_schema())?)
 }
 
@@ -379,7 +386,7 @@ pub(crate) async fn get_flight_info_cross_reference(
     query: CommandGetCrossReference,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
-    service.prepare_request(&request).await?;
+    service.prepare_request(&request, "GetFlightInfo").await?;
     flight_info_with_schema(
         query.as_any().encode_to_vec(),
         foreign_keys_schema(),
@@ -392,7 +399,7 @@ pub(crate) async fn do_get_cross_reference(
     _query: CommandGetCrossReference,
     request: Request<Ticket>,
 ) -> Result<Response<<SwanFlightSqlService as FlightService>::DoGetStream>, Status> {
-    service.prepare_request(&request).await?;
+    service.prepare_request(&request, "DoGet").await?;
     stream_single_batch(empty_batch(foreign_keys_schema())?)
 }
 
@@ -421,6 +428,7 @@ fn extract_table_rows(
     session: &Arc<crate::session::Session>,
     include_schema: bool,
     default_catalog: &str,
+    accounting: Option<&RequestAccounting>,
 ) -> Vec<TableRow> {
     let mut rows = Vec::new();
     if batch.num_rows() == 0 || batch.num_columns() < 3 {
@@ -449,7 +457,7 @@ fn extract_table_rows(
 
         let schema_def = if include_schema {
             let qualified_name = format!("{catalog}.{schema}.{name}");
-            match session.table_schema(&qualified_name) {
+            match session.table_schema(&qualified_name, accounting) {
                 Ok(schema) => schema,
                 Err(err) => {
                     warn!(%err, table = %qualified_name, "failed to load table schema");
@@ -722,13 +730,13 @@ mod tests {
         )
         .context("failed to build table metadata batch")?;
 
-        let no_schema_rows = extract_table_rows(&batch, &session, false, "fallback");
+        let no_schema_rows = extract_table_rows(&batch, &session, false, "fallback", None);
         assert_eq!(no_schema_rows.len(), 2);
         assert_eq!(no_schema_rows[0].table_type, "TABLE");
         assert_eq!(no_schema_rows[1].table_type, "VIEW");
         assert_eq!(no_schema_rows[1].catalog, "fallback");
 
-        let with_schema_rows = extract_table_rows(&batch, &session, true, "fallback");
+        let with_schema_rows = extract_table_rows(&batch, &session, true, "fallback", None);
         assert_eq!(with_schema_rows.len(), 2);
         assert!(with_schema_rows[0].schema_def.fields().is_empty());
         assert!(with_schema_rows[1].schema_def.fields().is_empty());

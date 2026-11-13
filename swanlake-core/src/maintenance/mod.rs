@@ -205,7 +205,10 @@ impl CheckpointService {
 
             let sql = format!("USE {db}; CHECKPOINT;");
             let exec = if let Some(conn) = guard.as_ref() {
-                conn.execute_batch(&sql).map_err(|e| anyhow!(e.to_string()))
+                // The checkpoint is no request's work: it runs under label 0
+                // with no accounting, and reaches no entry.
+                conn.execute_batch(&sql, crate::usage::ExecutionLabel::SwanLake, None)
+                    .map_err(|e| anyhow!(e.to_string()))
             } else {
                 Err(anyhow!("checkpoint connection initialization failed"))
             };

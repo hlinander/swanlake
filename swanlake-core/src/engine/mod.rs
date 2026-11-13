@@ -5,8 +5,10 @@
 //! - `EngineFactory`: Factory for creating initialized connections
 //! - `QueryResult`: Query execution results
 //! - `progress`: Query progress tracking via FFI
+//! - `resource_tracker`: Resource figures of a running request
 
 pub(crate) mod batch;
+mod breakdown;
 pub mod cancellation;
 pub mod connection;
 pub mod kernel_telemetry;
@@ -18,4 +20,4 @@ mod result_projection;
 pub use connection::{DuckDbConnection, QueryResult, StreamingBatch};
 pub use factory::EngineFactory;
 pub use progress::{query_progress, QueryProgress};
-pub use resource_tracker::{ResourceSnapshot, ResourceTracker};
+pub use resource_tracker::{progress_snapshot, read_totals, ResourceSnapshot};
