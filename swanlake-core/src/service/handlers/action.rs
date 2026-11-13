@@ -1254,6 +1254,7 @@ pub(crate) async fn do_action_execute(
     if !guarded {
         info!(sql = %sql, "executing action SQL");
     }
+    accounting.set_sql(&sql);
 
     // Execute the SQL statement
     let sql_clone = sql.clone();
@@ -1368,6 +1369,8 @@ pub(crate) async fn do_action_execute_sql(
     let (session, accounting) = service.prepare_request(&request, "DoAction").await?;
 
     info!(sql = %sql, "executing SQL from action type");
+    // The action's type is the client's SQL text on this route.
+    accounting.set_sql(sql);
 
     // Execute the SQL statement
     let sql_owned = sql.to_string();

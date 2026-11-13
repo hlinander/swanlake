@@ -132,7 +132,7 @@ pub(crate) async fn do_get_statement(
                     returns_rows = meta.is_query,
                     "executing statement via indexed ticket"
                 );
-                accounting.set_sql(&meta.sql);
+                accounting.set_sql(&meta.client_sql);
                 return if meta.is_query {
                     service
                         .execute_prepared_query_handle(&session, handle, meta, accounting)
