@@ -15,6 +15,17 @@ use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
 mod status;
 
+#[cfg(test)]
+mod flight_tests;
+
+fn flight_server(
+    service: SwanFlightService,
+    config: &ServerConfig,
+) -> arrow_flight::flight_service_server::FlightServiceServer<SwanFlightService> {
+    arrow_flight::flight_service_server::FlightServiceServer::new(service)
+        .max_decoding_message_size(config.max_decoding_message_size)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -159,7 +170,7 @@ async fn main() -> Result<()> {
 
     server
         .add_service(health_service)
-        .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(flight_service))
+        .add_service(flight_server(flight_service, &config))
         .serve_with_shutdown(addr, async {
             shutdown_rx.await.ok();
         })

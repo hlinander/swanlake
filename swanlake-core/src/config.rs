@@ -52,6 +52,8 @@ pub enum SessionIdMode {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Maximum decoded Flight request size in bytes, including protobuf fields.
+    pub max_decoding_message_size: usize,
     /// Host advertised in FlightEndpoint locations. Defaults to "localhost".
     /// Set to the externally reachable hostname or IP for remote clients.
     pub advertise_host: String,
@@ -146,6 +148,7 @@ impl Default for ServerConfig {
         Self {
             host: "0.0.0.0".to_string(),
             port: 4214,
+            max_decoding_message_size: 4 * 1024 * 1024,
             advertise_host: "localhost".to_string(),
             database_path: None,
             execution_owner_path: None,
@@ -214,6 +217,9 @@ impl ServerConfig {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        if self.max_decoding_message_size == 0 {
+            bail!("SWANLAKE_MAX_DECODING_MESSAGE_SIZE must be greater than 0");
+        }
         if self.tls_cert_path.is_some() != self.tls_key_path.is_some() {
             bail!(
                 "SWANLAKE_TLS_CERT_PATH and SWANLAKE_TLS_KEY_PATH must be set together (or both unset)"
@@ -285,6 +291,15 @@ impl ServerConfig {
 #[cfg(test)]
 mod duckvis_config_tests {
     use super::*;
+
+    #[test]
+    fn receive_limit_must_be_positive() {
+        let config = ServerConfig {
+            max_decoding_message_size: 0,
+            ..ServerConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
 
     /// base64 (standard) of a valid raw 32-byte Ed25519 seed.
     fn valid_key_b64() -> String {

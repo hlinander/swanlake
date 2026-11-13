@@ -16,6 +16,7 @@ and boolean flags accept `true/false` (case-insensitive).
 | --- | --- | --- |
 | `SWANLAKE_HOST` | gRPC bind address | `0.0.0.0` |
 | `SWANLAKE_PORT` | gRPC listening port | `4214` |
+| `SWANLAKE_MAX_DECODING_MESSAGE_SIZE` | Maximum decoded Flight request size in bytes, including protobuf fields; must be positive. Applies to each message, not the total stream. Raising it permits larger allocations for concurrent requests. | `4194304` (4 MiB) |
 | `SWANLAKE_ADVERTISE_HOST` | Host advertised in FlightEndpoint locations (the address clients use to connect back) | `localhost` |
 | `SWANLAKE_TLS_CERT_PATH` | PEM certificate chain for native Flight TLS; requires `SWANLAKE_TLS_KEY_PATH` | _(unset)_ |
 | `SWANLAKE_TLS_KEY_PATH` | PEM private key for native Flight TLS; requires `SWANLAKE_TLS_CERT_PATH` | _(unset)_ |
