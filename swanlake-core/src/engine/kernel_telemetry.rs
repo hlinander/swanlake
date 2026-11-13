@@ -1,9 +1,8 @@
 //! Session-bound access to the external_kernel telemetry ABI. Flight forwards
 //! these snapshots directly; it never reads another session's extension handle.
 use crate::error::ServerError;
-use duckdb::{Connection, InterruptHandle};
+use duckdb::Connection;
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::sync::Mutex;
 
 type SetContext = unsafe extern "C" fn(*mut c_void, u64, *const c_char) -> u64;
 type Read = unsafe extern "C" fn(u64, *const c_char) -> *mut c_char;
@@ -17,19 +16,16 @@ pub struct KernelTelemetry {
     scope: u64,
 }
 
-// Same pinned duckdb-rs layout already used by engine::progress.
-#[repr(C)]
-struct Handle {
-    conn: Mutex<libduckdb_sys::duckdb_connection>,
-}
+/// The native connection of `conn`.
+///
+/// Every caller holds the connection's guard or owns the connection
+/// outright, so no other thread can close it: the pointer is taken out of
+/// the accessor and stays live for the caller's engine call.
 fn raw(conn: &Connection) -> Result<*mut c_void, ServerError> {
-    let handle = conn.interrupt_handle();
-    let inner = unsafe { &*((&*handle as *const InterruptHandle).cast::<Handle>()) };
-    let ptr = *inner
-        .conn
-        .lock()
-        .map_err(|_| ServerError::Internal("interrupt handle poisoned".into()))?;
-    Ok(ptr.cast())
+    conn.interrupt_handle()
+        .with_connection(|native| native)
+        .map(|native| native.cast())
+        .ok_or_else(|| ServerError::Internal("connection is closed".into()))
 }
 
 impl KernelTelemetry {
