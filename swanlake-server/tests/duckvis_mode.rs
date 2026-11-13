@@ -2110,6 +2110,248 @@ async fn requests_report_their_attempts_and_labels() {
     assert!(!usage_attempts(failed).is_empty());
 }
 
+/// The usage records that arrived after the first `seen`, once no further
+/// record has arrived for a short while.
+async fn usage_records_after(mock: &MockState, seen: usize) -> Vec<Value> {
+    let mut records = usage_records(mock, seen + 1).await;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let now = usage_records(mock, records.len()).await;
+        if now.len() == records.len() {
+            return records.split_off(seen);
+        }
+        records = now;
+    }
+}
+
+/// The number of label-1 entries of `record`.
+fn client_attempts(record: &Value) -> usize {
+    usage_attempts(record)
+        .iter()
+        .filter(|(provenance, _)| *provenance == "CLIENT")
+        .count()
+}
+
+/// Every request that runs a block whose results SwanLake discards reports
+/// one label-1 entry for each statement, and each request reports the SQL
+/// text the client sent, where it sent one.
+#[tokio::test]
+async fn discarding_requests_report_their_statements_and_text() {
+    use arrow_flight::sql::client::FlightSqlServiceClient;
+
+    let h = base_harness().await;
+    let mut cli = client(&h.endpoint).await;
+    let token = format!("Bearer {}", valid_token("batch-user"));
+    let headers = project_headers(&token, "batch-session", PROJECT);
+    let mut sql_cli = FlightSqlServiceClient::new_from_inner(cli.clone());
+    for (key, value) in &headers {
+        sql_cli.set_header(*key, *value);
+    }
+    let mut seen = 0;
+
+    // DoPut statement update, with a block of two statements.
+    let sql = "CREATE TABLE put_rows (i INTEGER); INSERT INTO put_rows VALUES (1), (2)";
+    sql_cli.execute_update(sql.into(), None).await.expect("statement update");
+    let new = usage_records_after(&h.mock, seen).await;
+    seen += new.len();
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(new[0]["endpoint"], "DoPut");
+    assert_eq!(new[0]["sql"], sql);
+    assert_eq!(client_attempts(&new[0]), 2, "{}", new[0]);
+
+    // A command through GetFlightInfo and an ephemeral DoGet ticket.
+    let sql = "CREATE TABLE get_rows (i INTEGER)";
+    let info = sql_cli.execute(sql.into(), None).await.expect("command flight info");
+    for endpoint in info.endpoint {
+        let mut stream = cli
+            .do_get(with_headers(endpoint.ticket.expect("ticket"), &headers))
+            .await
+            .expect("command DoGet")
+            .into_inner();
+        while stream.message().await.expect("command stream").is_some() {}
+    }
+    let new = usage_records_after(&h.mock, seen).await;
+    seen += new.len();
+    let get = new
+        .iter()
+        .find(|record| record["endpoint"] == "DoGet")
+        .unwrap_or_else(|| panic!("no DoGet record: {new:?}"));
+    assert_eq!(get["sql"], sql);
+    assert_eq!(client_attempts(get), 1, "{get}");
+
+    // The create_schema action: SwanLake composes the statement, so the
+    // request carries no SQL text.
+    #[derive(serde::Serialize)]
+    struct CreateSchema<'a> {
+        catalog_name: &'a str,
+        schema: &'a str,
+        comment: Option<&'a str>,
+    }
+    let body = rmp_serde::to_vec_named(&CreateSchema {
+        catalog_name: "memory",
+        schema: "usage_schema",
+        comment: None,
+    })
+    .expect("encode");
+    let mut stream = cli
+        .do_action(with_headers(
+            Action {
+                r#type: "create_schema".into(),
+                body: body.into(),
+            },
+            &headers,
+        ))
+        .await
+        .expect("create_schema")
+        .into_inner();
+    while stream.message().await.expect("create_schema stream").is_some() {}
+    let new = usage_records_after(&h.mock, seen).await;
+    seen += new.len();
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(new[0]["endpoint"], "DoAction");
+    assert!(new[0].get("sql").is_none(), "{}", new[0]);
+    assert_eq!(client_attempts(&new[0]), 1, "{}", new[0]);
+
+    // The create_table action.
+    #[derive(serde::Serialize)]
+    struct CreateTable<'a> {
+        catalog_name: &'a str,
+        schema_name: &'a str,
+        table_name: &'a str,
+        arrow_schema: Vec<u8>,
+        on_conflict: &'a str,
+    }
+    // The schema as a framed Arrow IPC schema message, which is how a
+    // FlightInfo carries it.
+    let arrow_schema = {
+        use duckdb::arrow::datatypes::{DataType, Field, Schema};
+        let schema = Schema::new(vec![Field::new("i", DataType::Int64, true)]);
+        arrow_flight::FlightInfo::new()
+            .try_with_schema(&schema)
+            .expect("encode schema")
+            .schema
+            .to_vec()
+    };
+    let body = rmp_serde::to_vec_named(&CreateTable {
+        catalog_name: "memory",
+        schema_name: "usage_schema",
+        table_name: "made",
+        arrow_schema,
+        on_conflict: "error",
+    })
+    .expect("encode");
+    let mut stream = cli
+        .do_action(with_headers(
+            Action {
+                r#type: "create_table".into(),
+                body: body.into(),
+            },
+            &headers,
+        ))
+        .await
+        .expect("create_table")
+        .into_inner();
+    while stream.message().await.expect("create_table stream").is_some() {}
+    let new = usage_records_after(&h.mock, seen).await;
+    seen += new.len();
+    let made = new
+        .iter()
+        .find(|record| client_attempts(record) == 1)
+        .unwrap_or_else(|| panic!("no create_table statement: {new:?}"));
+    assert_eq!(made["endpoint"], "DoAction");
+    assert!(made.get("sql").is_none(), "{made}");
+
+    // The execute action: its body holds the SQL text.
+    let sql = "INSERT INTO usage_schema.made VALUES (1); INSERT INTO usage_schema.made VALUES (2)";
+    execute_sql_action(&mut cli, &headers, sql).await.expect("execute");
+    let new = usage_records_after(&h.mock, seen).await;
+    seen += new.len();
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(new[0]["endpoint"], "DoAction");
+    assert_eq!(new[0]["sql"], sql);
+    assert_eq!(client_attempts(&new[0]), 2, "{}", new[0]);
+
+    // The execute_guarded action.
+    let sql = "INSERT INTO usage_schema.made VALUES (3)";
+    let mut stream = cli
+        .do_action(with_headers(
+            Action {
+                r#type: "execute_guarded".into(),
+                body: sql.as_bytes().to_vec().into(),
+            },
+            &headers,
+        ))
+        .await
+        .expect("execute_guarded")
+        .into_inner();
+    while stream.message().await.expect("execute_guarded stream").is_some() {}
+    let new = usage_records_after(&h.mock, seen).await;
+    seen += new.len();
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(new[0]["sql"], sql);
+    assert_eq!(client_attempts(&new[0]), 1, "{}", new[0]);
+
+    // SQL passed as the action type.
+    let sql = "DROP TABLE put_rows";
+    action_type_sql(&mut cli, &headers, sql).await.expect("execute_sql");
+    let new = usage_records_after(&h.mock, seen).await;
+    seen += new.len();
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(new[0]["endpoint"], "DoAction");
+    assert_eq!(new[0]["sql"], sql);
+    assert_eq!(client_attempts(&new[0]), 1, "{}", new[0]);
+
+    // Raw DDL passed as the GetFlightInfo command.
+    let sql = "CREATE TABLE raw_rows (i INTEGER)";
+    cli.get_flight_info(with_headers(FlightDescriptor::new_cmd(sql), &headers))
+        .await
+        .expect("raw DDL");
+    let new = usage_records_after(&h.mock, seen).await;
+    seen += new.len();
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(new[0]["endpoint"], "GetFlightInfo");
+    assert_eq!(new[0]["sql"], sql);
+    assert_eq!(client_attempts(&new[0]), 1, "{}", new[0]);
+
+    // A statement that fails on this route reports its attempt and the
+    // engine's error type.
+    execute_sql_action(&mut cli, &headers, "INSERT INTO no_such_table VALUES (1)")
+        .await
+        .expect_err("the table does not exist");
+    let new = usage_records_after(&h.mock, seen).await;
+    seen += new.len();
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(new[0]["error_type"], "CATALOG");
+    assert_eq!(client_attempts(&new[0]), 1, "{}", new[0]);
+
+    // A prepared statement: the request that creates it reports the text it
+    // sent, and the request that runs it reports that same text, not the
+    // text SwanLake rewrote it to.
+    let sql = "SELECT count(*) AS n FROM usage_schema.made FOR UPDATE";
+    let mut prepared = sql_cli.prepare(sql.into(), None).await.expect("prepare");
+    let new = usage_records_after(&h.mock, seen).await;
+    seen += new.len();
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(new[0]["endpoint"], "DoAction");
+    assert_eq!(new[0]["sql"], sql);
+    let info = prepared.execute().await.expect("prepared flight info");
+    for endpoint in info.endpoint {
+        let mut stream = cli
+            .do_get(with_headers(endpoint.ticket.expect("ticket"), &headers))
+            .await
+            .expect("prepared DoGet")
+            .into_inner();
+        while stream.message().await.expect("prepared stream").is_some() {}
+    }
+    let new = usage_records_after(&h.mock, seen).await;
+    let get = new
+        .iter()
+        .find(|record| record["endpoint"] == "DoGet")
+        .unwrap_or_else(|| panic!("no DoGet record: {new:?}"));
+    assert_eq!(get["sql"], sql);
+    assert_eq!(client_attempts(get), 1, "{get}");
+}
+
 /// A resolve response's `secrets` become session secrets before the ATTACH; a
 /// malformed element refuses the arming, and user SQL cannot name the
 /// reserved prefix.
