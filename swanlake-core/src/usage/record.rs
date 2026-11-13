@@ -59,7 +59,7 @@ fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> &str {
 
 /// Substrings that mark a text as able to carry a credential. Each is
 /// lowercase ASCII and is compared without ASCII case.
-const CREDENTIAL_MARKERS: [&[u8]; 8] = [
+const CREDENTIAL_MARKERS: [&[u8]; 10] = [
     b"secret",
     b"password",
     b"passwd",
@@ -68,6 +68,8 @@ const CREDENTIAL_MARKERS: [&[u8]; 8] = [
     b"_key",
     b"credential",
     b"connection_string",
+    b"authorization",
+    b"bearer",
 ];
 
 /// Whether `sql` contains a credential marker, or a `://` followed by an `@`
@@ -475,6 +477,9 @@ mod tests {
             "select api_KEY from t",
             "select Credential from t",
             "select connection_string from t",
+            "SET VARIABLE h = MAP {'Authorization': 'x'}",
+            "SELECT * FROM read_json('https://host/x', headers = MAP {'a': 'BEARER abc'})",
+            "select bearer from t",
             "ATTACH 'postgres://user:pw@host/db' AS pg",
             "COPY t TO 's3://key:secr@bucket'",
         ] {
@@ -499,6 +504,7 @@ mod tests {
         for text in [
             "SELECT 1",
             "SELECT key, pw, tok FROM t",
+            "SELECT author, bear FROM t",
             "SELECT * FROM read_parquet('s3://bucket/path/file@v2.parquet')",
             "SELECT 'a@b.c' FROM 'https://host/path'",
             "SELECT 'a@b' || ':/' || '/'",
