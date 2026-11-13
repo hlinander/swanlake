@@ -105,7 +105,9 @@ pub struct UsageQueueSnapshot {
 pub enum UsageRecordDrop {
     /// The delivery queue could not hold the record within its byte bound.
     QueueFull,
-    /// The serialized record passed its size bound without its breakdowns.
+    /// The request's entries passed the bound on what its accounting
+    /// stores, or the serialized record passed its size bound without its
+    /// breakdowns.
     Oversized,
     /// The duckvis API answered 400, 413, or 422, or answered the record's
     /// fifth 401 after a token re-mint or 403.

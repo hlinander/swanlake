@@ -226,7 +226,8 @@ struct RecordJson<'a> {
 pub(super) enum Serialized {
     /// The record's bytes, within the bound.
     Record(Bytes),
-    /// The record passes the bound without its breakdowns.
+    /// The record passes the bound without its breakdowns, or its
+    /// accounting stopped storing entries. It is discarded.
     Oversized,
 }
 
