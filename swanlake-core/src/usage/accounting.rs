@@ -261,8 +261,8 @@ impl RequestAccounting {
 
     /// Records the DuckDB error type of the failure that failed the request
     /// in the engine. The record carries the type's name. The first type set
-    /// is the request's; later calls change nothing. A type that
-    /// has no name sets nothing.
+    /// is the request's; later calls change nothing. A value that is no
+    /// constant of `duckdb_error_type` sets nothing.
     pub fn set_error_type(&self, error_type: libduckdb_sys::duckdb_error_type) {
         if let Some(name) = record::error_type_name(error_type) {
             self.state().error_type.get_or_insert(name);
@@ -654,10 +654,9 @@ mod tests {
 
         let (queue, _metrics) = queue();
         let accounting = RequestAccounting::new("DoGet", Some(&auth()), Some(queue.clone()));
-        // A type with no name sets nothing, so the next call is the first.
-        accounting.set_error_type(ffi::duckdb_error_type_DUCKDB_INVALID_CONFIGURATION);
         accounting.set_error_type(ffi::duckdb_error_type_DUCKDB_ERROR_CONSTRAINT);
         accounting.set_error_type(ffi::duckdb_error_type_DUCKDB_ERROR_TRANSACTION);
+        accounting.set_error_type(ffi::duckdb_error_type_DUCKDB_INVALID_CONFIGURATION);
         accounting.push_entry(
             ExecutionLabel::Client,
             &totals(0, 0),
@@ -669,6 +668,30 @@ mod tests {
         drop(accounting);
 
         assert_eq!(queued(&queue)[0]["error_type"], json!("CONSTRAINT"));
+    }
+
+    #[test]
+    fn a_first_failure_of_invalid_configuration_is_kept() {
+        use libduckdb_sys as ffi;
+
+        let (queue, _metrics) = queue();
+        let accounting = RequestAccounting::new("DoGet", Some(&auth()), Some(queue.clone()));
+        accounting.set_error_type(ffi::duckdb_error_type_DUCKDB_INVALID_CONFIGURATION);
+        accounting.set_error_type(ffi::duckdb_error_type_DUCKDB_ERROR_CONSTRAINT);
+        accounting.push_entry(
+            ExecutionLabel::Client,
+            &totals(0, 0),
+            &totals(1, 1),
+            false,
+            None,
+        );
+
+        drop(accounting);
+
+        assert_eq!(
+            queued(&queue)[0]["error_type"],
+            json!("INVALID_CONFIGURATION")
+        );
     }
 
     #[test]

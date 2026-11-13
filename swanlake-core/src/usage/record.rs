@@ -102,8 +102,9 @@ fn can_carry_credential(sql: &str) -> bool {
 }
 
 /// The name of a `duckdb_error_type` constant without its `DUCKDB_ERROR_`
-/// prefix. `None` for `DUCKDB_INVALID_CONFIGURATION`, which has no such
-/// prefix, and for a value that is no constant of the enum.
+/// prefix. `DUCKDB_INVALID_CONFIGURATION` has no such prefix and is
+/// `INVALID_CONFIGURATION`. `None` for a value that is no constant of the
+/// enum.
 pub(super) fn error_type_name(error_type: ffi::duckdb_error_type) -> Option<&'static str> {
     let name = match error_type {
         ffi::duckdb_error_type_DUCKDB_ERROR_INVALID => "INVALID",
@@ -148,6 +149,7 @@ pub(super) fn error_type_name(error_type: ffi::duckdb_error_type) -> Option<&'st
         ffi::duckdb_error_type_DUCKDB_ERROR_MISSING_EXTENSION => "MISSING_EXTENSION",
         ffi::duckdb_error_type_DUCKDB_ERROR_AUTOLOAD => "AUTOLOAD",
         ffi::duckdb_error_type_DUCKDB_ERROR_SEQUENCE => "SEQUENCE",
+        ffi::duckdb_error_type_DUCKDB_INVALID_CONFIGURATION => "INVALID_CONFIGURATION",
         _ => return None,
     };
     Some(name)
@@ -432,22 +434,29 @@ mod tests {
             error_type_name(ffi::duckdb_error_type_DUCKDB_ERROR_SEQUENCE),
             Some("SEQUENCE")
         );
-        // Every value from the first constant to the last prefixed one has a
-        // distinct name.
-        let names = (0..=41)
+        // Every value from the first constant to the last has a distinct
+        // name.
+        assert_eq!(ffi::duckdb_error_type_DUCKDB_ERROR_INVALID, 0);
+        assert_eq!(ffi::duckdb_error_type_DUCKDB_INVALID_CONFIGURATION, 42);
+        let names = (0..=42)
             .map(error_type_name)
             .collect::<Option<std::collections::BTreeSet<_>>>()
-            .expect("a name for each prefixed constant");
-        assert_eq!(names.len(), 42);
+            .expect("a name for each constant");
+        assert_eq!(names.len(), 43);
     }
 
     #[test]
-    fn error_types_without_the_prefix_have_no_name() {
+    fn the_constant_without_the_prefix_reports_as_invalid_configuration() {
         assert_eq!(
             error_type_name(ffi::duckdb_error_type_DUCKDB_INVALID_CONFIGURATION),
-            None
+            Some("INVALID_CONFIGURATION")
         );
+    }
+
+    #[test]
+    fn a_value_that_is_no_constant_has_no_name() {
         assert_eq!(error_type_name(43), None);
+        assert_eq!(error_type_name(ffi::duckdb_error_type::MAX), None);
     }
 
     #[test]
