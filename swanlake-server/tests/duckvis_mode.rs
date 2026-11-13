@@ -123,6 +123,8 @@ struct MockState {
     fail_500: AtomicBool,
     /// Provided ETag for jwks.
     etag: Mutex<String>,
+    /// The usage records posted to `/v1/usage/requests`, in arrival order.
+    usage_records: Mutex<Vec<Value>>,
 }
 
 impl MockState {
@@ -320,7 +322,21 @@ async fn spawn_mock_api(state: Arc<MockState>) -> String {
         (StatusCode::OK, Json(body)).into_response()
     }
 
+    async fn usage_request(
+        State(state): State<Arc<MockState>>,
+        body: axum::body::Bytes,
+    ) -> impl IntoResponse {
+        let record = serde_json::from_slice(&body).expect("a usage record is JSON");
+        state
+            .usage_records
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(record);
+        StatusCode::NO_CONTENT
+    }
+
     let app = axum::Router::new()
+        .route("/v1/usage/requests", post(usage_request))
         .route("/.well-known/jwks.json", get(jwks))
         .route("/v1/auth/oauth/token", post(oauth_token))
         .route("/v1/authz/check", post(authz_check))
@@ -389,13 +405,15 @@ async fn spawn_server_with_init(
     let addr: SocketAddr = listener.local_addr().expect("server addr");
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
+    let usage_queue = swanlake_core::usage::spawn_delivery(duckvis.clone(), &metrics);
     let service = SwanFlightService::with_duckvis(
         Arc::clone(&registry),
         metrics,
         SessionIdMode::PeerAddr,
         format!("grpc://{addr}"),
         Some(duckvis),
-    );
+    )
+    .with_usage_queue(Some(usage_queue));
 
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
@@ -1970,20 +1988,20 @@ async fn authenticated_locked_session_reports_cpu_in_flight_metadata() {
         .await
         .unwrap()
         .into_inner();
-    let mut positive_cpu = false;
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let mut figures = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
         for endpoint in info.endpoint {
             let mut stream = cli
                 .do_get(with_headers(endpoint.ticket.unwrap(), &headers))
                 .await
                 .unwrap()
                 .into_inner();
-            // Let backpressure hold the result while the CPU sampler ticks.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             while let Some(data) = stream.message().await.unwrap() {
                 if !data.app_metadata.is_empty() {
                     let metadata: Value = rmp_serde::from_slice(&data.app_metadata).unwrap();
-                    positive_cpu |= metadata["cpu_time_us"].as_u64().unwrap_or(0) > 0;
+                    if let Some(cpu) = metadata["cpu_time_us"].as_u64() {
+                        figures.push(cpu);
+                    }
                 }
             }
         }
@@ -1991,9 +2009,105 @@ async fn authenticated_locked_session_reports_cpu_in_flight_metadata() {
     .await
     .unwrap();
     assert!(
-        positive_cpu,
+        figures.first().is_some_and(|first| *first > 0),
         "locked authenticated session omitted CPU telemetry"
     );
+    assert!(
+        figures.windows(2).all(|pair| pair[0] <= pair[1]),
+        "a CPU figure fell during the statement: {figures:?}"
+    );
+    assert!(
+        figures.first() < figures.last(),
+        "the CPU figure did not rise during the statement: {figures:?}"
+    );
+}
+
+/// The usage records the mock API holds once `count` have arrived.
+async fn usage_records(mock: &MockState, count: usize) -> Vec<Value> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let records = mock
+                .usage_records
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            if records.len() >= count {
+                return records;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the usage records arrived")
+}
+
+/// Each entry's provenance and `abandoned` flag, in record order.
+fn usage_attempts(record: &Value) -> Vec<(&str, bool)> {
+    record["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|entry| {
+            (
+                entry["provenance"].as_str().expect("provenance"),
+                entry["abandoned"].as_bool().expect("abandoned"),
+            )
+        })
+        .collect()
+}
+
+/// A raw-SQL query is two requests, and each queues one record: schema
+/// discovery under label 0 for GetFlightInfo, and for DoGet the probe under
+/// label 0 ahead of the client's statement under label 1. A statement that
+/// fails records its attempt and the engine's error type.
+#[tokio::test]
+async fn requests_report_their_attempts_and_labels() {
+    let h = base_harness().await;
+    let mut cli = client(&h.endpoint).await;
+    let token = format!("Bearer {}", valid_token("usage-user"));
+    let headers = project_headers(&token, "usage-session", PROJECT);
+
+    let sql = "SELECT sum(i) AS total FROM range(1000) t(i)";
+    run_select(&mut cli, &headers, sql).await.expect("select");
+    let records = usage_records(&h.mock, 2).await;
+    assert_eq!(records.len(), 2, "one record for each request: {records:?}");
+
+    let info = &records[0];
+    assert_eq!(info["endpoint"], "GetFlightInfo");
+    assert_eq!(info["sql"], sql);
+    assert_eq!(info["project_id"], PROJECT);
+    assert_eq!(info["subject"], "usage-user");
+    assert!(info["error_type"].is_null());
+    let attempts = usage_attempts(info);
+    assert!(!attempts.is_empty());
+    assert!(
+        attempts.iter().all(|(provenance, _)| *provenance == "SWANLAKE"),
+        "schema discovery is SwanLake's work: {attempts:?}"
+    );
+
+    let get = &records[1];
+    assert_eq!(get["endpoint"], "DoGet");
+    assert_eq!(get["sql"], sql);
+    assert_ne!(get["request_id"], info["request_id"]);
+    let attempts = usage_attempts(get);
+    assert_eq!(
+        attempts[attempts.len() - 2..],
+        [("SWANLAKE", true), ("CLIENT", false)],
+        "the abandoned probe, then the statement: {attempts:?}"
+    );
+    assert_eq!(
+        attempts.iter().filter(|(provenance, _)| *provenance == "CLIENT").count(),
+        1
+    );
+
+    run_select(&mut cli, &headers, "SELECT * FROM no_such_table")
+        .await
+        .expect_err("the table does not exist");
+    let records = usage_records(&h.mock, 3).await;
+    let failed = &records[2];
+    assert_eq!(failed["endpoint"], "GetFlightInfo");
+    assert_eq!(failed["error_type"], "CATALOG");
+    assert!(!usage_attempts(failed).is_empty());
 }
 
 /// A resolve response's `secrets` become session secrets before the ATTACH; a
