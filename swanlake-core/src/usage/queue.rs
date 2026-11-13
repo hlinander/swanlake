@@ -141,7 +141,7 @@ impl UsageQueue {
     }
 
     #[cfg(test)]
-    pub(super) fn snapshot(&self) -> Vec<Bytes> {
+    pub(crate) fn snapshot(&self) -> Vec<Bytes> {
         self.pending()
             .records
             .iter()
