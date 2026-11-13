@@ -268,9 +268,7 @@ impl DuckvisAuth {
         )
         .await?;
 
-        let status = self
-            .send_usage_record(&url, record.clone(), &token)
-            .await?;
+        let status = self.send_usage_record(&url, record.clone(), &token).await?;
         if status != reqwest::StatusCode::UNAUTHORIZED {
             return Ok(status);
         }
