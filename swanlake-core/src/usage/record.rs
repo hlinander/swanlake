@@ -370,6 +370,27 @@ mod tests {
     }
 
     #[test]
+    fn a_breakdown_time_that_is_not_finite_reports_as_zero() {
+        let sql = SqlText::default();
+        let mut child = node("child", vec![]);
+        child.operator_cpu_time = f64::NEG_INFINITY;
+        child.operator_timing = 0.125;
+        let mut root = node("root", vec![child]);
+        root.operator_cpu_time = f64::NAN;
+        root.operator_timing = f64::INFINITY;
+
+        let record = parse(serialize(parts(&sql, vec![entry(0, Some(root))])));
+
+        let root = &record["entries"][0]["breakdown"];
+        assert_eq!(root["operator_cpu_time"], json!(0.0));
+        assert_eq!(root["operator_timing"], json!(0.0));
+        let child = &root["children"][0];
+        assert_eq!(child["operator_cpu_time"], json!(0.0));
+        // A finite time is reported as it is.
+        assert_eq!(child["operator_timing"], json!(0.125));
+    }
+
+    #[test]
     fn record_without_sql_or_error_type_omits_both() {
         let sql = SqlText::default();
         let record = parse(serialize(parts(&sql, vec![entry(0, None)])));
