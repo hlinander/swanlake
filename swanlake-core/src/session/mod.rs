@@ -411,9 +411,14 @@ impl Session {
 
         // The statement references these secrets by name, so they exist first.
         // Engine text for a failed secret is not relayed: it can echo the
-        // statement, which carries the credential.
+        // statement, which carries the credential. The request's record
+        // takes the engine's error type here, because the error the client
+        // receives no longer carries it; the type's name holds no text.
         for secret_sql in secrets_sql {
-            self.execute_statement_privileged(secret_sql, accounting).map_err(|_| {
+            self.execute_statement_privileged(secret_sql, accounting).map_err(|error| {
+                if let Some(accounting) = accounting {
+                    crate::service::SwanFlightSqlService::record_failure(accounting, &error);
+                }
                 ServerError::Internal("failed to create the attachment's session secret".into())
             })?;
         }
@@ -1745,6 +1750,74 @@ mod lockdown_tests {
         let record = record.expect("a record");
         assert_eq!(attempts(&record).len(), 1, "the existence probe alone");
         assert_eq!(record["entries"][0]["provenance"], "SWANLAKE");
+        Ok(())
+    }
+
+    /// A secret statement that fails in the engine fails the attachment
+    /// with a fixed text that carries none of the engine's, and the
+    /// request's record carries the engine's error type.
+    #[test]
+    fn a_failed_attachment_secret_records_its_error_type() -> Result<()> {
+        let session = Session::new_with_id(
+            SessionId::from_string("attach-secret-failure".to_string()),
+            Arc::new(test_connection()?),
+        );
+        let secret = "CREATE SECRET __duckvis_broken (TYPE postgres, PASSWORD 'hunter2'".to_string();
+        let (attached, record) = record_of(|accounting| {
+            session.attach_catalog(
+                "side",
+                &[secret],
+                "ATTACH ':memory:' AS side",
+                None,
+                Some(accounting),
+            )
+        });
+        let Err(error) = attached else {
+            return Err(anyhow!("the secret statement does not parse"));
+        };
+        assert!(matches!(error, ServerError::Internal(_)), "{error:?}");
+        let status = crate::service::SwanFlightSqlService::status_from_error(error);
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert_eq!(
+            status.message(),
+            "internal error: failed to create the attachment's session secret"
+        );
+        let record = record.expect("a record");
+        assert_eq!(record["error_type"], "PARSER", "{record}");
+        assert_eq!(attempts(&record), [swanlake(false)], "the secret statement alone");
+        Ok(())
+    }
+
+    /// After the lockdown block, which ends with `SET lock_configuration =
+    /// true`, the engine refuses a client's change of
+    /// `task_boundary_cpu_clock`, session or global, and the setting keeps
+    /// its value.
+    #[test]
+    fn a_locked_session_cannot_set_the_task_boundary_cpu_clock() -> Result<()> {
+        for writer in [false, true] {
+            let scratch = tempfile::tempdir()?;
+            let session = locked_session(writer, scratch.path())?;
+            let before = raw_setting(&session.connection, "task_boundary_cpu_clock")?;
+            assert_eq!(before, "false");
+            for sql in [
+                "SET task_boundary_cpu_clock = true",
+                "SET GLOBAL task_boundary_cpu_clock = true",
+            ] {
+                let result = session.execute_statement(sql, None);
+                let Err(ServerError::DuckDb(error)) = result else {
+                    return Err(anyhow!("{sql:?} was not refused by the engine: {result:?}"));
+                };
+                assert!(
+                    error.to_string().contains("configuration has been locked"),
+                    "{sql:?} failed for another reason: {error}"
+                );
+                assert_eq!(
+                    raw_setting(&session.connection, "task_boundary_cpu_clock")?,
+                    before,
+                    "{sql:?}"
+                );
+            }
+        }
         Ok(())
     }
 
