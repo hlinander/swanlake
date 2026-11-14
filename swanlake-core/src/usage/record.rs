@@ -94,7 +94,7 @@ fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> &str {
 
 /// Substrings that mark a text as able to carry a credential. Each is
 /// lowercase ASCII and is compared without ASCII case.
-const CREDENTIAL_MARKERS: [&[u8]; 10] = [
+const CREDENTIAL_MARKERS: [&[u8]; 15] = [
     b"secret",
     b"password",
     b"passwd",
@@ -105,6 +105,11 @@ const CREDENTIAL_MARKERS: [&[u8]; 10] = [
     b"connection_string",
     b"authorization",
     b"bearer",
+    b"sig=",
+    b"signature=",
+    b"api-key",
+    b"apikey",
+    b"cookie",
 ];
 
 /// Whether `sql` contains a credential marker, or a `://` followed by an `@`
@@ -551,6 +556,16 @@ mod tests {
             "SET VARIABLE h = MAP {'Authorization': 'x'}",
             "SELECT * FROM read_json('https://host/x', headers = MAP {'a': 'BEARER abc'})",
             "select bearer from t",
+            // An Azure shared access signature URL.
+            "COPY t FROM 'https://acct.blob.core.windows.net/c/f.parquet?sv=2022-11-02&ss=b&srt=o&sp=r&se=2026-12-01T00:00:00Z&sig=dGhpcyBpcyBub3QgYSBrZXk%3D'",
+            "SELECT * FROM 'https://acct.blob.core.windows.net/c/f.parquet?sp=r&SIG=abc'",
+            // An AWS presigned URL with a version 2 signature.
+            "SELECT * FROM read_parquet('https://bucket.s3.amazonaws.com/f.parquet?AWSAccessKeyId=AKIAEXAMPLE&Expires=1790000000&Signature=abc%2Bdef%3D')",
+            "SELECT * FROM 'https://host/f?X-Amz-Signature=0123abcd'",
+            "SELECT * FROM read_json('https://host/x', headers = MAP {'x-api-key': 'abc'})",
+            "SELECT * FROM read_json('https://host/x', headers = MAP {'Api-Key': 'abc'})",
+            "SELECT * FROM read_json('https://host/x', headers = MAP {'ApiKey': 'abc'})",
+            "SELECT * FROM read_json('https://host/x', headers = MAP {'Cookie': 'session=abc'})",
             "ATTACH 'postgres://user:pw@host/db' AS pg",
             "COPY t TO 's3://key:secr@bucket'",
         ] {
@@ -576,6 +591,8 @@ mod tests {
             "SELECT 1",
             "SELECT key, pw, tok FROM t",
             "SELECT author, bear FROM t",
+            "SELECT sig, signature, api, cook FROM t",
+            "SELECT * FROM 'https://host/f.parquet?sv=2022-11-02&sp=r'",
             "SELECT * FROM read_parquet('s3://bucket/path/file@v2.parquet')",
             "SELECT 'a@b.c' FROM 'https://host/path'",
             "SELECT 'a@b' || ':/' || '/'",
