@@ -306,9 +306,10 @@ impl RequestAccounting {
     }
 
     /// Records the SQL text the client sent. The first text set is the
-    /// request's; later calls change nothing.
+    /// request's; later calls change nothing. An empty text sets nothing,
+    /// so a later text is still the first.
     pub fn set_sql(&self, sql: &str) {
-        if self.destination.is_none() {
+        if self.destination.is_none() || sql.is_empty() {
             return;
         }
         // The redaction scan runs outside the lock.
@@ -353,10 +354,22 @@ impl RequestAccounting {
         abandoned: bool,
         breakdown: Option<BreakdownNode>,
     ) -> u64 {
-        // The breakdown is measured outside the lock.
         let mut breakdown = breakdown.filter(|_| self.destination.is_some());
         let mut breakdown_omitted = false;
         let mut breakdown_bytes = 0;
+        // No breakdown is stored once the record has overflowed, or once the
+        // stored entries have reached the bound for entries with breakdowns:
+        // the stored size never falls, and a breakdown adds to it. Such a
+        // breakdown is dropped without being measured.
+        let storable = breakdown.is_some() && {
+            let state = self.state();
+            !state.overflowed && state.entries_bytes < self.limits.entries_bytes_with_breakdown
+        };
+        if breakdown.is_some() && !storable {
+            breakdown = None;
+            breakdown_omitted = true;
+        }
+        // A breakdown that can be stored is measured outside the lock.
         if let Some(root) = &breakdown {
             if root.is_deeper_than(self.limits.breakdown_levels) {
                 breakdown = None;
@@ -753,6 +766,40 @@ mod tests {
 
         let records = queued(&queue);
         assert_eq!(records[0]["sql"], json!("SELECT 1"));
+    }
+
+    #[test]
+    fn an_empty_sql_text_sets_nothing() {
+        let (queue, _metrics) = queue();
+        let push = |accounting: &RequestAccounting| {
+            accounting.push_entry(
+                ExecutionLabel::Client,
+                &totals(0, 0),
+                &totals(1, 1),
+                false,
+                None,
+            );
+        };
+
+        // An empty text alone leaves the record without a text.
+        let accounting = RequestAccounting::new("DoGet", Some(&auth()), Some(queue.clone()));
+        accounting.set_sql("");
+        push(&accounting);
+        drop(accounting);
+
+        // An empty text does not count as the first text.
+        let accounting = RequestAccounting::new("DoGet", Some(&auth()), Some(queue.clone()));
+        accounting.set_sql("");
+        accounting.set_sql("SELECT 2");
+        accounting.set_sql("SELECT 3");
+        push(&accounting);
+        drop(accounting);
+
+        let records = queued(&queue);
+        assert!(records[0].get("sql").is_none(), "{}", records[0]);
+        assert_eq!(records[0]["sql_truncated"], json!(false));
+        assert_eq!(records[0]["sql_redacted"], json!(false));
+        assert_eq!(records[1]["sql"], json!("SELECT 2"));
     }
 
     #[test]
