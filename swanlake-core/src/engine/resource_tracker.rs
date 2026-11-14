@@ -7,7 +7,7 @@
 use duckdb::InterruptHandle;
 use libduckdb_sys as ffi;
 
-use crate::usage::{Progress, ResourceTotals, UsageTotals};
+use crate::usage::{Progress, ProgressFigures, ResourceTotals, UsageTotals};
 
 /// Snapshot of resource usage at a point in time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,19 +74,32 @@ pub fn read_totals(handle: &InterruptHandle) -> Option<ResourceTotals> {
 /// The resource figures of a request's label-1 attempts as of this call.
 ///
 /// While an attempt is open, the snapshot adds the database's CPU since that
-/// attempt's opening read to the CPU of the attempts that have closed, and
-/// its memory level and peak are those of one read of the connection behind
-/// `handle`. With no attempt open it reads nothing: the snapshot carries the
-/// closed attempts' CPU and their largest peak, and no memory level. Once the
-/// request's last label-1 attempt has closed, the snapshot equals the
-/// request's total.
+/// attempt's opening read to the CPU of the attempts that have closed, its
+/// memory level is that of one read of the connection behind `handle`, and
+/// its peak is the larger of that read's peak and the largest peak among the
+/// closed attempts. With no attempt open it reads nothing: the snapshot
+/// carries the closed attempts' CPU and their largest peak, and no memory
+/// level. Once the request's last label-1 attempt has closed, the snapshot
+/// equals the request's total.
 pub fn progress_snapshot(handle: &InterruptHandle, progress: &Progress) -> ResourceSnapshot {
     let figures = progress.figures();
     let current = figures.open.and_then(|_| read_totals(handle));
+    snapshot_of(&figures, current.as_ref())
+}
+
+/// The snapshot of `figures`, with `current` a read taken while an attempt
+/// is open.
+///
+/// A read's peak covers only the attempt that is open, so the peak is the
+/// larger of it and the closed attempts' largest peak, and never falls
+/// during a request.
+fn snapshot_of(figures: &ProgressFigures, current: Option<&ResourceTotals>) -> ResourceSnapshot {
     ResourceSnapshot {
-        peak_memory_bytes: current.map_or(figures.closed_peak_bytes, |read| read.memory_peak_bytes),
+        peak_memory_bytes: current.map_or(figures.closed_peak_bytes, |read| {
+            read.memory_peak_bytes.max(figures.closed_peak_bytes)
+        }),
         current_memory_bytes: current.map_or(0, |read| read.memory_bytes),
-        cpu_time_us: figures.cpu_ns(current.as_ref()) / 1_000,
+        cpu_time_us: figures.cpu_ns(current) / 1_000,
     }
 }
 
@@ -108,36 +121,131 @@ mod tests {
         Arc::new(DuckDbConnection::new(native))
     }
 
+    /// A statement that runs until it is interrupted.
+    const ENDLESS_SQL: &str = "SELECT sum(sin(i::DOUBLE)) FROM range(100000000000) t(i)";
+
     /// A read never waits for the statement thread: it returns while another
-    /// thread holds the connection guard inside a statement.
+    /// thread executes a statement under the connection guard, and it
+    /// reports that statement's CPU as it accrues.
     #[test]
-    fn a_read_returns_while_a_statement_holds_the_guard() {
+    fn a_read_returns_while_a_statement_runs() {
         let connection = connection();
         let handle = connection.interrupt_handle();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker = {
             let connection = connection.clone();
+            let finished = finished.clone();
             thread::spawn(move || {
-                connection.with_raw(|native| {
-                    native.execute_batch(BUSY_SQL).unwrap();
-                    started_tx.send(()).unwrap();
-                    let _ = release_rx.recv_timeout(Duration::from_secs(5));
-                });
+                let result = connection.with_raw(|native| native.execute_batch(ENDLESS_SQL));
+                finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                result
             })
         };
-        started_rx.recv().unwrap();
-        assert!(connection.guard_is_held());
-        let start = Instant::now();
-        let totals = read_totals(&handle).expect("the connection is open");
-        let elapsed = start.elapsed();
-        release_tx.send(()).unwrap();
-        worker.join().unwrap();
-        assert!(totals.database.cpu_ns > 0, "the statement's CPU is in the totals");
+
+        // The statement is executing once the database's CPU rises between
+        // two reads.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let first = read_totals(&handle).expect("the connection is open");
+        let mut slowest = Duration::ZERO;
+        let mut latest = first;
+        while latest.database.cpu_ns <= first.database.cpu_ns || !connection.guard_is_held() {
+            assert!(Instant::now() < deadline, "the statement's CPU never reached a read");
+            thread::sleep(Duration::from_millis(10));
+            let start = Instant::now();
+            latest = read_totals(&handle).expect("the connection is open");
+            slowest = slowest.max(start.elapsed());
+        }
+        // Reads taken while the statement executes.
+        for _ in 0..20 {
+            let start = Instant::now();
+            let read = read_totals(&handle).expect("the connection is open");
+            slowest = slowest.max(start.elapsed());
+            assert!(read.database.cpu_ns >= latest.database.cpu_ns);
+            latest = read;
+        }
+        let still_running = !finished.load(std::sync::atomic::Ordering::SeqCst);
+        handle.interrupt();
+        let result = worker.join().unwrap();
+
+        assert!(still_running, "the statement ended before the reads did");
+        assert!(result.is_err(), "the statement ran until the interrupt: {result:?}");
         assert!(
-            elapsed < Duration::from_millis(100),
-            "a read took {elapsed:?} while a statement held the guard"
+            slowest < Duration::from_millis(100),
+            "a read took {slowest:?} while a statement executed"
         );
+    }
+
+    /// The peak of a snapshot never falls during a request: a read taken
+    /// while an attempt is open reports that attempt's peak alone, and the
+    /// snapshot reports the larger of it and the closed attempts' peak.
+    #[test]
+    fn a_snapshot_peak_is_never_below_the_closed_attempts_peak() {
+        let read = |peak: u64| ResourceTotals {
+            memory_bytes: peak / 2,
+            memory_peak_bytes: peak,
+            ..ResourceTotals::default()
+        };
+        let closed = ProgressFigures {
+            closed_cpu_ns: 5_000,
+            closed_peak_bytes: 800,
+            open: None,
+        };
+        let open = ProgressFigures {
+            open: Some(read(0)),
+            ..closed
+        };
+
+        // With no attempt open, the closed attempts' peak and no level.
+        let settled = snapshot_of(&closed, None);
+        assert_eq!((settled.peak_memory_bytes, settled.current_memory_bytes), (800, 0));
+        // An open attempt whose own peak is below the closed attempts' peak.
+        let below = snapshot_of(&open, Some(&read(300)));
+        assert_eq!((below.peak_memory_bytes, below.current_memory_bytes), (800, 150));
+        // An open attempt whose peak passes it.
+        let above = snapshot_of(&open, Some(&read(900)));
+        assert_eq!((above.peak_memory_bytes, above.current_memory_bytes), (900, 450));
+    }
+
+    /// Through the engine: the second attempt of a request uses less memory
+    /// than the first, and a snapshot taken while it is open still reports
+    /// the first attempt's peak.
+    #[test]
+    fn a_later_smaller_attempt_keeps_the_request_peak() {
+        let connection = connection();
+        let handle = connection.interrupt_handle();
+        let accounting = RequestAccounting::new("DoGet", None, None);
+        let progress = accounting.progress();
+
+        connection
+            .guarded(None, Some(&accounting), |native, bracket| {
+                bracket.measure(ExecutionLabel::Client, || {
+                    native.execute_batch(
+                        "SELECT count(*) FROM (SELECT i % 1000000 AS g, count(*) AS n \
+                         FROM range(3000000) t(i) GROUP BY g)",
+                    )
+                })?;
+                Ok(())
+            })
+            .unwrap();
+        let first_peak = progress.figures().closed_peak_bytes;
+        assert!(first_peak > 0, "the first attempt used memory");
+
+        let during = connection
+            .guarded(None, Some(&accounting), |native, bracket| {
+                Ok(bracket.measure(ExecutionLabel::Client, || {
+                    native.execute_batch("SELECT 1").unwrap();
+                    let own = read_totals(&handle).expect("the connection is open");
+                    (own, progress_snapshot(&handle, &progress))
+                }))
+            })
+            .unwrap();
+        let (own, snapshot) = during;
+        assert!(
+            own.memory_peak_bytes < first_peak,
+            "the second attempt's own peak, {}, is below the first's, {first_peak}",
+            own.memory_peak_bytes
+        );
+        assert_eq!(snapshot.peak_memory_bytes, first_peak);
     }
 
     /// The totals survive what emptied the profiling tree: an execution error
