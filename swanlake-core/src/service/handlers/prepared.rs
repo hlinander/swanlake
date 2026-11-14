@@ -457,6 +457,11 @@ pub(crate) async fn do_put_prepared_statement_update(
         ));
     }
 
+    // The request runs a prepared statement, so its text is the one the
+    // `CreatePreparedStatement` request sent, on every route below: the
+    // appender route included, which inserts the rows without the text.
+    accounting.set_sql(&client_sql);
+
     let parsed_opt = ParsedStatement::parse(&sql);
     let _in_flight = service.metrics.start_update();
     let start = Instant::now();
@@ -477,7 +482,6 @@ pub(crate) async fn do_put_prepared_statement_update(
         let batches = SwanFlightSqlService::collect_record_batches(request).await?;
         if batches.is_empty() {
             // No batches sent, execute the statement with empty params.
-            accounting.set_sql(&client_sql);
             let session_clone = Arc::clone(&session);
             let accounting_clone = Arc::clone(&accounting);
             let sql_for_exec = sql.clone();
@@ -586,7 +590,6 @@ pub(crate) async fn do_put_prepared_statement_update(
             "executing prepared statement update with parameters"
         );
 
-        accounting.set_sql(&client_sql);
         let session_clone = Arc::clone(&session);
         let accounting_clone = Arc::clone(&accounting);
         let sql_for_exec = sql.clone();
