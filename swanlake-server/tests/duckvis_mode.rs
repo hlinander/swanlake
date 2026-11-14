@@ -2344,12 +2344,159 @@ async fn discarding_requests_report_their_statements_and_text() {
         while stream.message().await.expect("prepared stream").is_some() {}
     }
     let new = usage_records_after(&h.mock, seen).await;
+    seen += new.len();
     let get = new
         .iter()
         .find(|record| record["endpoint"] == "DoGet")
         .unwrap_or_else(|| panic!("no DoGet record: {new:?}"));
     assert_eq!(get["sql"], sql);
     assert_eq!(client_attempts(get), 1, "{get}");
+
+    // A prepared update whose DoPut carries its rows: SwanLake inserts them
+    // through the appender and never runs the text, and the request still
+    // reports the text its CreatePreparedStatement request sent.
+    use arrow_flight::sql::{
+        ActionCreatePreparedStatementRequest, CommandPreparedStatementUpdate, ProstMessageExt,
+    };
+    // A one-part name resolves to the default catalog where the session's
+    // catalog is `memory`, so the text names the catalog.
+    let sql = "INSERT INTO memory.raw_rows VALUES (?)";
+    let create = ActionCreatePreparedStatementRequest {
+        query: sql.into(),
+        transaction_id: None,
+    };
+    let mut stream = cli
+        .do_action(with_headers(
+            Action {
+                r#type: "CreatePreparedStatement".into(),
+                body: encoded_any(&create.as_any()).into(),
+            },
+            &headers,
+        ))
+        .await
+        .expect("create prepared insert")
+        .into_inner();
+    let created = stream
+        .message()
+        .await
+        .expect("create prepared insert stream")
+        .expect("the action returns its result");
+    while stream.message().await.expect("create prepared insert stream").is_some() {}
+    // The result is an `Any` whose value is the action's result message,
+    // and that message's field 1 is the handle.
+    let result = bytes_field(&created.body, 2).expect("the result's value");
+    let handle = bytes_field(result, 1).expect("the prepared statement handle").to_vec();
+    let new = usage_records_after(&h.mock, seen).await;
+    seen += new.len();
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(new[0]["sql"], sql);
+
+    let rows = {
+        use duckdb::arrow::array::Int32Array;
+        use duckdb::arrow::datatypes::{DataType, Field, Schema};
+        use duckdb::arrow::record_batch::RecordBatch;
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, true)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("rows")
+    };
+    let update = CommandPreparedStatementUpdate {
+        prepared_statement_handle: handle.into(),
+    };
+    let descriptor = FlightDescriptor::new_cmd(encoded_any(&update.as_any()));
+    let flight_data: Vec<_> = futures::TryStreamExt::try_collect(
+        arrow_flight::encode::FlightDataEncoderBuilder::new()
+            .with_flight_descriptor(Some(descriptor))
+            .with_schema(rows.schema())
+            .build(futures::stream::iter([Ok(rows)])),
+    )
+    .await
+    .expect("encode rows");
+    let mut stream = cli
+        .do_put(with_headers(futures::stream::iter(flight_data), &headers))
+        .await
+        .expect("prepared update with rows")
+        .into_inner();
+    while stream.message().await.expect("prepared update stream").is_some() {}
+    let new = usage_records_after(&h.mock, seen).await;
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(new[0]["endpoint"], "DoPut");
+    assert_eq!(new[0]["sql"], sql);
+    // The appender's one attempt is the request's only label-1 entry, so
+    // the rows did go through the appender and not through the text.
+    assert_eq!(client_attempts(&new[0]), 1, "{}", new[0]);
+    assert!(
+        new[0]["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .all(|entry| entry.get("breakdown").is_none()),
+        "an appender insert carries no breakdown: {}",
+        new[0]
+    );
+    run_select(
+        &mut cli,
+        &headers,
+        "SELECT CASE WHEN (SELECT count(*) FROM raw_rows) = 3 THEN 1 \
+         ELSE error('raw_rows does not hold the three rows') END AS checked",
+    )
+    .await
+    .expect("the three rows were inserted");
+}
+
+/// The protobuf encoding of a field of wire type 2, which holds a string,
+/// bytes, or a message.
+fn encoded_bytes_field(number: u8, bytes: &[u8]) -> Vec<u8> {
+    let mut out = vec![number << 3 | 2];
+    let mut len = bytes.len();
+    loop {
+        let low = (len & 0x7f) as u8;
+        len >>= 7;
+        if len == 0 {
+            out.push(low);
+            break;
+        }
+        out.push(low | 0x80);
+    }
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// The protobuf encoding of an `Any`: its type URL is field 1 and its value
+/// is field 2.
+fn encoded_any(any: &arrow_flight::sql::Any) -> Vec<u8> {
+    let mut out = encoded_bytes_field(1, any.type_url.as_bytes());
+    out.extend(encoded_bytes_field(2, &any.value));
+    out
+}
+
+/// The contents of field `number` of a protobuf message whose fields are
+/// all of wire type 2.
+fn bytes_field(mut message: &[u8], number: u8) -> Option<&[u8]> {
+    while let Some((&key, rest)) = message.split_first() {
+        if key & 7 != 2 {
+            return None;
+        }
+        let mut len = 0usize;
+        let mut shift = 0;
+        let mut at = 0;
+        loop {
+            let byte = *rest.get(at)?;
+            at += 1;
+            len |= usize::from(byte & 0x7f) << shift;
+            shift += 7;
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        let contents = rest.get(at..at.checked_add(len)?)?;
+        if key >> 3 == number {
+            return Some(contents);
+        }
+        message = &rest[at + len..];
+    }
+    None
 }
 
 /// A resolve response's `secrets` become session secrets before the ATTACH; a
