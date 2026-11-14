@@ -1005,7 +1005,8 @@ mod tests {
 
     #[tokio::test]
     async fn one_limit_covers_the_mint_and_the_send_together() {
-        // Each answer arrives within the limit, and the two together do not.
+        // Each answer arrives 300 ms after its request, which is within the
+        // limit, and the two together take at least 600 ms, which is not.
         let api = StandInApi::start_with(
             [204],
             Behavior {
@@ -1016,11 +1017,16 @@ mod tests {
 
         let status = api
             .auth()
-            .post_usage_record_within(Bytes::from_static(b"{}"), Duration::from_millis(450))
+            .post_usage_record_within(Bytes::from_static(b"{}"), Duration::from_millis(550))
             .await;
 
         assert_eq!(status, Err(crate::duckvis::DuckvisError::Unavailable));
         assert_eq!(api.token_mints(), 1);
+        // The mint was answered and the POST was sent with its token, so
+        // the limit ended the send and not the mint.
+        let posts = api.usage_posts();
+        assert_eq!(posts.len(), 1, "the POST was sent before the limit passed");
+        assert_eq!(posts[0].authorization.as_deref(), Some("Bearer token-1"));
     }
 
     #[tokio::test]

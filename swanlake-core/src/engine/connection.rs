@@ -2096,8 +2096,9 @@ mod tests {
         assert_eq!(conn.execute_query("SELECT 42", None).unwrap().total_rows, 1);
     }
 
-    /// Ending an abandoned read leaves the client's explicit transaction
-    /// open and usable.
+    /// A client read abandoned while it executes inside the client's
+    /// explicit transaction: the bracket ends the execution, and the
+    /// transaction stays open with its earlier work and takes later work.
     #[test]
     fn an_abandoned_read_keeps_an_explicit_transaction() {
         let conn = test_connection();
@@ -2107,15 +2108,38 @@ mod tests {
             .unwrap();
         conn.execute_statement_with_params("INSERT INTO kept VALUES (1)", &[], None)
             .unwrap();
-        let (schema, record) =
-            record_of(|accounting| conn.schema_for_query("SELECT i FROM kept", Some(accounting)));
-        assert_eq!(schema.unwrap().fields().len(), 1);
-        assert_eq!(attempts(&record.unwrap()), [swanlake(true)]);
+
+        // The read sees the transaction's own row, and the consumer leaves
+        // after the first batch of ten million rows.
+        let (tx, mut rx) = mpsc::channel(1);
+        let (result, record) = record_of(|accounting| {
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    conn.execute_query_streaming(
+                        "SELECT r.i FROM kept, range(10000000) r(i)",
+                        tx,
+                        None,
+                        Some(accounting),
+                    )
+                });
+                assert!(matches!(rx.blocking_recv(), Some(StreamingBatch::Schema(_))));
+                assert!(matches!(rx.blocking_recv(), Some(StreamingBatch::Batch(_))));
+                drop(rx);
+                worker.join().expect("the stream task returns")
+            })
+        });
+        result.unwrap();
+        assert_eq!(attempts(&record.unwrap()), [swanlake(true), client(true)]);
+
         conn.execute_statement_with_params("INSERT INTO kept VALUES (2)", &[], None)
             .unwrap();
+        assert_eq!(row_count(&conn, "kept"), 2, "both rows are in the transaction");
+        // A COMMIT fails where no transaction is open.
         conn.execute_batch("COMMIT", ExecutionLabel::Client, None)
-            .unwrap();
+            .expect("the transaction is still open");
         assert_eq!(row_count(&conn, "kept"), 2);
+        let rollback = conn.execute_batch("ROLLBACK", ExecutionLabel::Client, None);
+        assert!(rollback.is_err(), "the COMMIT ended the transaction: {rollback:?}");
     }
 
     /// Schema discovery for a body DESCRIBE can wrap is SwanLake's work.
@@ -2264,25 +2288,78 @@ mod tests {
         assert_eq!(record["breakdown_omitted"], false);
     }
 
-    /// A panic inside a measured statement unwinds through the bracket: the
-    /// closing read runs, the entry is recorded, and the guard is released.
+    /// A panic while the last statement's stream is live unwinds through
+    /// the bracket: the closing read ends the open execution, the entry is
+    /// recorded as abandoned, and the guard is released.
     #[test]
-    fn an_unwind_records_the_attempt() {
+    fn an_unwind_with_a_live_stream_records_the_attempt() {
         let conn = test_connection();
         let (outcome, record) = record_of(|accounting| {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                conn.guarded(None, Some(accounting), |raw, bracket| {
-                    bracket.measure_block("SELECT 1; SELECT 2", |_| -> Result<(), ServerError> {
-                        raw.execute_batch("SELECT 3").unwrap();
-                        panic!("Failed to fetch Arrow record batch: INTERRUPT Error: Interrupted!")
-                    })
+                conn.guarded(None, Some(accounting), |_, bracket| {
+                    bracket.measure_block(
+                        "SELECT 1; SELECT i FROM range(10000000) t(i)",
+                        |stmt| -> Result<(), ServerError> {
+                            let mut stream = stmt.stream_arrow([])?;
+                            assert!(stream.next().is_some(), "the first batch fetches");
+                            panic!("a panic with the stream live")
+                        },
+                    )
                 })
             }))
         });
         assert!(outcome.is_err(), "the panic propagates");
-        assert_eq!(attempts(&record.unwrap()), [client(false), client(false)]);
+        assert_eq!(attempts(&record.unwrap()), [client(false), client(true)]);
         assert!(conn.guard_is_poisoned());
         assert!(!conn.guard_is_held());
+        assert_eq!(conn.execute_query("SELECT 42", None).unwrap().total_rows, 1);
+    }
+
+    /// A fetch that fails after the first chunk. duckdb-rs's Arrow iterator
+    /// yields batches and no error, so it panics on the failure, and the
+    /// failure reaches this crate as an unwind and not as an error value.
+    /// The bracket records the attempt, and the connection takes the next
+    /// statement. The record carries no `error_type`, because no
+    /// `ServerError` holds the engine's type on this path.
+    #[test]
+    fn a_fetch_failure_after_the_first_chunk_unwinds_and_records_its_attempt() {
+        let conn = test_connection();
+        // One thread produces the rows in order, and the failing row lies
+        // far past the rows the engine buffers ahead of a fetch.
+        conn.execute_batch("SET threads = 1", ExecutionLabel::SwanLake, None)
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let (outcome, record) = record_of(|accounting| {
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    let result = conn.execute_query_streaming(
+                        "SELECT CAST(CASE WHEN i < 10000000 THEN '1' ELSE 'not a number' END \
+                         AS INTEGER) AS v FROM range(20000000) t(i)",
+                        tx,
+                        None,
+                        Some(accounting),
+                    );
+                    // As the stream task does with an error the query returns.
+                    if let Err(error) = &result {
+                        crate::service::SwanFlightSqlService::record_failure(accounting, error);
+                    }
+                    result
+                });
+                assert!(matches!(rx.blocking_recv(), Some(StreamingBatch::Schema(_))));
+                let mut batches = 0;
+                while let Some(StreamingBatch::Batch(_)) = rx.blocking_recv() {
+                    batches += 1;
+                }
+                assert!(batches > 1, "the failure follows the first chunk");
+                worker.join()
+            })
+        });
+        assert!(outcome.is_err(), "the fetch failure unwinds the stream task");
+        let record = record.unwrap();
+        assert_eq!(record["entries"].as_array().unwrap().len(), 2, "{record}");
+        assert_eq!(record["entries"][1]["provenance"], "CLIENT");
+        assert!(record.get("error_type").is_none(), "{record}");
+        assert!(conn.guard_is_poisoned());
         assert_eq!(conn.execute_query("SELECT 42", None).unwrap().total_rows, 1);
     }
 }
