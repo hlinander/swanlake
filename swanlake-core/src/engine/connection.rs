@@ -423,7 +423,7 @@ impl DuckDbConnection {
     }
 
     /// Runs a client block whose every result is discarded, under label 1
-    /// with one attempt for each statement. A block that holds no statement
+    /// as one attempt for the whole block. A block that holds no statement
     /// succeeds.
     pub fn execute_statement_with_telemetry(
         &self,
@@ -847,7 +847,7 @@ impl DuckDbConnection {
 
 /// The bracket handle [`DuckDbConnection::guarded`] passes its closure.
 ///
-/// Each of its two methods measures attempts: a `duckdb_begin_measured`
+/// Each of its three methods measures attempts: a `duckdb_begin_measured`
 /// before a body of work and a `duckdb_end_measured` after it, whose two
 /// reads give the attempt's figures. One bracket is open at a time, and the
 /// closing call runs on every exit from the measured work.
@@ -897,25 +897,27 @@ impl<'a> Bracket<'a> {
         f(&mut stmt)
     }
 
-    /// Runs the block `sql` under label 1 and discards every result, one
-    /// attempt for each statement, each with its breakdown.
+    /// Runs the block `sql` under label 1 and discards every result, as one
+    /// attempt for the whole block.
     ///
-    /// No statement is prepared, so none passes through the VARIANT
-    /// result-column checks. Extraction parses the whole block before any
-    /// statement runs and belongs to the first attempt. A statement that
-    /// fails ends the block with its error. A block that holds no statement
-    /// makes one attempt and succeeds.
+    /// The block runs through one `duckdb_query` call. That call rolls back
+    /// a transaction the block opened with the automatic-rollback property
+    /// when a statement of the block fails, and it clears the interrupt flag
+    /// once, so an interrupt between two statements stops the next one. The
+    /// engine expands some single statements into such a block, and a split
+    /// into statements would leave the session in the failed transaction.
+    ///
+    /// The statement count decides only the breakdown: the profiler holds
+    /// the last statement's tree after the call, so the entry carries a
+    /// breakdown where the block holds exactly one statement. A count that
+    /// fails is ignored, and the `duckdb_query` call reports the block's
+    /// error. A block that holds no statement succeeds.
     pub(crate) fn measure_batch(&self, sql: &str) -> Result<(), ServerError> {
-        let mut attempt = self.open(ExecutionLabel::Client, true);
-        let mut statements = self.conn.extract(sql)?;
-        let Some(last) = statements.len().checked_sub(1) else {
-            return Ok(());
-        };
-        for index in 0..last {
-            statements.execute_and_discard(index)?;
-            attempt.next();
-        }
-        statements.execute_and_discard(last)?;
+        let mut attempt = self.open(ExecutionLabel::Client, false);
+        // The extracted set is released before the block runs.
+        let count = self.conn.extract(sql).map(|statements| statements.len());
+        attempt.breakdown = matches!(count, Ok(1));
+        self.conn.execute_batch(sql)?;
         Ok(())
     }
 
@@ -1888,10 +1890,7 @@ mod tests {
         conn.execute_statement_with_telemetry(sql, None, None, Some(accounting))
     }
 
-    /// A block on the discarding route makes one label-1 attempt for each
-    /// statement, each with its breakdown, and no probe.
-    #[test]
-    fn a_batch_records_one_entry_for_each_statement() {
+    fn profiled_connection() -> DuckDbConnection {
         let conn = test_connection();
         conn.execute_batch(
             "SET enable_profiling = 'no_output'",
@@ -1899,6 +1898,14 @@ mod tests {
             None,
         )
         .unwrap();
+        conn
+    }
+
+    /// A block of several statements on the discarding route is one label-1
+    /// attempt with no breakdown and no probe, and every statement runs once.
+    #[test]
+    fn a_batch_of_several_statements_records_one_entry_without_a_breakdown() {
+        let conn = profiled_connection();
         let (result, record) = record_of(|accounting| {
             run_batch(
                 &conn,
@@ -1909,26 +1916,85 @@ mod tests {
         });
         result.unwrap();
         let record = record.unwrap();
-        assert_eq!(
-            attempts(&record),
-            [client(false), client(false), client(false)]
-        );
+        assert_eq!(attempts(&record), [client(false)]);
         assert_eq!(row_count(&conn, "batch"), 12, "each statement ran once");
-        let last = &record["entries"][2];
+        let entry = &record["entries"][0];
         assert!(
-            last["breakdown"].is_object(),
-            "an attempt of the batch carries its tree: {last}"
+            entry.get("breakdown").is_none(),
+            "a block of several statements carries no tree: {entry}"
         );
+        assert_eq!(record["breakdown_omitted"], false);
+    }
 
-        let (result, record) =
-            record_of(|accounting| run_batch(&conn, "DROP TABLE batch", accounting));
+    /// A block of exactly one statement on the discarding route is one
+    /// label-1 attempt that carries the statement's breakdown.
+    #[test]
+    fn a_batch_of_one_statement_records_one_entry_with_its_breakdown() {
+        let conn = profiled_connection();
+        conn.execute_statement("CREATE TABLE single (i INTEGER)", None)
+            .unwrap();
+        let (result, record) = record_of(|accounting| {
+            run_batch(
+                &conn,
+                "INSERT INTO single SELECT i FROM range(10) t(i)",
+                accounting,
+            )
+        });
         result.unwrap();
+        let record = record.unwrap();
+        assert_eq!(attempts(&record), [client(false)]);
+        assert_eq!(row_count(&conn, "single"), 10);
+        let breakdown = &record["entries"][0]["breakdown"];
+        assert!(breakdown.is_object(), "the statement's tree: {breakdown}");
+        assert!(
+            !breakdown["children"].as_array().unwrap().is_empty(),
+            "the tree holds the statement's operators: {breakdown}"
+        );
+    }
+
+    /// The engine expands an `ADD COLUMN` with a default that is not a
+    /// constant into `BEGIN`, a body, and `COMMIT`. When the body fails on
+    /// the discarding route, the one `duckdb_query` call rolls the
+    /// transaction back: the session stays in autocommit and takes the next
+    /// statement.
+    #[test]
+    fn a_failing_expanded_statement_leaves_the_session_in_autocommit() {
+        let conn = test_connection();
+        conn.execute_statement("CREATE TABLE expanded (i INTEGER, c INTEGER)", None)
+            .unwrap();
+        conn.execute_statement("INSERT INTO expanded VALUES (1, 1)", None)
+            .unwrap();
+        let (result, record) = record_of(|accounting| {
+            run_batch(
+                &conn,
+                "ALTER TABLE expanded ADD COLUMN c INTEGER DEFAULT (random()*10)::INTEGER",
+                accounting,
+            )
+        });
+        let Err(ServerError::DuckDb(duckdb::Error::DuckDBFailure(failure, _))) = result else {
+            panic!("expected the catalog failure, got {result:?}");
+        };
+        assert_eq!(
+            failure.error_type,
+            ffi::duckdb_error_type_DUCKDB_ERROR_CATALOG
+        );
         assert_eq!(attempts(&record.unwrap()), [client(false)]);
+
+        // A plain statement runs and commits by itself.
+        conn.execute_statement("INSERT INTO expanded VALUES (2, 2)", None)
+            .expect("the session takes the next statement");
+        // No transaction is open: a ROLLBACK has nothing to end, and the
+        // insert above is kept.
+        let rollback = conn.execute_statement("ROLLBACK", None);
+        assert!(
+            rollback.is_err(),
+            "the session is in autocommit, so ROLLBACK fails: {rollback:?}"
+        );
+        assert_eq!(row_count(&conn, "expanded"), 2);
     }
 
     /// The discarding route prepares no statement, so a statement with a
-    /// VARIANT result column succeeds there, last in the block or not, as it
-    /// does through `duckdb_query`.
+    /// VARIANT result column succeeds there, last in the block or not.
     #[test]
     fn a_batch_runs_a_variant_result_statement() {
         let conn = test_connection();
@@ -1936,20 +2002,15 @@ mod tests {
             "SELECT 42::VARIANT AS v",
             "SELECT 42::VARIANT AS v; SELECT 'x'::VARIANT AS w",
         ] {
-            conn.with_raw(|raw| raw.execute_batch(sql))
-                .expect("duckdb_query accepts the block");
             let (result, record) = record_of(|accounting| run_batch(&conn, sql, accounting));
             result.unwrap_or_else(|error| panic!("{sql:?} failed: {error}"));
-            let record = record.unwrap();
-            assert!(
-                attempts(&record).iter().all(|attempt| *attempt == client(false)),
-                "{sql:?}: {record}"
-            );
+            assert_eq!(attempts(&record.unwrap()), [client(false)], "{sql:?}");
         }
     }
 
     /// A parse error in a later statement of a batch keeps the first from
-    /// running, and the one attempt covers the parse.
+    /// running. The count's failure is ignored, the `duckdb_query` call
+    /// reports the error with its type, and the one attempt covers both.
     #[test]
     fn a_batch_parse_error_runs_no_statement() {
         let conn = test_connection();
@@ -1968,24 +2029,24 @@ mod tests {
         );
     }
 
-    /// A block that holds no statement succeeds on the discarding route, as
-    /// `duckdb_query` does, and makes one attempt.
+    /// A block that holds no statement succeeds on the discarding route and
+    /// makes one attempt with no breakdown.
     #[test]
     fn an_empty_batch_succeeds() {
-        let conn = test_connection();
+        let conn = profiled_connection();
         for sql in ["", "   ", ";", "-- a comment"] {
-            conn.with_raw(|raw| raw.execute_batch(sql))
-                .expect("duckdb_query accepts an empty block");
             let (result, record) = record_of(|accounting| run_batch(&conn, sql, accounting));
             assert_eq!(result.unwrap(), 0, "{sql:?}");
-            assert_eq!(attempts(&record.unwrap()), [client(false)], "{sql:?}");
+            let record = record.unwrap();
+            assert_eq!(attempts(&record), [client(false)], "{sql:?}");
+            assert!(record["entries"][0].get("breakdown").is_none(), "{sql:?}");
         }
     }
 
-    /// A statement that fails ends a batch: its attempt is the last entry,
-    /// no later statement runs, and the failure carries the engine's type.
+    /// A statement that fails ends a batch: the block is one entry, no later
+    /// statement runs, and the failure carries the engine's type.
     #[test]
-    fn a_failing_batch_statement_records_its_entry_and_ends_the_block() {
+    fn a_failing_batch_statement_records_one_entry_and_ends_the_block() {
         let conn = test_connection();
         let (result, record) = record_of(|accounting| {
             run_batch(
@@ -2003,10 +2064,7 @@ mod tests {
             failure.error_type,
             ffi::duckdb_error_type_DUCKDB_ERROR_CONSTRAINT
         );
-        assert_eq!(
-            attempts(&record.unwrap()),
-            [client(false), client(false), client(false)]
-        );
+        assert_eq!(attempts(&record.unwrap()), [client(false)]);
         assert_eq!(row_count(&conn, "failing_batch"), 1);
     }
 
