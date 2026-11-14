@@ -2133,7 +2133,7 @@ fn client_attempts(record: &Value) -> usize {
 }
 
 /// Every request that runs a block whose results SwanLake discards reports
-/// one label-1 entry for each statement, and each request reports the SQL
+/// one label-1 entry for the whole block, and each request reports the SQL
 /// text the client sent, where it sent one.
 #[tokio::test]
 async fn discarding_requests_report_their_statements_and_text() {
@@ -2157,7 +2157,7 @@ async fn discarding_requests_report_their_statements_and_text() {
     assert_eq!(new.len(), 1, "{new:?}");
     assert_eq!(new[0]["endpoint"], "DoPut");
     assert_eq!(new[0]["sql"], sql);
-    assert_eq!(client_attempts(&new[0]), 2, "{}", new[0]);
+    assert_eq!(client_attempts(&new[0]), 1, "{}", new[0]);
 
     // A command through GetFlightInfo and an ephemeral DoGet ticket.
     let sql = "CREATE TABLE get_rows (i INTEGER)";
@@ -2269,7 +2269,7 @@ async fn discarding_requests_report_their_statements_and_text() {
     assert_eq!(new.len(), 1, "{new:?}");
     assert_eq!(new[0]["endpoint"], "DoAction");
     assert_eq!(new[0]["sql"], sql);
-    assert_eq!(client_attempts(&new[0]), 2, "{}", new[0]);
+    assert_eq!(client_attempts(&new[0]), 1, "{}", new[0]);
 
     // The execute_guarded action.
     let sql = "INSERT INTO usage_schema.made VALUES (3)";
