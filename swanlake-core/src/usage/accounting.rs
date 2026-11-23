@@ -1,6 +1,7 @@
 //! Request accounting: one request's identity, its entries, and its progress
 //! figures, from admission until its record is queued.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::Serialize;
@@ -17,6 +18,10 @@ pub struct UsageTotals {
     pub cpu_ns: u64,
     pub bytes_read: u64,
     pub bytes_written: u64,
+    /// The part of `bytes_read` the engine read from local files.
+    pub file_bytes_read: u64,
+    /// The part of `bytes_read` the engine's HTTP client read.
+    pub http_bytes_read: u64,
 }
 
 /// One read of a connection's totals, its database's totals, and that
@@ -93,10 +98,17 @@ pub struct Entry {
     /// The database's CPU between the attempt's two reads.
     pub cpu_seconds: f64,
     pub bytes_read: u64,
+    /// The part of `bytes_read` read from local files.
+    pub file_bytes_read: u64,
+    /// The part of `bytes_read` read through the engine's HTTP client. The
+    /// remainder of `bytes_read` after both parts is Postgres traffic.
+    pub http_bytes_read: u64,
     pub bytes_written: u64,
     /// The connection's part of `cpu_seconds`.
     pub connection_cpu_seconds: f64,
     pub connection_bytes_read: u64,
+    pub connection_file_bytes_read: u64,
+    pub connection_http_bytes_read: u64,
     pub connection_bytes_written: u64,
     pub memory_peak_bytes: u64,
     pub memory_byte_seconds: f64,
@@ -129,9 +141,13 @@ impl Entry {
             provenance: label,
             cpu_seconds: seconds_from_ns(database.cpu_ns),
             bytes_read: database.bytes_read,
+            file_bytes_read: database.file_bytes_read,
+            http_bytes_read: database.http_bytes_read,
             bytes_written: database.bytes_written,
             connection_cpu_seconds: seconds_from_ns(connection.cpu_ns),
             connection_bytes_read: connection.bytes_read,
+            connection_file_bytes_read: connection.file_bytes_read,
+            connection_http_bytes_read: connection.http_bytes_read,
             connection_bytes_written: connection.bytes_written,
             memory_peak_bytes: closing.memory_peak_bytes,
             memory_byte_seconds: memory_byte_ms as f64 / 1_000.0,
@@ -147,6 +163,12 @@ fn difference(opening: &UsageTotals, closing: &UsageTotals) -> UsageTotals {
         cpu_ns: closing.cpu_ns.saturating_sub(opening.cpu_ns),
         bytes_read: closing.bytes_read.saturating_sub(opening.bytes_read),
         bytes_written: closing.bytes_written.saturating_sub(opening.bytes_written),
+        file_bytes_read: closing
+            .file_bytes_read
+            .saturating_sub(opening.file_bytes_read),
+        http_bytes_read: closing
+            .http_bytes_read
+            .saturating_sub(opening.http_bytes_read),
     }
 }
 
@@ -263,6 +285,8 @@ pub struct RequestAccounting {
     limits: Limits,
     state: Mutex<State>,
     progress: Progress,
+    /// The bytes of the Flight data messages sent to the client so far.
+    response_bytes: AtomicU64,
 }
 
 impl RequestAccounting {
@@ -292,6 +316,7 @@ impl RequestAccounting {
             limits: Limits::default(),
             state: Mutex::new(State::default()),
             progress: Progress::default(),
+            response_bytes: AtomicU64::new(0),
         }
     }
 
@@ -328,6 +353,13 @@ impl RequestAccounting {
         if let Some(name) = record::error_type_name(error_type) {
             self.state().error_type.get_or_insert(name);
         }
+    }
+
+    /// Adds the bytes of one Flight data message sent to the client: its
+    /// header, body, and application metadata. The record reports the sum as
+    /// `response_bytes`.
+    pub fn add_response_bytes(&self, bytes: u64) {
+        self.response_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Records the opening read of an attempt. A label-1 attempt becomes the
@@ -465,6 +497,7 @@ impl Drop for RequestAccounting {
             ended_at: chrono::Utc::now(),
             error_type: state.error_type,
             breakdown_omitted: state.breakdown_omitted,
+            response_bytes: *self.response_bytes.get_mut(),
             entries: state.entries,
         }));
     }
@@ -518,11 +551,15 @@ mod tests {
                 cpu_ns: 1_000_000_000,
                 bytes_read: 100,
                 bytes_written: 10,
+                file_bytes_read: 40,
+                http_bytes_read: 20,
             },
             database: UsageTotals {
                 cpu_ns: 5_000_000_000,
                 bytes_read: 1_000,
                 bytes_written: 500,
+                file_bytes_read: 400,
+                http_bytes_read: 200,
             },
             memory_bytes: 4_096,
             memory_peak_bytes: 4_096,
@@ -533,11 +570,15 @@ mod tests {
                 cpu_ns: 1_750_000_000,
                 bytes_read: 164,
                 bytes_written: 42,
+                file_bytes_read: 70,
+                http_bytes_read: 45,
             },
             database: UsageTotals {
                 cpu_ns: 7_500_000_000,
                 bytes_read: 3_000,
                 bytes_written: 800,
+                file_bytes_read: 1_600,
+                http_bytes_read: 900,
             },
             memory_bytes: 8_192,
             memory_peak_bytes: 65_536,
@@ -553,9 +594,13 @@ mod tests {
                 provenance: ExecutionLabel::Client,
                 cpu_seconds: 2.5,
                 bytes_read: 2_000,
+                file_bytes_read: 1_200,
+                http_bytes_read: 700,
                 bytes_written: 300,
                 connection_cpu_seconds: 0.75,
                 connection_bytes_read: 64,
+                connection_file_bytes_read: 30,
+                connection_http_bytes_read: 25,
                 connection_bytes_written: 32,
                 memory_peak_bytes: 65_536,
                 memory_byte_seconds: 2.5,
@@ -589,11 +634,15 @@ mod tests {
                 cpu_ns: 9,
                 bytes_read: 9,
                 bytes_written: 9,
+                file_bytes_read: 9,
+                http_bytes_read: 9,
             },
             database: UsageTotals {
                 cpu_ns: 9,
                 bytes_read: 9,
                 bytes_written: 9,
+                file_bytes_read: 9,
+                http_bytes_read: 9,
             },
             ..ResourceTotals::default()
         };
@@ -613,6 +662,10 @@ mod tests {
         assert_eq!(entry.bytes_written, 0);
         assert_eq!(entry.connection_bytes_read, 0);
         assert_eq!(entry.connection_bytes_written, 0);
+        assert_eq!(entry.file_bytes_read, 0);
+        assert_eq!(entry.http_bytes_read, 0);
+        assert_eq!(entry.connection_file_bytes_read, 0);
+        assert_eq!(entry.connection_http_bytes_read, 0);
     }
 
     #[test]

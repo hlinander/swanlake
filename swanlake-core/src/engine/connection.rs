@@ -1017,6 +1017,8 @@ fn zeroed_totals() -> ffi::duckdb_resource_totals {
         cpu_ns: 0,
         bytes_read: 0,
         bytes_written: 0,
+        file_bytes_read: 0,
+        http_bytes_read: 0,
     };
     ffi::duckdb_resource_totals {
         connection: zero,

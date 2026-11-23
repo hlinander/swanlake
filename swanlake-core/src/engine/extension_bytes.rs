@@ -257,4 +257,11 @@ fn extension_transfers_reach_the_totals_and_the_operators() {
         http_read <= served_bytes,
         "the HTTP statement counted {http_read} bytes and the listener sent {served_bytes}"
     );
+    // The httpfs copy of the engine passes the HTTP source to the host's
+    // totals.
+    let http_source_read = bytes(&http, "http_bytes_read");
+    assert!(
+        http_source_read > 0 && http_source_read <= http_read,
+        "the HTTP statement read {http_read} bytes, {http_source_read} of them over HTTP"
+    );
 }

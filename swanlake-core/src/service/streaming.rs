@@ -131,10 +131,10 @@ impl SwanFlightSqlService {
     /// - Disconnects cancel this request while it owns the connection
     /// - Dropping a completed stream cannot interrupt a subsequent query
     ///
-    /// The stream task holds `accounting` until the query ends, so the
-    /// request's record is queued after its last attempt closes and not when
-    /// the handler returns. The response stream holds the progress figures
-    /// alone.
+    /// The stream task holds `accounting` until the query ends, and the
+    /// response stream holds it until it has yielded its last message, so
+    /// the request's record is queued after its last attempt closes and
+    /// carries the bytes of every message the stream yielded.
     pub(crate) async fn execute_query_streaming(
         session: Arc<Session>,
         sql: String,
@@ -171,6 +171,7 @@ impl SwanFlightSqlService {
         let query_connection = session.connection.clone();
         let sql_clone = sql.clone();
         let progress = accounting.progress();
+        let stream_accounting = accounting.clone();
         tokio::task::spawn_blocking(move || {
             let result = cancellation
                 .check()
@@ -205,6 +206,7 @@ impl SwanFlightSqlService {
             rx_stream,
             interrupt_handle,
             progress,
+            stream_accounting,
             cancel_on_disconnect,
             query_connection,
         );
@@ -234,6 +236,10 @@ struct StreamingBatchToFlightData<S> {
     _cancel_on_disconnect: CancelOnDrop,
     /// The request's progress figures, which outlive its accounting.
     progress: Progress,
+    /// The request's accounting, which counts the bytes of each message the
+    /// stream yields. Released when the stream ends or fails, so the record
+    /// is queued before the client observes either.
+    accounting: Option<Arc<RequestAccounting>>,
     /// Rows sent so far (for fallback progress calculation)
     rows_sent: u64,
     /// Periodic timer for sending progress heartbeats between data batches.
@@ -245,6 +251,7 @@ impl<S> StreamingBatchToFlightData<S> {
         inner: S,
         interrupt_handle: Arc<InterruptHandle>,
         progress: Progress,
+        accounting: Arc<RequestAccounting>,
         cancel_on_disconnect: CancelOnDrop,
         query_connection: Arc<crate::engine::DuckDbConnection>,
     ) -> Self {
@@ -262,9 +269,27 @@ impl<S> StreamingBatchToFlightData<S> {
             interrupt_handle,
             _cancel_on_disconnect: cancel_on_disconnect,
             progress,
+            accounting: Some(accounting),
             rows_sent: 0,
             heartbeat,
         }
+    }
+
+    /// Counts a message the stream is about to yield: its header, body, and
+    /// application metadata.
+    fn counted(&self, message: FlightData) -> FlightData {
+        if let Some(accounting) = &self.accounting {
+            let bytes =
+                message.data_header.len() + message.data_body.len() + message.app_metadata.len();
+            accounting.add_response_bytes(bytes as u64);
+        }
+        message
+    }
+
+    /// Ends the stream and releases the request's accounting.
+    fn finish(&mut self) {
+        self.done = true;
+        self.accounting = None;
     }
 
     /// The request's CPU and memory figures as of this call.
@@ -303,9 +328,9 @@ where
                     debug!(fields = schema.fields().len(), "streaming: received schema");
                     self.schema = Some(Arc::new(schema.clone()));
                     match encode_schema(&schema) {
-                        Ok(fd) => Poll::Ready(Some(Ok(fd))),
+                        Ok(fd) => Poll::Ready(Some(Ok(self.counted(fd)))),
                         Err(e) => {
-                            self.done = true;
+                            self.finish();
                             Poll::Ready(Some(Err(e)))
                         }
                     }
@@ -330,26 +355,26 @@ where
                     );
 
                     match encode_batch(&batch, progress, Some(snapshot)) {
-                        Ok(fd) => Poll::Ready(Some(Ok(fd))),
+                        Ok(fd) => Poll::Ready(Some(Ok(self.counted(fd)))),
                         Err(e) => {
-                            self.done = true;
+                            self.finish();
                             Poll::Ready(Some(Err(e)))
                         }
                     }
                 }
                 StreamingBatch::Done { total_rows, total_bytes } => {
                     info!(total_rows, total_bytes, "streaming query completed");
-                    self.done = true;
+                    self.finish();
                     Poll::Ready(None)
                 }
                 StreamingBatch::Error(e) => {
                     error!(%e, "streaming query error");
-                    self.done = true;
+                    self.finish();
                     Poll::Ready(Some(Err(Status::internal(format!("query error: {e}")))))
                 }
             },
             Poll::Ready(None) => {
-                self.done = true;
+                self.finish();
                 Poll::Ready(None)
             }
             Poll::Pending => {
@@ -373,7 +398,7 @@ where
                                         cpu_time_us = snapshot.cpu_time_us,
                                         "heartbeat: sending progress update"
                                     );
-                                    return Poll::Ready(Some(Ok(fd)));
+                                    return Poll::Ready(Some(Ok(self.counted(fd))));
                                 }
                                 Err(_) => {}
                             }
@@ -564,11 +589,20 @@ mod cancellation_tests {
         )
         .await?
         .into_inner();
+        let mut message_bytes = 0;
         while let Some(message) = response.next().await {
-            message?;
+            let message = message?;
+            message_bytes +=
+                message.data_header.len() + message.data_body.len() + message.app_metadata.len();
         }
         let record = queued_record(&queue).await?;
         assert_eq!(record["endpoint"], "DoGet");
+        assert!(message_bytes > 0, "the stream carried no data");
+        assert_eq!(
+            record["response_bytes"],
+            message_bytes as u64,
+            "the record counts every message the stream yielded"
+        );
         assert_eq!(
             testing::attempts(&record),
             [

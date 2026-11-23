@@ -206,6 +206,8 @@ pub(super) struct RecordParts<'a> {
     pub(super) error_type: Option<&'static str>,
     /// Set when an entry was stored without the breakdown its attempt had.
     pub(super) breakdown_omitted: bool,
+    /// The bytes of the Flight data messages sent to the client.
+    pub(super) response_bytes: u64,
     pub(super) entries: Vec<Entry>,
 }
 
@@ -223,6 +225,7 @@ struct RecordJson<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     error_type: Option<&'static str>,
     breakdown_omitted: bool,
+    response_bytes: u64,
     entries: &'a [Entry],
 }
 
@@ -273,6 +276,7 @@ fn to_json(parts: &RecordParts<'_>, breakdown_omitted: bool) -> Vec<u8> {
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         error_type: parts.error_type,
         breakdown_omitted,
+        response_bytes: parts.response_bytes,
         entries: &parts.entries,
     };
     // `serde_json::to_vec` fails only on a `Serialize` impl that fails or a
@@ -294,9 +298,13 @@ mod tests {
             provenance: ExecutionLabel::Client,
             cpu_seconds: 1.5,
             bytes_read: 10,
+            file_bytes_read: 6,
+            http_bytes_read: 3,
             bytes_written: 20,
             connection_cpu_seconds: 0.5,
             connection_bytes_read: 3,
+            connection_file_bytes_read: 2,
+            connection_http_bytes_read: 1,
             connection_bytes_written: 4,
             memory_peak_bytes: 4096,
             memory_byte_seconds: 2.25,
@@ -330,6 +338,7 @@ mod tests {
                 .expect("valid timestamp"),
             error_type: None,
             breakdown_omitted: false,
+            response_bytes: 77,
             entries,
         }
     }
@@ -345,9 +354,13 @@ mod tests {
             "provenance": provenance,
             "cpu_seconds": 1.5,
             "bytes_read": 10,
+            "file_bytes_read": 6,
+            "http_bytes_read": 3,
             "bytes_written": 20,
             "connection_cpu_seconds": 0.5,
             "connection_bytes_read": 3,
+            "connection_file_bytes_read": 2,
+            "connection_http_bytes_read": 1,
             "connection_bytes_written": 4,
             "memory_peak_bytes": 4096,
             "memory_byte_seconds": 2.25,
@@ -409,6 +422,7 @@ mod tests {
                 "ended_at": "2023-11-14T22:13:20.123Z",
                 "error_type": "TRANSACTION",
                 "breakdown_omitted": false,
+                "response_bytes": 77,
                 "entries": [
                     entry_json(0, "CLIENT", false, Some(node_json("t", json!([node_json("child", json!([]))])))),
                     entry_json(1, "SWANLAKE", true, None),

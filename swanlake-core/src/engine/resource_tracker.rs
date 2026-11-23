@@ -23,6 +23,8 @@ impl From<ffi::duckdb_usage_totals> for UsageTotals {
             cpu_ns: totals.cpu_ns,
             bytes_read: totals.bytes_read,
             bytes_written: totals.bytes_written,
+            file_bytes_read: totals.file_bytes_read,
+            http_bytes_read: totals.http_bytes_read,
         }
     }
 }
@@ -53,11 +55,15 @@ pub fn read_totals(handle: &InterruptHandle) -> Option<ResourceTotals> {
                     cpu_ns: 0,
                     bytes_read: 0,
                     bytes_written: 0,
+                    file_bytes_read: 0,
+                    http_bytes_read: 0,
                 },
                 database: ffi::duckdb_usage_totals {
                     cpu_ns: 0,
                     bytes_read: 0,
                     bytes_written: 0,
+                    file_bytes_read: 0,
+                    http_bytes_read: 0,
                 },
                 memory_bytes: 0,
                 memory_peak_bytes: 0,
