@@ -3,7 +3,7 @@
 //!
 //! [`RequestAccounting`] collects one request's entries. When its last owner
 //! drops it, it serializes one record and pushes it onto the process's
-//! [`UsageQueue`], which one background task drains with
+//! [`UsageQueue`], which one background task drains in batches with
 //! `POST {api}/v1/usage/requests`.
 //!
 //! Nothing here blocks a request or writes to disk. A record the queue cannot

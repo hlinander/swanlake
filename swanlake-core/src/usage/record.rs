@@ -393,6 +393,25 @@ mod tests {
         }
     }
 
+    /// A batch separates its records by a line feed, so a record holds none.
+    #[test]
+    fn a_record_holds_no_line_feed() {
+        let sql = SqlText::capture("SELECT 1,\n  2\r\nFROM t");
+        let entries = vec![entry(0, Some(node("multi\nline", vec![])))];
+
+        let Serialized::Record(record) = serialize(parts(&sql, entries)) else {
+            panic!("record was discarded");
+        };
+
+        assert!(!record.contains(&b'\n'));
+        let parsed: Value = serde_json::from_slice(&record).expect("record is JSON");
+        assert_eq!(parsed["sql"], json!("SELECT 1,\n  2\r\nFROM t"));
+        assert_eq!(
+            parsed["entries"][0]["breakdown"]["operator_name"],
+            json!("multi\nline")
+        );
+    }
+
     #[test]
     fn record_carries_the_specified_fields() {
         let sql = SqlText::capture("SELECT 1");

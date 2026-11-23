@@ -326,13 +326,18 @@ async fn spawn_mock_api(state: Arc<MockState>) -> String {
         State(state): State<Arc<MockState>>,
         body: axum::body::Bytes,
     ) -> impl IntoResponse {
-        let record = serde_json::from_slice(&body).expect("a usage record is JSON");
+        // The body is a batch: one record on each line.
+        let records = body
+            .split(|byte| *byte == b'\n')
+            .map(|record| serde_json::from_slice(record).expect("a usage record is JSON"))
+            .collect::<Vec<Value>>();
+        let statuses = vec![204; records.len()];
         state
             .usage_records
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .push(record);
-        StatusCode::NO_CONTENT
+            .extend(records);
+        Json(statuses)
     }
 
     let app = axum::Router::new()

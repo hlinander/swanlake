@@ -10,9 +10,9 @@ use tracing::warn;
 
 use super::{sa, DuckvisAuth, DuckvisError};
 
-/// The limit on one whole delivery of a usage record: the token mint, the
-/// POST, and after a 401 the re-mint and the second POST. The shared client
-/// sets no timeout.
+/// The limit on one whole delivery of a batch of usage records: the token
+/// mint, the POST, and after a 401 the re-mint and the second POST. The
+/// shared client sets no timeout.
 pub(crate) const USAGE_RECORD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A resolved project attachment (contract C3 allow path). `secret_config` is
@@ -217,31 +217,32 @@ impl DuckvisAuth {
         })
     }
 
-    /// `POST {api}/v1/usage/requests` with one serialized usage record as the
-    /// body, and return the response's status whatever it is. The body is
-    /// sent as given, so a resend carries identical bytes.
+    /// `POST {api}/v1/usage/requests` with a batch of serialized usage
+    /// records as the body, and return the response's status and body
+    /// whatever they are. The body is sent as given, so a resend carries
+    /// identical bytes.
     ///
     /// Shares the SA token cache of [`Self::post_json_with_retry`]: a 401
-    /// re-mints the token once and sends again, and the second response's
-    /// status is the result. `Err(Unavailable)` is a failure to mint the
-    /// token, a failure to send the request, or a call that has no result
-    /// within 30 seconds of its start. That one limit covers the token mint,
-    /// the send, the re-mint, and the second send together.
-    pub async fn post_usage_record(
+    /// re-mints the token once and sends again, and the second response is
+    /// the result. `Err(Unavailable)` is a failure to mint the token, a
+    /// failure to send the request or to read the response, or a call that
+    /// has no result within 30 seconds of its start. That one limit covers
+    /// the token mint, the send, the re-mint, and the second send together.
+    pub async fn post_usage_records(
         &self,
-        record: bytes::Bytes,
-    ) -> Result<reqwest::StatusCode, DuckvisError> {
-        self.post_usage_record_within(record, USAGE_RECORD_TIMEOUT)
+        body: bytes::Bytes,
+    ) -> Result<(reqwest::StatusCode, bytes::Bytes), DuckvisError> {
+        self.post_usage_records_within(body, USAGE_RECORD_TIMEOUT)
             .await
     }
 
-    /// [`Self::post_usage_record`] with `limit` on the whole call.
-    pub(crate) async fn post_usage_record_within(
+    /// [`Self::post_usage_records`] with `limit` on the whole call.
+    pub(crate) async fn post_usage_records_within(
         &self,
-        record: bytes::Bytes,
+        body: bytes::Bytes,
         limit: std::time::Duration,
-    ) -> Result<reqwest::StatusCode, DuckvisError> {
-        match tokio::time::timeout(limit, self.post_usage_record_unbounded(record)).await {
+    ) -> Result<(reqwest::StatusCode, bytes::Bytes), DuckvisError> {
+        match tokio::time::timeout(limit, self.post_usage_records_unbounded(body)).await {
             Ok(result) => result,
             Err(_elapsed) => {
                 warn!(
@@ -253,10 +254,10 @@ impl DuckvisAuth {
         }
     }
 
-    async fn post_usage_record_unbounded(
+    async fn post_usage_records_unbounded(
         &self,
-        record: bytes::Bytes,
-    ) -> Result<reqwest::StatusCode, DuckvisError> {
+        body: bytes::Bytes,
+    ) -> Result<(reqwest::StatusCode, bytes::Bytes), DuckvisError> {
         let url = format!("{}/v1/usage/requests", self.api_url.trim_end_matches('/'));
         let token = sa::get_token(
             &self.sa_token,
@@ -268,9 +269,9 @@ impl DuckvisAuth {
         )
         .await?;
 
-        let status = self.send_usage_record(&url, record.clone(), &token).await?;
-        if status != reqwest::StatusCode::UNAUTHORIZED {
-            return Ok(status);
+        let response = self.send_usage_records(&url, body.clone(), &token).await?;
+        if response.0 != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(response);
         }
 
         let fresh = sa::force_refresh(
@@ -282,27 +283,30 @@ impl DuckvisAuth {
             &self.signing_key,
         )
         .await?;
-        self.send_usage_record(&url, record, &fresh).await
+        self.send_usage_records(&url, body, &fresh).await
     }
 
-    async fn send_usage_record(
+    async fn send_usage_records(
         &self,
         url: &str,
-        record: bytes::Bytes,
+        body: bytes::Bytes,
         token: &str,
-    ) -> Result<reqwest::StatusCode, DuckvisError> {
-        self.client
+    ) -> Result<(reqwest::StatusCode, bytes::Bytes), DuckvisError> {
+        let unavailable = |e: reqwest::Error| {
+            warn!(error = %e, "usage record send failed");
+            DuckvisError::Unavailable
+        };
+        let response = self
+            .client
             .post(url)
             .bearer_auth(token)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(record)
+            .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+            .body(body)
             .send()
             .await
-            .map(|resp| resp.status())
-            .map_err(|e| {
-                warn!(error = %e, "usage record send failed");
-                DuckvisError::Unavailable
-            })
+            .map_err(unavailable)?;
+        let status = response.status();
+        Ok((status, response.bytes().await.map_err(unavailable)?))
     }
 
     async fn send_json<B: Serialize>(

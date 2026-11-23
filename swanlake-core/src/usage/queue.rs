@@ -1,5 +1,5 @@
 //! The process's in-memory queue of serialized records, and the task that
-//! delivers its head to the duckvis API.
+//! delivers batches from its head to the duckvis API.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -10,21 +10,29 @@ use bytes::Bytes;
 use tokio::sync::Notify;
 use tracing::warn;
 
-use super::record::Serialized;
+use super::record::{Serialized, MAX_RECORD_BYTES};
 use crate::duckvis::DuckvisAuth;
 use crate::metrics::{Metrics, UsageRecordDrop};
 
 /// Largest total of serialized record bytes the queue holds.
 pub const MAX_QUEUE_BYTES: usize = 67_108_864;
 
-/// The wait before the first resend of a record.
+/// The most records one batch holds, which is the number of a body's records
+/// the API handles.
+const MAX_BATCH_RECORDS: usize = 256;
+
+/// The most bytes one batch's body holds: the API's body limit, which is the
+/// record bound.
+const MAX_BATCH_BYTES: usize = MAX_RECORD_BYTES;
+
+/// The wait before the first resend of a batch.
 const FIRST_RETRY_WAIT: Duration = Duration::from_secs(1);
 
-/// The longest wait between two sends of a record.
+/// The longest wait between two sends of a batch.
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
 
-/// The number of 401-after-re-mint and 403 responses to one record at which
-/// the record is discarded.
+/// The number of 401-after-re-mint and 403 responses to one batch at which
+/// the batch's records are discarded.
 const MAX_DENIALS: u32 = 5;
 
 /// The queue of serialized records awaiting delivery. Clones share one queue.
@@ -102,20 +110,40 @@ impl UsageQueue {
         self.inner.arrived.notify_one();
     }
 
-    /// The record at the head, once one exists. The record stays queued.
-    async fn head(&self) -> Bytes {
+    /// The batch at the head, once the queue holds a record: the head record
+    /// and each record behind it while the batch holds at most
+    /// [`MAX_BATCH_RECORDS`] records and its body at most
+    /// [`MAX_BATCH_BYTES`] bytes. The records stay queued.
+    async fn head_batch(&self) -> Vec<Bytes> {
         loop {
-            if let Some((record, _)) = self.pending().records.front() {
-                return record.clone();
+            {
+                let pending = self.pending();
+                let mut batch = Vec::new();
+                let mut body_bytes = 0;
+                for (record, _) in pending.records.iter().take(MAX_BATCH_RECORDS) {
+                    // One line feed separates a record from the one ahead.
+                    let bytes = body_bytes + record.len() + usize::from(!batch.is_empty());
+                    if !batch.is_empty() && bytes > MAX_BATCH_BYTES {
+                        break;
+                    }
+                    body_bytes = bytes;
+                    batch.push(record.clone());
+                }
+                if !batch.is_empty() {
+                    return batch;
+                }
             }
             self.inner.arrived.notified().await;
         }
     }
 
-    fn remove_head(&self) {
+    /// Removes the first `records` records.
+    fn remove_head(&self, records: usize) {
         let mut pending = self.pending();
-        if let Some((record, _)) = pending.records.pop_front() {
-            pending.bytes -= record.len();
+        for _ in 0..records {
+            if let Some((record, _)) = pending.records.pop_front() {
+                pending.bytes -= record.len();
+            }
         }
         self.report(&pending);
     }
@@ -150,48 +178,70 @@ impl UsageQueue {
     }
 }
 
-/// What a response to a record's POST does to the record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A batch's body: its records joined by one line feed. A serialized record
+/// holds no line feed, so the API reads the records back by splitting there.
+fn body_of(batch: &[Bytes]) -> Bytes {
+    batch.join(&b'\n').into()
+}
+
+/// What a response to a batch's POST does to the batch's records.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Disposition {
-    /// 2xx: the API holds the record.
-    Delivered,
+    /// 200 with the status of each record the API handled, in the batch's
+    /// order: 204 for a record it holds, any other for a record it refuses.
+    /// The API handled no record behind them.
+    Handled(Vec<u16>),
     /// 400, 413, or 422: the API refuses the same bytes again.
     Refused,
     /// 401 after the token re-mint, or 403.
     Denied,
-    /// Any other status, or no response.
+    /// Any other response, or none.
     Retry,
 }
 
-/// `status` is the status `DuckvisAuth::post_usage_record` returns, which is
-/// a 401 only after the token re-mint, or `None` when the token mint or the
-/// send failed or the request timed out.
-fn disposition(status: Option<u16>) -> Disposition {
-    match status {
-        Some(200..=299) => Disposition::Delivered,
-        Some(400 | 413 | 422) => Disposition::Refused,
-        Some(401 | 403) => Disposition::Denied,
+/// `response` is the status and body `DuckvisAuth::post_usage_records`
+/// returns for a batch of `records` records. Its status is a 401 only after
+/// the token re-mint. It is `None` when the token mint or the send failed or
+/// the request timed out.
+fn disposition(response: Option<(u16, &[u8])>, records: usize) -> Disposition {
+    match response {
+        Some((200, body)) => match serde_json::from_slice::<Vec<u16>>(body) {
+            Ok(statuses) if (1..=records).contains(&statuses.len()) => {
+                Disposition::Handled(statuses)
+            }
+            _ => Disposition::Retry,
+        },
+        Some((400 | 413 | 422, _)) => Disposition::Refused,
+        Some((401 | 403, _)) => Disposition::Denied,
         _ => Disposition::Retry,
     }
 }
 
-/// Sends the head record until the API accepts or refuses it, or denies it
-/// for the fifth time, then removes it. Every send carries the same bytes.
+/// Sends the batch at the head until the API handles records of it or
+/// refuses it, or denies it for the fifth time, then removes the records the
+/// API handled or the batch's records. Every send carries the same bytes.
 /// Between two sends it waits 1 second, then twice the previous wait, up to
 /// 60 seconds.
-async fn deliver_head<S, SendFuture, W, WaitFuture>(queue: &UsageQueue, send: &S, wait: &W)
+async fn deliver_batch<S, SendFuture, W, WaitFuture>(queue: &UsageQueue, send: &S, wait: &W)
 where
     S: Fn(Bytes) -> SendFuture,
-    SendFuture: Future<Output = Option<u16>>,
+    SendFuture: Future<Output = Option<(u16, Bytes)>>,
     W: Fn(Duration) -> WaitFuture,
     WaitFuture: Future<Output = ()>,
 {
-    let record = queue.head().await;
+    let batch = queue.head_batch().await;
+    let body = body_of(&batch);
     let mut retry_wait = FIRST_RETRY_WAIT;
     let mut denials = 0;
-    loop {
-        let status = send(record.clone()).await;
-        let mut disposition = disposition(status);
+    let (removed, refused) = loop {
+        let response = send(body.clone()).await;
+        let status = response.as_ref().map(|(status, _)| *status);
+        let mut disposition = disposition(
+            response
+                .as_ref()
+                .map(|(status, body)| (*status, body.as_ref())),
+            batch.len(),
+        );
         if disposition == Disposition::Denied {
             denials += 1;
             disposition = if denials >= MAX_DENIALS {
@@ -201,15 +251,25 @@ where
             };
         }
         match disposition {
-            Disposition::Delivered => break,
+            Disposition::Handled(statuses) => {
+                let refused = statuses.iter().filter(|status| **status != 204).count();
+                if refused > 0 {
+                    warn!(
+                        refused,
+                        records = statuses.len(),
+                        "duckvis API refused usage records; discarding them"
+                    );
+                }
+                break (statuses.len(), refused);
+            }
             Disposition::Refused => {
                 warn!(
                     status,
-                    bytes = record.len(),
-                    "duckvis API refused a usage record; discarding it"
+                    bytes = body.len(),
+                    records = batch.len(),
+                    "duckvis API refused a usage record batch; discarding it"
                 );
-                queue.count_drop(UsageRecordDrop::Refused);
-                break;
+                break (batch.len(), batch.len());
             }
             Disposition::Denied | Disposition::Retry => {
                 warn!(
@@ -221,30 +281,34 @@ where
                 retry_wait = retry_wait.saturating_mul(2).min(MAX_RETRY_WAIT);
             }
         }
+    };
+    for _ in 0..refused {
+        queue.count_drop(UsageRecordDrop::Refused);
     }
-    queue.remove_head();
+    queue.remove_head(removed);
 }
 
 /// Creates the process's queue and spawns the task that delivers its records
-/// to `{api}/v1/usage/requests` through `auth`, one at a time and in order.
-/// The task runs until the runtime shuts down and flushes nothing then.
+/// to `{api}/v1/usage/requests` through `auth`, one batch at a time and in
+/// order. The task runs until the runtime shuts down and flushes nothing
+/// then.
 ///
 /// Must be called within a Tokio runtime.
 pub fn spawn_delivery(auth: Arc<DuckvisAuth>, metrics: &Metrics) -> UsageQueue {
     let queue = UsageQueue::new(metrics.clone());
     let delivery_queue = queue.clone();
     tokio::spawn(async move {
-        let send = |record: Bytes| {
+        let send = |body: Bytes| {
             let auth = Arc::clone(&auth);
             async move {
-                auth.post_usage_record(record)
+                auth.post_usage_records(body)
                     .await
                     .ok()
-                    .map(|status| status.as_u16())
+                    .map(|(status, body)| (status.as_u16(), body))
             }
         };
         loop {
-            deliver_head(&delivery_queue, &send, &tokio::time::sleep).await;
+            deliver_batch(&delivery_queue, &send, &tokio::time::sleep).await;
         }
     });
     queue
@@ -270,39 +334,49 @@ mod tests {
         (dropped.queue_full, dropped.oversized, dropped.refused)
     }
 
+    /// A 200 response whose body is `statuses`.
+    fn handled(statuses: &'static str) -> Option<(u16, Bytes)> {
+        Some((200, Bytes::from_static(statuses.as_bytes())))
+    }
+
+    /// A response of `status` with an empty body.
+    fn status(status: u16) -> Option<(u16, Bytes)> {
+        Some((status, Bytes::new()))
+    }
+
     /// A stand-in for the API and the clock: answers each send with the next
-    /// scripted status and records every body and every wait.
+    /// scripted response and records every body and every wait.
     #[derive(Default)]
     struct Script {
-        statuses: Mutex<VecDeque<Option<u16>>>,
+        responses: Mutex<VecDeque<Option<(u16, Bytes)>>>,
         bodies: Mutex<Vec<Bytes>>,
         waits: Mutex<Vec<Duration>>,
     }
 
     impl Script {
-        fn new(statuses: impl IntoIterator<Item = Option<u16>>) -> Self {
+        fn new(responses: impl IntoIterator<Item = Option<(u16, Bytes)>>) -> Self {
             Self {
-                statuses: Mutex::new(statuses.into_iter().collect()),
+                responses: Mutex::new(responses.into_iter().collect()),
                 ..Self::default()
             }
         }
 
-        async fn deliver_head(&self, queue: &UsageQueue) {
+        async fn deliver_batch(&self, queue: &UsageQueue) {
             let send = |body: Bytes| {
                 self.bodies.lock().expect("bodies").push(body);
-                let status = self
-                    .statuses
+                let response = self
+                    .responses
                     .lock()
-                    .expect("statuses")
+                    .expect("responses")
                     .pop_front()
-                    .expect("a scripted status for every send");
-                std::future::ready(status)
+                    .expect("a scripted response for every send");
+                std::future::ready(response)
             };
             let wait = |duration: Duration| {
                 self.waits.lock().expect("waits").push(duration);
                 std::future::ready(())
             };
-            deliver_head(queue, &send, &wait).await;
+            deliver_batch(queue, &send, &wait).await;
         }
 
         fn bodies(&self) -> Vec<Bytes> {
@@ -320,20 +394,37 @@ mod tests {
     }
 
     #[test]
-    fn statuses_map_to_the_delivery_table() {
-        for status in [200, 201, 204, 299] {
-            assert_eq!(disposition(Some(status)), Disposition::Delivered);
+    fn responses_map_to_the_delivery_table() {
+        let of = |status: u16, body: &'static str, records: usize| {
+            disposition(Some((status, body.as_bytes())), records)
+        };
+        assert_eq!(of(200, "[204]", 1), Disposition::Handled(vec![204]));
+        assert_eq!(
+            of(200, "[204,422,400]", 3),
+            Disposition::Handled(vec![204, 422, 400])
+        );
+        // The API handled the first two records of five.
+        assert_eq!(
+            of(200, "[204,204]", 5),
+            Disposition::Handled(vec![204, 204])
+        );
+        // A 200 that holds no status, more statuses than the batch holds
+        // records, or no status list.
+        for body in ["[]", "[204,204]", "", "{}", "204", "[\"204\"]", "[204"] {
+            assert_eq!(of(200, body, 1), Disposition::Retry, "{body}");
         }
         for status in [400, 413, 422] {
-            assert_eq!(disposition(Some(status)), Disposition::Refused);
+            assert_eq!(of(status, "", 1), Disposition::Refused);
         }
         for status in [401, 403] {
-            assert_eq!(disposition(Some(status)), Disposition::Denied);
+            assert_eq!(of(status, "", 1), Disposition::Denied);
         }
-        for status in [100, 301, 402, 404, 408, 409, 429, 500, 502, 503, 504] {
-            assert_eq!(disposition(Some(status)), Disposition::Retry);
+        for status in [
+            100, 201, 204, 299, 301, 402, 404, 408, 409, 429, 500, 502, 503, 504,
+        ] {
+            assert_eq!(of(status, "[204]", 1), Disposition::Retry);
         }
-        assert_eq!(disposition(None), Disposition::Retry);
+        assert_eq!(disposition(None, 1), Disposition::Retry);
     }
 
     #[test]
@@ -355,7 +446,7 @@ mod tests {
         assert_eq!(dropped(&metrics), (2, 0, 0));
 
         // Removing the head frees its bytes.
-        queue.remove_head();
+        queue.remove_head(1);
         queue.push(Bytes::from_static(b"abcdef"));
         assert_eq!(
             queue.snapshot(),
@@ -381,39 +472,129 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_success_removes_the_record() {
+    async fn a_batch_holds_the_queued_records_and_a_success_removes_them() {
         let (queue, metrics) = queue_with_max_bytes(100);
         queue.push(Bytes::from_static(b"first"));
         queue.push(Bytes::from_static(b"second"));
-        let script = Script::new([Some(204), Some(200)]);
+        let script = Script::new([handled("[204,204]"), handled("[204]")]);
 
-        script.deliver_head(&queue).await;
-        assert_eq!(queue.snapshot(), vec![Bytes::from_static(b"second")]);
-        script.deliver_head(&queue).await;
+        script.deliver_batch(&queue).await;
+        assert!(queue.snapshot().is_empty());
+
+        // A record that arrives later travels in its own batch.
+        queue.push(Bytes::from_static(b"third"));
+        script.deliver_batch(&queue).await;
 
         assert!(queue.snapshot().is_empty());
         assert_eq!(
             script.bodies(),
-            vec![Bytes::from_static(b"first"), Bytes::from_static(b"second")]
+            vec![
+                Bytes::from_static(b"first\nsecond"),
+                Bytes::from_static(b"third")
+            ]
         );
         assert!(script.waits_secs().is_empty());
         assert_eq!(dropped(&metrics), (0, 0, 0));
     }
 
     #[tokio::test]
-    async fn a_refusal_discards_and_counts_the_record() {
-        for status in [400, 413, 422] {
+    async fn a_batch_holds_at_most_256_records() {
+        let (queue, _metrics) = queue_with_max_bytes(MAX_QUEUE_BYTES);
+        for _ in 0..300 {
+            queue.push(Bytes::from_static(b"{}"));
+        }
+        let script = Script::new([Some((
+            200,
+            Bytes::from(serde_json::to_vec(&vec![204; 256]).expect("statuses")),
+        ))]);
+
+        script.deliver_batch(&queue).await;
+
+        assert_eq!(queue.snapshot().len(), 44);
+        let bodies = script.bodies();
+        assert_eq!(bodies[0].split(|byte| *byte == b'\n').count(), 256);
+        assert_eq!(MAX_BATCH_RECORDS, 256);
+    }
+
+    #[tokio::test]
+    async fn a_batch_body_holds_at_most_the_body_bound() {
+        let (queue, _metrics) = queue_with_max_bytes(MAX_QUEUE_BYTES);
+        // The first two records and their line feed fill the bound exactly.
+        queue.push(Bytes::from(vec![b'a'; MAX_BATCH_BYTES - 10]));
+        queue.push(Bytes::from_static(b"123456789"));
+        queue.push(Bytes::from_static(b"c"));
+        // A record at the bound travels alone.
+        queue.push(Bytes::from(vec![b'd'; MAX_BATCH_BYTES]));
+        queue.push(Bytes::from_static(b"e"));
+        let script = Script::new([handled("[204,204]"), handled("[204]"), handled("[204]")]);
+
+        script.deliver_batch(&queue).await;
+        script.deliver_batch(&queue).await;
+        script.deliver_batch(&queue).await;
+
+        let bodies = script.bodies();
+        assert_eq!(bodies[0].len(), MAX_BATCH_BYTES);
+        assert!(bodies[0].ends_with(b"a\n123456789"));
+        assert_eq!(bodies[1], Bytes::from_static(b"c"));
+        assert_eq!(bodies[2], Bytes::from(vec![b'd'; MAX_BATCH_BYTES]));
+        assert_eq!(queue.snapshot(), vec![Bytes::from_static(b"e")]);
+        assert_eq!(MAX_BATCH_BYTES, 4_194_304);
+    }
+
+    #[tokio::test]
+    async fn the_records_behind_the_handled_ones_stay_queued() {
+        let (queue, metrics) = queue_with_max_bytes(100);
+        queue.push(Bytes::from_static(b"first"));
+        queue.push(Bytes::from_static(b"second"));
+        queue.push(Bytes::from_static(b"third"));
+        let script = Script::new([handled("[204,204]"), handled("[204]")]);
+
+        script.deliver_batch(&queue).await;
+        assert_eq!(queue.snapshot(), vec![Bytes::from_static(b"third")]);
+        script.deliver_batch(&queue).await;
+
+        assert!(queue.snapshot().is_empty());
+        assert_eq!(
+            script.bodies(),
+            vec![
+                Bytes::from_static(b"first\nsecond\nthird"),
+                Bytes::from_static(b"third")
+            ]
+        );
+        assert!(script.waits_secs().is_empty());
+        assert_eq!(dropped(&metrics), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_handled_record_the_api_refuses_is_discarded_and_counted() {
+        let (queue, metrics) = queue_with_max_bytes(100);
+        queue.push(Bytes::from_static(b"stored"));
+        queue.push(Bytes::from_static(b"unresolved"));
+        queue.push(Bytes::from_static(b"unreadable"));
+        queue.push(Bytes::from_static(b"unhandled"));
+        let script = Script::new([handled("[204,422,400]")]);
+
+        script.deliver_batch(&queue).await;
+
+        assert_eq!(queue.snapshot(), vec![Bytes::from_static(b"unhandled")]);
+        assert!(script.waits_secs().is_empty());
+        assert_eq!(dropped(&metrics), (0, 0, 2));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_discards_and_counts_the_batch() {
+        for refusal in [400, 413, 422] {
             let (queue, metrics) = queue_with_max_bytes(100);
             queue.push(Bytes::from_static(b"refused"));
-            queue.push(Bytes::from_static(b"next"));
-            let script = Script::new([Some(status)]);
+            queue.push(Bytes::from_static(b"with it"));
+            let script = Script::new([status(refusal)]);
 
-            script.deliver_head(&queue).await;
+            script.deliver_batch(&queue).await;
 
-            assert_eq!(queue.snapshot(), vec![Bytes::from_static(b"next")]);
+            assert!(queue.snapshot().is_empty());
             assert_eq!(script.bodies().len(), 1);
             assert!(script.waits_secs().is_empty());
-            assert_eq!(dropped(&metrics), (0, 0, 1));
+            assert_eq!(dropped(&metrics), (0, 0, 2));
         }
     }
 
@@ -421,9 +602,9 @@ mod tests {
     async fn a_retry_resends_identical_bytes_and_delivers_once() {
         let (queue, metrics) = queue_with_max_bytes(100);
         queue.push(Bytes::from_static(b"{\"request_id\":\"r\"}"));
-        let script = Script::new([Some(503), None, Some(500), Some(204)]);
+        let script = Script::new([status(503), None, status(500), handled("[204]")]);
 
-        script.deliver_head(&queue).await;
+        script.deliver_batch(&queue).await;
 
         let bodies = script.bodies();
         assert_eq!(bodies.len(), 4);
@@ -436,24 +617,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_fifth_denial_discards_and_counts_the_record() {
+    async fn a_200_without_a_status_list_is_sent_again() {
+        let (queue, metrics) = queue_with_max_bytes(100);
+        queue.push(Bytes::from_static(b"record"));
+        let script = Script::new([
+            handled("[]"),
+            handled("[204,204]"),
+            handled(""),
+            status(204),
+            handled("[204]"),
+        ]);
+
+        script.deliver_batch(&queue).await;
+
+        assert_eq!(script.bodies().len(), 5);
+        assert_eq!(script.waits_secs(), vec![1, 2, 4, 8]);
+        assert!(queue.snapshot().is_empty());
+        assert_eq!(dropped(&metrics), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn the_fifth_denial_discards_and_counts_the_batch() {
         for denials in [[401; 5], [403; 5], [401, 403, 403, 401, 403]] {
             let (queue, metrics) = queue_with_max_bytes(100);
             queue.push(Bytes::from_static(b"denied"));
-            queue.push(Bytes::from_static(b"next"));
-            let script = Script::new(denials.map(Some));
+            queue.push(Bytes::from_static(b"with it"));
+            let script = Script::new(denials.map(status));
 
-            script.deliver_head(&queue).await;
+            script.deliver_batch(&queue).await;
 
-            assert_eq!(queue.snapshot(), vec![Bytes::from_static(b"next")]);
+            assert!(queue.snapshot().is_empty());
             let bodies = script.bodies();
             assert_eq!(bodies.len(), 5);
             assert!(bodies
                 .iter()
-                .all(|body| body == &Bytes::from_static(b"denied")));
+                .all(|body| body == &Bytes::from_static(b"denied\nwith it")));
             // The fifth response discards without a further wait.
             assert_eq!(script.waits_secs(), vec![1, 2, 4, 8]);
-            assert_eq!(dropped(&metrics), (0, 0, 1));
+            assert_eq!(dropped(&metrics), (0, 0, 2));
         }
     }
 
@@ -462,18 +663,18 @@ mod tests {
         let (queue, metrics) = queue_with_max_bytes(100);
         queue.push(Bytes::from_static(b"denied"));
         let script = Script::new([
-            Some(403),
-            Some(503),
-            Some(401),
+            status(403),
+            status(503),
+            status(401),
             None,
-            Some(403),
-            Some(500),
-            Some(403),
-            Some(429),
-            Some(401),
+            status(403),
+            status(500),
+            status(403),
+            status(429),
+            status(401),
         ]);
 
-        script.deliver_head(&queue).await;
+        script.deliver_batch(&queue).await;
 
         assert_eq!(script.bodies().len(), 9);
         assert_eq!(script.waits_secs(), vec![1, 2, 4, 8, 16, 32, 60, 60]);
@@ -485,9 +686,15 @@ mod tests {
     async fn four_denials_then_a_success_deliver_the_record() {
         let (queue, metrics) = queue_with_max_bytes(100);
         queue.push(Bytes::from_static(b"record"));
-        let script = Script::new([Some(403), Some(401), Some(403), Some(401), Some(204)]);
+        let script = Script::new([
+            status(403),
+            status(401),
+            status(403),
+            status(401),
+            handled("[204]"),
+        ]);
 
-        script.deliver_head(&queue).await;
+        script.deliver_batch(&queue).await;
 
         assert_eq!(script.bodies().len(), 5);
         assert_eq!(script.waits_secs(), vec![1, 2, 4, 8]);
@@ -496,25 +703,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_record_counts_its_own_denials_and_waits() {
+    async fn each_batch_counts_its_own_denials_and_waits() {
         let (queue, metrics) = queue_with_max_bytes(100);
-        queue.push(Bytes::from_static(b"first"));
-        queue.push(Bytes::from_static(b"second"));
         let script = Script::new([
-            Some(403),
-            Some(403),
-            Some(403),
-            Some(403),
-            Some(204),
-            Some(403),
-            Some(204),
+            status(403),
+            status(403),
+            status(403),
+            status(403),
+            handled("[204]"),
+            status(403),
+            handled("[204]"),
         ]);
 
-        script.deliver_head(&queue).await;
-        script.deliver_head(&queue).await;
+        queue.push(Bytes::from_static(b"first"));
+        script.deliver_batch(&queue).await;
+        queue.push(Bytes::from_static(b"second"));
+        script.deliver_batch(&queue).await;
 
-        // The second record's wait starts at 1 second, and its one denial
-        // is its first.
+        // The second batch's wait starts at 1 second, and its one denial is
+        // its first.
         assert_eq!(script.waits_secs(), vec![1, 2, 4, 8, 1]);
         assert!(queue.snapshot().is_empty());
         assert_eq!(dropped(&metrics), (0, 0, 0));
@@ -544,10 +751,10 @@ mod tests {
         assert_eq!(state(75_000), (10, 75_000));
 
         // The next record becomes the head with its own, shorter age.
-        queue.remove_head();
+        queue.remove_head(1);
         assert_eq!(state(100), (4, 70));
 
-        queue.remove_head();
+        queue.remove_head(1);
         assert_eq!(state(100), (0, 0));
 
         // A record pushed onto the drained queue is the head from its push.
@@ -565,10 +772,11 @@ mod tests {
             start + Duration::from_millis(400),
         );
         let ages_while_waiting = Mutex::new(Vec::new());
-        let statuses = Mutex::new(VecDeque::from([Some(503), Some(403), Some(204)]));
+        // The last response handles the head alone, so the tail stays.
+        let responses = Mutex::new(VecDeque::from([status(503), status(403), handled("[204]")]));
 
         let send = |_body: Bytes| {
-            std::future::ready(statuses.lock().expect("statuses").pop_front().flatten())
+            std::future::ready(responses.lock().expect("responses").pop_front().flatten())
         };
         let wait = |_duration: Duration| {
             let state = metrics.usage_queue_at(start + Duration::from_millis(1_000));
@@ -578,7 +786,7 @@ mod tests {
                 .push((state.bytes, state.head_age_ms));
             std::future::ready(())
         };
-        deliver_head(&queue, &send, &wait).await;
+        deliver_batch(&queue, &send, &wait).await;
 
         // A failed send does not restart the head's age.
         assert_eq!(
@@ -593,33 +801,37 @@ mod tests {
     async fn the_wait_doubles_to_60_seconds() {
         let (queue, _metrics) = queue_with_max_bytes(100);
         queue.push(Bytes::from_static(b"record"));
-        let script =
-            Script::new(std::iter::repeat_n(Some(503), 9).chain(std::iter::once(Some(204))));
+        let script = Script::new(
+            std::iter::repeat_n(status(503), 9).chain(std::iter::once(handled("[204]"))),
+        );
 
-        script.deliver_head(&queue).await;
+        script.deliver_batch(&queue).await;
 
         assert_eq!(script.waits_secs(), vec![1, 2, 4, 8, 16, 32, 60, 60, 60]);
     }
 
     #[tokio::test]
-    async fn a_failing_record_stays_at_the_head_while_it_waits() {
+    async fn a_failing_batch_stays_queued_and_unchanged_while_it_waits() {
         let (queue, _metrics) = queue_with_max_bytes(100);
         queue.push(Bytes::from_static(b"head"));
         queue.push(Bytes::from_static(b"tail"));
         let seen_while_waiting = Mutex::new(Vec::new());
-        let statuses = Mutex::new(VecDeque::from([Some(503), Some(204)]));
+        let bodies = Mutex::new(Vec::new());
+        let responses = Mutex::new(VecDeque::from([status(503), handled("[204,204]")]));
 
-        let send = |_body: Bytes| {
-            std::future::ready(statuses.lock().expect("statuses").pop_front().flatten())
+        let send = |body: Bytes| {
+            bodies.lock().expect("bodies").push(body);
+            std::future::ready(responses.lock().expect("responses").pop_front().flatten())
         };
         let wait = |_duration: Duration| {
             seen_while_waiting
                 .lock()
                 .expect("seen")
                 .push(queue.snapshot());
+            queue.push(Bytes::from_static(b"late"));
             std::future::ready(())
         };
-        deliver_head(&queue, &send, &wait).await;
+        deliver_batch(&queue, &send, &wait).await;
 
         assert_eq!(
             *seen_while_waiting.lock().expect("seen"),
@@ -628,18 +840,24 @@ mod tests {
                 Bytes::from_static(b"tail")
             ]]
         );
-        assert_eq!(queue.snapshot(), vec![Bytes::from_static(b"tail")]);
+        // The resend holds the records of the first send and not the record
+        // that arrived during the wait.
+        assert_eq!(
+            *bodies.lock().expect("bodies"),
+            vec![Bytes::from_static(b"head\ntail"); 2]
+        );
+        assert_eq!(queue.snapshot(), vec![Bytes::from_static(b"late")]);
     }
 
     #[tokio::test]
     async fn delivery_waits_for_a_record_to_arrive() {
         let (queue, _metrics) = queue_with_max_bytes(100);
-        let script = Arc::new(Script::new([Some(204)]));
+        let script = Arc::new(Script::new([handled("[204]")]));
 
         let delivery = tokio::spawn({
             let queue = queue.clone();
             let script = Arc::clone(&script);
-            async move { script.deliver_head(&queue).await }
+            async move { script.deliver_batch(&queue).await }
         });
         tokio::task::yield_now().await;
         assert!(script.bodies().is_empty());
@@ -660,9 +878,15 @@ mod tests {
         body: Vec<u8>,
     }
 
-    /// A scripted status that makes the stand-in API hold a usage POST open
+    /// A scripted answer to a usage POST: its status and body.
+    type Answer = (u16, &'static str);
+
+    /// The answer that reports one handled record, which the API holds.
+    const STORED: Answer = (200, "[204]");
+
+    /// A scripted answer that makes the stand-in API hold a usage POST open
     /// and never answer it.
-    const STALL: u16 = 0;
+    const STALL: Answer = (0, "");
 
     /// How the stand-in API departs from answering every request at once.
     #[derive(Default)]
@@ -676,45 +900,49 @@ mod tests {
 
     /// A local HTTP listener standing in for the duckvis API. It mints
     /// `token-1`, `token-2`, … at the token route and answers each usage POST
-    /// with the next scripted status.
+    /// with the next scripted answer.
     struct StandInApi {
         url: String,
         received: Arc<Mutex<Vec<Received>>>,
     }
 
     impl StandInApi {
-        fn start(usage_statuses: impl IntoIterator<Item = u16>) -> Self {
-            Self::start_with(usage_statuses, Behavior::default())
+        fn start(usage_answers: impl IntoIterator<Item = Answer>) -> Self {
+            Self::start_with(usage_answers, Behavior::default())
         }
 
-        fn start_with(usage_statuses: impl IntoIterator<Item = u16>, behavior: Behavior) -> Self {
+        fn start_with(usage_answers: impl IntoIterator<Item = Answer>, behavior: Behavior) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             let url = format!("http://{}", listener.local_addr().expect("local addr"));
             let received = Arc::new(Mutex::new(Vec::new()));
             let seen = Arc::clone(&received);
-            let mut usage_statuses = usage_statuses.into_iter().collect::<VecDeque<_>>();
+            let mut usage_answers = usage_answers.into_iter().collect::<VecDeque<_>>();
             std::thread::spawn(move || {
                 let mut minted = 0;
                 let mut stalled = Vec::new();
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else { break };
                     let request = read_request(&mut stream);
-                    let (status, body) = if request.path == "/v1/auth/oauth/token" {
+                    let is_mint = request.path == "/v1/auth/oauth/token";
+                    let answer = if is_mint {
                         minted += 1;
                         (
                             200,
                             format!(r#"{{"access_token":"token-{minted}","expires_in":600}}"#),
                         )
                     } else {
-                        (usage_statuses.pop_front().unwrap_or(500), String::new())
+                        let (status, body) = usage_answers.pop_front().unwrap_or((500, ""));
+                        (status, body.to_owned())
                     };
-                    let is_mint = request.path == "/v1/auth/oauth/token";
                     seen.lock().expect("received").push(request);
-                    if status == STALL || (is_mint && behavior.stalled_mint == Some(minted)) {
+                    if (!is_mint && answer.0 == STALL.0)
+                        || (is_mint && behavior.stalled_mint == Some(minted))
+                    {
                         stalled.push(stream);
                         continue;
                     }
                     std::thread::sleep(behavior.answer_delay);
+                    let (status, body) = answer;
                     let response = format!(
                         "HTTP/1.1 {status} Scripted\r\ncontent-type: application/json\r\n\
                          content-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -802,25 +1030,34 @@ mod tests {
         })
     }
 
-    /// Delivers the head of `queue` through `auth`, recording each wait
-    /// instead of sleeping.
-    async fn deliver_head_through(queue: &UsageQueue, auth: &Arc<DuckvisAuth>) -> Vec<u64> {
+    /// Delivers the batch at the head of `queue` through `auth`, with `limit`
+    /// on each send, recording each wait instead of sleeping.
+    async fn deliver_batch_within(
+        queue: &UsageQueue,
+        auth: &Arc<DuckvisAuth>,
+        limit: Duration,
+    ) -> Vec<u64> {
         let waits = Mutex::new(Vec::new());
-        let send = |record: Bytes| {
+        let send = |body: Bytes| {
             let auth = Arc::clone(auth);
             async move {
-                auth.post_usage_record(record)
+                auth.post_usage_records_within(body, limit)
                     .await
                     .ok()
-                    .map(|status| status.as_u16())
+                    .map(|(status, body)| (status.as_u16(), body))
             }
         };
         let wait = |duration: Duration| {
             waits.lock().expect("waits").push(duration.as_secs());
             std::future::ready(())
         };
-        deliver_head(queue, &send, &wait).await;
+        deliver_batch(queue, &send, &wait).await;
         waits.into_inner().expect("waits")
+    }
+
+    /// [`deliver_batch_within`] the production limit.
+    async fn deliver_batch_through(queue: &UsageQueue, auth: &Arc<DuckvisAuth>) -> Vec<u64> {
+        deliver_batch_within(queue, auth, crate::duckvis::api::USAGE_RECORD_TIMEOUT).await
     }
 
     /// A request's record as its accounting queues it.
@@ -853,12 +1090,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_503_then_a_204_delivers_the_record_once() {
-        let api = StandInApi::start([503, 204]);
+    async fn a_503_then_a_200_delivers_the_record_once() {
+        let api = StandInApi::start([(503, ""), STORED]);
         let (queue, metrics) = queue_with_max_bytes(MAX_QUEUE_BYTES);
         let record = queue_one_record(&queue);
 
-        let waits = deliver_head_through(&queue, &api.auth()).await;
+        let waits = deliver_batch_through(&queue, &api.auth()).await;
 
         assert_eq!(waits, vec![1]);
         assert!(queue.snapshot().is_empty());
@@ -868,7 +1105,7 @@ mod tests {
         for post in &posts {
             assert_eq!(post.body, record);
             assert_eq!(post.authorization.as_deref(), Some("Bearer token-1"));
-            assert_eq!(post.content_type.as_deref(), Some("application/json"));
+            assert_eq!(post.content_type.as_deref(), Some("application/x-ndjson"));
         }
         // Both sends used the one cached token.
         assert_eq!(api.token_mints(), 1);
@@ -878,22 +1115,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_422_discards_the_record_and_delivery_moves_on() {
-        let api = StandInApi::start([422, 204]);
+    async fn a_batch_is_one_post_and_its_response_decides_each_record() {
+        let api = StandInApi::start([(200, "[422,204]"), STORED]);
         let (queue, metrics) = queue_with_max_bytes(MAX_QUEUE_BYTES);
         let refused = queue_one_record(&queue);
-        queue.push(Bytes::from_static(b"{\"next\":true}"));
+        queue.push(Bytes::from_static(b"{\"stored\":true}"));
+        queue.push(Bytes::from_static(b"{\"unhandled\":true}"));
         let auth = api.auth();
 
-        let waits = deliver_head_through(&queue, &auth).await;
+        let waits = deliver_batch_through(&queue, &auth).await;
         assert!(waits.is_empty());
         assert_eq!(
             queue.snapshot(),
-            vec![Bytes::from_static(b"{\"next\":true}")]
+            vec![Bytes::from_static(b"{\"unhandled\":true}")]
         );
         assert_eq!(dropped(&metrics), (0, 0, 1));
 
-        deliver_head_through(&queue, &auth).await;
+        deliver_batch_through(&queue, &auth).await;
+        assert!(queue.snapshot().is_empty());
+        assert_eq!(dropped(&metrics), (0, 0, 1));
+        let bodies = api
+            .usage_posts()
+            .into_iter()
+            .map(|post| post.body)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bodies,
+            vec![
+                [
+                    refused.as_ref(),
+                    b"{\"stored\":true}",
+                    b"{\"unhandled\":true}"
+                ]
+                .join(&b'\n'),
+                b"{\"unhandled\":true}".to_vec()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_422_discards_the_batch_and_delivery_moves_on() {
+        let api = StandInApi::start([(422, ""), STORED]);
+        let (queue, metrics) = queue_with_max_bytes(MAX_QUEUE_BYTES);
+        let refused = queue_one_record(&queue);
+        let auth = api.auth();
+
+        let waits = deliver_batch_through(&queue, &auth).await;
+        assert!(waits.is_empty());
+        assert!(queue.snapshot().is_empty());
+        assert_eq!(dropped(&metrics), (0, 0, 1));
+
+        queue.push(Bytes::from_static(b"{\"next\":true}"));
+        deliver_batch_through(&queue, &auth).await;
         assert!(queue.snapshot().is_empty());
         assert_eq!(dropped(&metrics), (0, 0, 1));
         let bodies = api
@@ -906,11 +1179,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_401_re_mints_the_token_once_and_resends() {
-        let api = StandInApi::start([401, 204]);
+        let api = StandInApi::start([(401, ""), STORED]);
         let (queue, _metrics) = queue_with_max_bytes(MAX_QUEUE_BYTES);
         let record = queue_one_record(&queue);
 
-        let waits = deliver_head_through(&queue, &api.auth()).await;
+        let waits = deliver_batch_through(&queue, &api.auth()).await;
 
         assert!(waits.is_empty());
         assert!(queue.snapshot().is_empty());
@@ -927,15 +1200,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_usage_record_returns_the_status_after_one_re_mint() {
-        let api = StandInApi::start([401, 401]);
+    async fn post_usage_records_returns_the_status_and_body() {
+        let api = StandInApi::start([(200, "[204,422]")]);
 
-        let status = api
+        let response = api
             .auth()
-            .post_usage_record(Bytes::from_static(b"{}"))
+            .post_usage_records(Bytes::from_static(b"{}\n{}"))
             .await;
 
-        assert_eq!(status, Ok(reqwest::StatusCode::UNAUTHORIZED));
+        assert_eq!(
+            response,
+            Ok((reqwest::StatusCode::OK, Bytes::from_static(b"[204,422]")))
+        );
+    }
+
+    #[tokio::test]
+    async fn post_usage_records_returns_the_response_after_one_re_mint() {
+        let api = StandInApi::start([(401, ""), (401, "")]);
+
+        let response = api
+            .auth()
+            .post_usage_records(Bytes::from_static(b"{}"))
+            .await;
+
+        assert_eq!(
+            response,
+            Ok((reqwest::StatusCode::UNAUTHORIZED, Bytes::new()))
+        );
         assert_eq!(api.usage_posts().len(), 2);
         assert_eq!(api.token_mints(), 2);
     }
@@ -945,12 +1236,12 @@ mod tests {
         let api = StandInApi::start([STALL]);
 
         let started = std::time::Instant::now();
-        let status = api
+        let response = api
             .auth()
-            .post_usage_record_within(Bytes::from_static(b"{}"), Duration::from_millis(200))
+            .post_usage_records_within(Bytes::from_static(b"{}"), Duration::from_millis(200))
             .await;
 
-        assert_eq!(status, Err(crate::duckvis::DuckvisError::Unavailable));
+        assert_eq!(response, Err(crate::duckvis::DuckvisError::Unavailable));
         assert!(started.elapsed() >= Duration::from_millis(200));
         assert_eq!(api.usage_posts().len(), 1);
         assert_eq!(
@@ -962,7 +1253,7 @@ mod tests {
     #[tokio::test]
     async fn a_token_mint_that_never_answers_times_out() {
         let api = StandInApi::start_with(
-            [204],
+            [STORED],
             Behavior {
                 stalled_mint: Some(1),
                 ..Behavior::default()
@@ -970,12 +1261,12 @@ mod tests {
         );
 
         let started = std::time::Instant::now();
-        let status = api
+        let response = api
             .auth()
-            .post_usage_record_within(Bytes::from_static(b"{}"), Duration::from_millis(200))
+            .post_usage_records_within(Bytes::from_static(b"{}"), Duration::from_millis(200))
             .await;
 
-        assert_eq!(status, Err(crate::duckvis::DuckvisError::Unavailable));
+        assert_eq!(response, Err(crate::duckvis::DuckvisError::Unavailable));
         assert!(started.elapsed() >= Duration::from_millis(200));
         assert_eq!(api.token_mints(), 1);
         assert!(api.usage_posts().is_empty());
@@ -984,7 +1275,7 @@ mod tests {
     #[tokio::test]
     async fn a_re_mint_that_never_answers_times_out() {
         let api = StandInApi::start_with(
-            [401, 204],
+            [(401, ""), STORED],
             Behavior {
                 stalled_mint: Some(2),
                 ..Behavior::default()
@@ -992,12 +1283,12 @@ mod tests {
         );
 
         let started = std::time::Instant::now();
-        let status = api
+        let response = api
             .auth()
-            .post_usage_record_within(Bytes::from_static(b"{}"), Duration::from_millis(200))
+            .post_usage_records_within(Bytes::from_static(b"{}"), Duration::from_millis(200))
             .await;
 
-        assert_eq!(status, Err(crate::duckvis::DuckvisError::Unavailable));
+        assert_eq!(response, Err(crate::duckvis::DuckvisError::Unavailable));
         assert!(started.elapsed() >= Duration::from_millis(200));
         assert_eq!(api.token_mints(), 2);
         assert_eq!(api.usage_posts().len(), 1);
@@ -1008,19 +1299,19 @@ mod tests {
         // Each answer arrives 300 ms after its request, which is within the
         // limit, and the two together take at least 600 ms, which is not.
         let api = StandInApi::start_with(
-            [204],
+            [STORED],
             Behavior {
                 answer_delay: Duration::from_millis(300),
                 ..Behavior::default()
             },
         );
 
-        let status = api
+        let response = api
             .auth()
-            .post_usage_record_within(Bytes::from_static(b"{}"), Duration::from_millis(550))
+            .post_usage_records_within(Bytes::from_static(b"{}"), Duration::from_millis(550))
             .await;
 
-        assert_eq!(status, Err(crate::duckvis::DuckvisError::Unavailable));
+        assert_eq!(response, Err(crate::duckvis::DuckvisError::Unavailable));
         assert_eq!(api.token_mints(), 1);
         // The mint was answered and the POST was sent with its token, so
         // the limit ended the send and not the mint.
@@ -1032,7 +1323,7 @@ mod tests {
     #[tokio::test]
     async fn a_send_that_passes_the_limit_is_sent_again() {
         let api = StandInApi::start_with(
-            [204],
+            [STORED],
             Behavior {
                 stalled_mint: Some(1),
                 ..Behavior::default()
@@ -1040,26 +1331,11 @@ mod tests {
         );
         let (queue, metrics) = queue_with_max_bytes(MAX_QUEUE_BYTES);
         let record = queue_one_record(&queue);
-        let auth = api.auth();
-        let waits = Mutex::new(Vec::new());
-        let send = |record: Bytes| {
-            let auth = Arc::clone(&auth);
-            async move {
-                auth.post_usage_record_within(record, Duration::from_millis(200))
-                    .await
-                    .ok()
-                    .map(|status| status.as_u16())
-            }
-        };
-        let wait = |duration: Duration| {
-            waits.lock().expect("waits").push(duration.as_secs());
-            std::future::ready(())
-        };
 
-        deliver_head(&queue, &send, &wait).await;
+        let waits = deliver_batch_within(&queue, &api.auth(), Duration::from_millis(200)).await;
 
         // The first send timed out in its mint; the second minted and sent.
-        assert_eq!(*waits.lock().expect("waits"), vec![1]);
+        assert_eq!(waits, vec![1]);
         assert_eq!(api.token_mints(), 2);
         let posts = api.usage_posts();
         assert_eq!(posts.len(), 1);
@@ -1069,20 +1345,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fifth_403_discards_the_record() {
-        let api = StandInApi::start([403, 403, 403, 403, 403, 204]);
+    async fn a_fifth_403_discards_the_batch() {
+        let api = StandInApi::start([
+            (403, ""),
+            (403, ""),
+            (403, ""),
+            (403, ""),
+            (403, ""),
+            STORED,
+        ]);
         let (queue, metrics) = queue_with_max_bytes(MAX_QUEUE_BYTES);
         let denied = queue_one_record(&queue);
-        queue.push(Bytes::from_static(b"{\"next\":true}"));
         let auth = api.auth();
 
-        let waits = deliver_head_through(&queue, &auth).await;
+        let waits = deliver_batch_through(&queue, &auth).await;
 
         assert_eq!(waits, vec![1, 2, 4, 8]);
-        assert_eq!(
-            queue.snapshot(),
-            vec![Bytes::from_static(b"{\"next\":true}")]
-        );
+        assert!(queue.snapshot().is_empty());
         assert_eq!(dropped(&metrics), (0, 0, 1));
         let posts = api.usage_posts();
         assert_eq!(posts.len(), 5);
@@ -1090,7 +1369,8 @@ mod tests {
         // A 403 re-mints no token.
         assert_eq!(api.token_mints(), 1);
 
-        deliver_head_through(&queue, &auth).await;
+        queue.push(Bytes::from_static(b"{\"next\":true}"));
+        deliver_batch_through(&queue, &auth).await;
         assert!(queue.snapshot().is_empty());
         assert_eq!(dropped(&metrics), (0, 0, 1));
     }
@@ -1101,19 +1381,21 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().expect("local addr"));
         drop(listener);
 
-        let status = auth_for(url)
-            .post_usage_record(Bytes::from_static(b"{}"))
+        let response = auth_for(url)
+            .post_usage_records(Bytes::from_static(b"{}"))
             .await;
 
-        assert_eq!(status, Err(crate::duckvis::DuckvisError::Unavailable));
+        assert_eq!(response, Err(crate::duckvis::DuckvisError::Unavailable));
     }
 
     #[tokio::test]
     async fn spawned_delivery_drains_the_queue() {
-        let api = StandInApi::start([204, 204]);
+        let api = StandInApi::start([(200, "[204,204]")]);
         let metrics = Metrics::new(100, 8);
         let queue = spawn_delivery(api.auth(), &metrics);
 
+        // The delivery task first runs when this test awaits, so it finds
+        // both records queued.
         queue.push(Bytes::from_static(b"{\"n\":1}"));
         queue.push(Bytes::from_static(b"{\"n\":2}"));
 
@@ -1129,6 +1411,6 @@ mod tests {
             .into_iter()
             .map(|post| post.body)
             .collect::<Vec<_>>();
-        assert_eq!(bodies, vec![b"{\"n\":1}".to_vec(), b"{\"n\":2}".to_vec()]);
+        assert_eq!(bodies, vec![b"{\"n\":1}\n{\"n\":2}".to_vec()]);
     }
 }
