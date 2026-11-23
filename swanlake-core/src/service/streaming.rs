@@ -616,13 +616,39 @@ mod cancellation_tests {
         Ok(())
     }
 
-    /// A client that stops reading abandons the statement: its label-1
-    /// attempt carries `abandoned`.
+    /// Waits until the database behind `handle` uses no CPU between two
+    /// reads 50 ms apart: the stream task then waits on its full channel
+    /// and is not inside a fetch.
+    async fn stream_task_waits_on_the_client(handle: &InterruptHandle) -> anyhow::Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut last = None;
+            loop {
+                let cpu_ns = crate::engine::read_totals(handle).map(|totals| totals.database.cpu_ns);
+                if cpu_ns.is_some() && cpu_ns == last {
+                    return;
+                }
+                last = cpu_ns;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("the stream task kept using CPU"))
+    }
+
+    /// A client that stops reading and then disconnects abandons the
+    /// statement: its label-1 attempt carries `abandoned`.
+    ///
+    /// The statement is abandoned where the stream task waits for the
+    /// client. A disconnect that reaches the task inside a fetch interrupts
+    /// the fetch, which ends the execution before the bracket closes, so the
+    /// test disconnects only once the task waits.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_abandoned_stream_marks_its_statement() -> anyhow::Result<()> {
         use crate::usage::testing;
         use futures::StreamExt;
         let session = session().await?;
+        // Taken before the statement holds the connection guard.
+        let handle = session.connection.interrupt_handle();
         let queue = testing::queue();
         let mut response = SwanFlightSqlService::execute_query_streaming(
             session,
@@ -636,6 +662,7 @@ mod cancellation_tests {
         for _ in 0..2 {
             response.next().await.transpose()?;
         }
+        stream_task_waits_on_the_client(&handle).await?;
         drop(response);
         let record = queued_record(&queue).await?;
         assert_eq!(
